@@ -129,4 +129,5 @@ Taking over your only display is risky, so there are several layers of protectio
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Contains code derived from Microsoft's MIT-licensed Windows samples.
+MIT, see [LICENSE](LICENSE). Contains code derived from Microsoft's MIT-licensed Windows samples, see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
