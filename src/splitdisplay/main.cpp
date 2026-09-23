@@ -875,8 +875,16 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
             if (!shm->mon[i].plugged || shm->mon[i].frameSeq <= base[i] || !IsTargetActive(VirtualName(i).c_str())) return false;
         return true;
     };
+    std::vector<std::wstring> allNames;
+    for (UINT i = 0; i < cfg.count; i++) allNames.push_back(VirtualName(i));
     for (int i = 0; i < 100 && !live(); i++)
+    {
+        // Plugged but left off the desktop (a saved topology): switch them on ourselves,
+        // and as a last resort extend the desktop to every connected display.
+        if (i == 15) ActivateMonitors(allNames);
+        if (i == 60) ForceExtendTopology();
         if (!Nap(100)) return true;
+    }
     if (!live()) throw std::runtime_error("virtual monitors did not come up");
     Log(L"%u virtual monitors live", cfg.count);
     for (auto& p : ps)

@@ -254,6 +254,59 @@ int CurrentRefreshOf(const std::wstring& name)
     return 0;
 }
 
+bool ActivateMonitors(const std::vector<std::wstring>& names)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> all;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    for (int attempt = 0; attempt < 5; attempt++)
+    {
+        UINT32 np = 0, nm = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &np, &nm) != ERROR_SUCCESS) return false;
+        all.resize(np);
+        modes.resize(nm);
+        LONG r = QueryDisplayConfig(QDC_ALL_PATHS, &np, all.data(), &nm, modes.data(), nullptr);
+        if (r == ERROR_INSUFFICIENT_BUFFER) continue;
+        if (r != ERROR_SUCCESS) return false;
+        all.resize(np);
+        modes.resize(nm);
+        break;
+    }
+
+    auto sameSource = [](const DISPLAYCONFIG_PATH_INFO& a, const DISPLAYCONFIG_PATH_INFO& b) {
+        return a.sourceInfo.adapterId.LowPart == b.sourceInfo.adapterId.LowPart && a.sourceInfo.adapterId.HighPart == b.sourceInfo.adapterId.HighPart &&
+               a.sourceInfo.id == b.sourceInfo.id;
+    };
+    auto sameTarget = [](const DISPLAYCONFIG_PATH_INFO& a, const DISPLAYCONFIG_PATH_INFO& b) {
+        return a.targetInfo.adapterId.LowPart == b.targetInfo.adapterId.LowPart && a.targetInfo.adapterId.HighPart == b.targetInfo.adapterId.HighPart &&
+               a.targetInfo.id == b.targetInfo.id;
+    };
+
+    // Keep everything that is active now, and add one path (with a free source) per wanted target.
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    for (auto& p : all)
+        if (p.flags & DISPLAYCONFIG_PATH_ACTIVE) paths.push_back(p);
+    int added = 0;
+    for (auto& p : all)
+    {
+        if ((p.flags & DISPLAYCONFIG_PATH_ACTIVE) || !p.targetInfo.targetAvailable) continue;
+        if (std::find(names.begin(), names.end(), TargetName(p)) == names.end()) continue;
+        bool busy = false;
+        for (auto& q : paths) busy |= sameSource(p, q) || sameTarget(p, q);
+        if (busy) continue;
+        DISPLAYCONFIG_PATH_INFO n = p;
+        n.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+        n.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        n.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        paths.push_back(n);
+        added++;
+    }
+    if (!added) return false;
+    LONG r = SetDisplayConfig((UINT32)paths.size(), paths.data(), (UINT32)modes.size(), modes.data(),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    Log(L"Windows left %d split monitor(s) off the desktop; activating them: %ld", added, r);
+    return r == ERROR_SUCCESS;
+}
+
 bool IsTargetActive(const wchar_t* namePrefix)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;

@@ -34,6 +34,11 @@ void ForceRefresh(const std::vector<std::wstring>& names, int hz);
 // Current refresh rate (Hz, rounded) of the active monitor with exactly this name, or 0.
 int CurrentRefreshOf(const std::wstring& name);
 
+// Adds the named (connected but inactive) monitors to the desktop, leaving every other display as
+// it is. Windows restores a saved topology for a known set of monitors, which can keep freshly
+// plugged split monitors switched off. Returns true if a change was applied.
+bool ActivateMonitors(const std::vector<std::wstring>& names);
+
 // Returns true if the target with this name is part of the desktop.
 bool IsTargetActive(const wchar_t* namePrefix);
 
