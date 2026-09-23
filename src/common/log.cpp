@@ -4,6 +4,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
+#include <share.h>
 
 static FILE* g_file = nullptr;
 static std::mutex g_lock;
@@ -11,11 +12,11 @@ static std::mutex g_lock;
 void LogInit(const wchar_t* fileName)
 {
     wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    wchar_t* slash = wcsrchr(path, L'\\');
-    if (slash) slash[1] = 0;
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay\\", path, MAX_PATH);
+    CreateDirectoryW(path, nullptr);
     wcscat_s(path, fileName);
-    _wfopen_s(&g_file, path, L"a, ccs=UTF-8");
+    // Shared so the watchdog (a second process) and readers can use the same file.
+    g_file = _wfsopen(path, L"a, ccs=UTF-8", _SH_DENYNO);
 }
 
 void Log(const wchar_t* fmt, ...)

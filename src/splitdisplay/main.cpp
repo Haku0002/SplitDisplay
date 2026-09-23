@@ -1,6 +1,8 @@
 // splitdisplay: turns the single 2560x2880 Sculptor panel into two native Windows monitors.
 //
-//   splitdisplay run [--test SECONDS]   plug virtual monitors, take over the panel, composite
+//   splitdisplay run [--test SECONDS]   plug virtual monitors, take over the panel, composite;
+//                                       without --test it keeps running and heals itself
+//   splitdisplay stop                   ask a running instance to exit (it reverts on the way out)
 //   splitdisplay revert                 give the panel back to the desktop, unplug virtual monitors
 //   splitdisplay watchdog ...           (internal) guards a running compositor
 //
@@ -32,12 +34,34 @@ namespace wdc = winrt::Windows::Devices::Display::Core;
 namespace wdd = winrt::Windows::Devices::Display;
 namespace wgd = winrt::Windows::Graphics::DirectX;
 
+static constexpr wchar_t kStopEventName[] = L"Local\\SplitDisplay.Stop";
+static constexpr wchar_t kInstanceMutexName[] = L"Local\\SplitDisplay.Instance";
+
 static std::atomic_bool g_stop = false;
+static HANDLE g_stopEvent = nullptr;
 static volatile LONG64* g_heartbeat = nullptr;
 
 static void Beat()
 {
     if (g_heartbeat) InterlockedExchange64(g_heartbeat, (LONG64)GetTickCount64());
+}
+
+static bool StopRequested()
+{
+    if (!g_stop && g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) g_stop = true;
+    return g_stop;
+}
+
+// Sleeps in small steps, keeping the heartbeat alive. Returns false if a stop was requested.
+static bool Nap(DWORD ms)
+{
+    for (DWORD t = 0; t < ms; t += 100)
+    {
+        Beat();
+        if (StopRequested()) return false;
+        Sleep(100);
+    }
+    return !StopRequested();
 }
 
 static BOOL WINAPI OnCtrl(DWORD)
@@ -62,6 +86,24 @@ static std::wstring HeartbeatName(DWORD pid)
     return L"Local\\SplitDisplay.Hb." + std::to_wstring(pid);
 }
 
+// Over HDMI the panel is one tall target. Over DP it shows up as two ordinary monitors,
+// which must be left alone.
+static std::optional<PanelTarget> FindCombinedPanel()
+{
+    for (auto& t : EnumTargets())
+    {
+        if (t.friendlyName.rfind(L"Sculptor", 0) != 0) continue;
+        if (!t.active)
+        {
+            // Off the desktop: only ours if it is still removed via the override (e.g. left behind by a crash).
+            if (GetSpecialization(t.adapter, t.targetId).enabled) return t;
+            continue;
+        }
+        if (t.height > t.width && t.height % 2 == 0) return t;
+    }
+    return std::nullopt;
+}
+
 #pragma region Revert / watchdog
 
 static bool PanelActive(LUID luid, UINT32 targetId)
@@ -71,27 +113,30 @@ static bool PanelActive(LUID luid, UINT32 targetId)
     return false;
 }
 
+static void UnplugVirtual()
+{
+    SharedView v;
+    if (!v.Open()) return;
+    InterlockedExchange(&v->desiredPlugged, 0);
+    v.Kick();
+    for (int i = 0; i < 50 && (v->mon[0].plugged || v->mon[1].plugged); i++) Sleep(100);
+    Log(L"revert: virtual monitors unplugged (%ld,%ld)", v->mon[0].plugged, v->mon[1].plugged);
+}
+
 // Idempotent: panel back on the desktop first, then remove the virtual monitors.
 static void RevertAll(LUID luid, UINT32 targetId)
 {
-    // Always send the disable packet: the documented GET query does not reflect this override.
     for (int i = 0; i < 10; i++)
     {
         LONG r = SetSpecialization(luid, targetId, false);
+        if (r == ERROR_SUCCESS) Log(L"revert: panel returned to the desktop");
+        if (r == ERROR_SUCCESS || r == ERROR_GEN_FAILURE) break; // GEN_FAILURE: nothing to undo
         Log(L"revert: SetSpecialization(false) -> %ld", r);
-        if (r == ERROR_SUCCESS) break;
         Sleep(500);
     }
     for (int i = 0; i < 20 && !PanelActive(luid, targetId); i++) Sleep(250);
 
-    SharedView v;
-    if (v.Open())
-    {
-        InterlockedExchange(&v->desiredPlugged, 0);
-        v.Kick();
-        for (int i = 0; i < 50 && (v->mon[0].plugged || v->mon[1].plugged); i++) Sleep(100);
-        Log(L"revert: virtual monitors unplugged (%ld,%ld)", v->mon[0].plugged, v->mon[1].plugged);
-    }
+    UnplugVirtual();
 
     if (!PanelActive(luid, targetId))
     {
@@ -103,14 +148,33 @@ static void RevertAll(LUID luid, UINT32 targetId)
 
 static int CmdRevert()
 {
-    // After specialization the panel is no longer an active path, but EnumTargets still lists it.
-    auto p = FindPanel();
-    if (!p)
+    bool any = false;
+    for (auto& t : EnumTargets())
+    {
+        if (t.friendlyName.rfind(L"Sculptor", 0) != 0) continue;
+        any = true;
+        RevertAll(t.adapter, t.targetId);
+    }
+    if (!any)
     {
         Log(L"revert: Sculptor not found");
+        UnplugVirtual();
         return 1;
     }
-    RevertAll(p->adapter, p->targetId);
+    return 0;
+}
+
+static int CmdStop()
+{
+    HANDLE e = OpenEventW(EVENT_MODIFY_STATE, FALSE, kStopEventName);
+    if (!e)
+    {
+        Log(L"stop: no running instance");
+        return 1;
+    }
+    SetEvent(e);
+    CloseHandle(e);
+    Log(L"stop: signalled");
     return 0;
 }
 
@@ -185,9 +249,8 @@ struct FrameSource
     winrt::com_ptr<ID3D11Texture2D> tex[SD_BUFFERS];
     winrt::com_ptr<ID3D11Fence> fence;
     UINT width = 0, height = 0;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     LONG64 lastSeq = -1;
-    UINT64 consumed = 0;
+    bool reserved = false;
 
     void Drop()
     {
@@ -200,8 +263,8 @@ struct FrameSource
     {
         auto& m = s->mon[index];
         LONG g1 = m.handleGeneration;
-        if ((g1 & 1) || m.fenceHandle == 0) return false;
         Drop();
+        if ((g1 & 1) || m.fenceHandle == 0) return false;
         MemoryBarrier();
 
         auto open = [&](UINT64 remote, auto&& fn) -> bool {
@@ -224,9 +287,8 @@ struct FrameSource
         }
         width = m.width;
         height = m.height;
-        format = (DXGI_FORMAT)m.format;
         gen = g1;
-        Log(L"mon%d: attached ring gen=%ld %ux%u fmt=%u", index, gen, width, height, format);
+        Log(L"mon%d: attached ring gen=%ld %ux%u fmt=%u", index, gen, width, height, m.format);
         return true;
     }
 
@@ -242,6 +304,7 @@ struct FrameSource
             if (m.latest == l)
             {
                 fenceValue = m.fenceValue[l];
+                reserved = true;
                 return l;
             }
             InterlockedExchange(&m.readerIndex, -1);
@@ -251,13 +314,22 @@ struct FrameSource
 
     void Release(SdShared* s)
     {
+        if (!reserved) return;
         InterlockedExchange(&s->mon[index].readerIndex, -1);
+        reserved = false;
     }
 };
 
 #pragma endregion
 
 #pragma region Compositor
+
+enum class Outcome
+{
+    Stop,        // user asked to stop or test finished
+    DisplaysOff, // Windows powered the virtual monitors off; panel released so it can sleep
+    Lost,        // panel/GPU went away; caller reverts and retries
+};
 
 static wdc::DisplayTarget WaitForOwnableTarget(const wdc::DisplayManager& mgr, LUID luid, UINT32 targetId, int timeoutMs)
 {
@@ -298,14 +370,21 @@ static void HotkeyThread()
     UnregisterHotKey(nullptr, 1);
 }
 
-static int Composite(SharedView& shm, const PanelTarget& panel, DWORD testSeconds)
+static bool AnyVirtualSignal(SdShared* s)
+{
+    for (auto& m : s->mon)
+        if (m.fenceHandle != 0 && m.latest >= 0) return true;
+    return false;
+}
+
+static Outcome Composite(SharedView& shm, const PanelTarget& panel, ULONGLONG deadline)
 {
     auto mgr = wdc::DisplayManager::Create(wdc::DisplayManagerOptions::None);
     auto target = WaitForOwnableTarget(mgr, panel.adapter, panel.targetId, 10000);
     if (!target)
     {
         Log(L"panel never became ownable");
-        return 5;
+        return Outcome::Lost;
     }
 
     auto targets = winrt::single_threaded_vector<wdc::DisplayTarget>({ target });
@@ -313,7 +392,7 @@ static int Composite(SharedView& shm, const PanelTarget& panel, DWORD testSecond
     if (acq.ErrorCode() != wdc::DisplayManagerResult::Success)
     {
         Log(L"acquire failed: result=%d hr=0x%08X", (int)acq.ErrorCode(), (UINT)acq.ExtendedErrorCode());
-        return 2;
+        return Outcome::Lost;
     }
     auto state = acq.State();
     auto path = state.ConnectTarget(target);
@@ -336,14 +415,16 @@ static int Composite(SharedView& shm, const PanelTarget& panel, DWORD testSecond
     if (!best)
     {
         Log(L"no usable mode");
-        return 3;
+        mgr.ReleaseTarget(target);
+        return Outcome::Lost;
     }
     path.ApplyPropertiesFromMode(best);
     auto applied = state.TryApply(wdc::DisplayStateApplyOptions::None);
     if (applied.Status() != wdc::DisplayStateOperationStatus::Success)
     {
         Log(L"TryApply failed: status=%d hr=0x%08X", (int)applied.Status(), (UINT)applied.ExtendedErrorCode());
-        return 4;
+        mgr.ReleaseTarget(target);
+        return Outcome::Lost;
     }
     state = mgr.TryAcquireTargetsAndReadCurrentState(targets).State();
     path = state.GetPathForTarget(target);
@@ -352,7 +433,6 @@ static int Composite(SharedView& shm, const PanelTarget& panel, DWORD testSecond
     Log(L"panel owned: %dx%d @ %.3f Hz", res.Width, res.Height, (double)rate.Numerator / rate.Denominator);
     Beat();
 
-    // D3D on the panel's GPU.
     winrt::com_ptr<IDXGIFactory6> factory;
     factory.capture(&CreateDXGIFactory2, 0);
     winrt::com_ptr<IDXGIAdapter4> adapter;
@@ -399,8 +479,9 @@ static int Composite(SharedView& shm, const PanelTarget& panel, DWORD testSecond
     if (!driverProc)
     {
         Log(L"cannot open driver host process %lu: %lu", shm->driverPid, GetLastError());
+        CloseHandle(fenceEvent);
         mgr.ReleaseTarget(target);
-        return 6;
+        return Outcome::Lost;
     }
 
     FrameSource src[SD_MONITORS];
@@ -411,30 +492,80 @@ static int Composite(SharedView& shm, const PanelTarget& panel, DWORD testSecond
     LARGE_INTEGER freq, t0, now{};
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
-    UINT64 vblanks = 0, presents = 0;
-    double gpuWaitMaxMs = 0;
+    UINT64 vblanks = 0, presents = 0, stalls = 0;
+    UINT64 pendingFence = 0; // our copies that still hold ring reservations
     bool presented = false;
+    ULONGLONG darkSince = 0;
+    bool poweredOff = false;
+    Outcome outcome = Outcome::Stop;
 
-    while (!g_stop)
+    while (!StopRequested())
     {
         Beat();
         device.WaitForVBlank(source);
+        auto status = source.Status();
+        if (status == wdc::DisplaySourceStatus::PoweredOff)
+        {
+            // Windows blanked all displays (idle timeout / sleep). The session stays intact;
+            // everything is repainted once power returns.
+            if (!poweredOff) Log(L"panel powered off by Windows, waiting");
+            poweredOff = true;
+            presented = false;
+            darkSince = 0;
+            if (!Nap(100)) break;
+            if (deadline && GetTickCount64() >= deadline) break;
+            continue;
+        }
+        if (poweredOff && status == wdc::DisplaySourceStatus::Active)
+        {
+            Log(L"panel powered on again");
+            poweredOff = false;
+        }
+        if (status != wdc::DisplaySourceStatus::Active)
+        {
+            Log(L"panel source status %d", static_cast<int>(status));
+            outcome = Outcome::Lost;
+            break;
+        }
         vblanks++;
+
+        // Copies issued last frame are almost always done by now; only wait if they are not.
+        if (pendingFence && fence->GetCompletedValue() < pendingFence)
+        {
+            stalls++;
+            fence->SetEventOnCompletion(pendingFence, fenceEvent);
+            WaitForSingleObject(fenceEvent, 100);
+        }
+        for (auto& s : src) s.Release(shm.get());
+        pendingFence = 0;
+
+        // Windows turned the (virtual) displays off: let the panel lose signal and sleep too.
+        if (!AnyVirtualSignal(shm.get()))
+        {
+            if (!darkSince) darkSince = GetTickCount64();
+            if (GetTickCount64() - darkSince > 2000)
+            {
+                outcome = Outcome::DisplaysOff;
+                break;
+            }
+        }
+        else
+        {
+            darkSince = 0;
+        }
 
         bool changed = !presented;
         for (auto& s : src)
         {
-            if (s.gen != shm->mon[s.index].handleGeneration) changed = true;
-            if (shm->mon[s.index].frameSeq != s.lastSeq) changed = true;
+            auto& m = shm->mon[s.index];
+            if (s.gen != m.handleGeneration || m.frameSeq != s.lastSeq) changed = true;
         }
 
         if (changed)
         {
             int back = (int)(presents & 1);
-            int reserved[SD_MONITORS];
             for (auto& s : src)
             {
-                reserved[s.index] = -1;
                 auto& m = shm->mon[s.index];
                 if (s.gen != m.handleGeneration) s.Refresh(dev.get(), shm.get(), driverProc);
 
@@ -445,27 +576,17 @@ static int Composite(SharedView& shm, const PanelTarget& panel, DWORD testSecond
                 if (idx < 0)
                 {
                     ctx->ClearView(primRtv[back].get(), black, &area, 1);
+                    s.lastSeq = seq;
                     continue;
                 }
-                reserved[s.index] = idx;
                 s.lastSeq = seq;
-                s.consumed++;
                 ctx->Wait(s.fence.get(), fv);
                 D3D11_BOX box{ 0, 0, 0, std::min<UINT>(s.width, (UINT)res.Width), std::min<UINT>(s.height, halfH), 1 };
                 ctx->CopySubresourceRegion(primTex[back].get(), 0, 0, s.index * halfH, 0, s.tex[idx].get(), 0, &box);
             }
             ctx->Signal(fence.get(), ++fenceValue);
             ctx->Flush();
-
-            // Hold the reservations until our copies are done on the GPU.
-            LARGE_INTEGER w0, w1;
-            QueryPerformanceCounter(&w0);
-            fence->SetEventOnCompletion(fenceValue, fenceEvent);
-            WaitForSingleObject(fenceEvent, 250);
-            QueryPerformanceCounter(&w1);
-            gpuWaitMaxMs = std::max(gpuWaitMaxMs, 1000.0 * (w1.QuadPart - w0.QuadPart) / freq.QuadPart);
-            for (auto& s : src)
-                if (reserved[s.index] >= 0) s.Release(shm.get());
+            pendingFence = fenceValue;
 
             auto task = pool.CreateTask();
             task.SetScanout(scan[back]);
@@ -475,117 +596,180 @@ static int Composite(SharedView& shm, const PanelTarget& panel, DWORD testSecond
             presented = true;
         }
 
-        QueryPerformanceCounter(&now);
-        double elapsed = (double)(now.QuadPart - t0.QuadPart) / freq.QuadPart;
-        if (testSeconds && elapsed >= testSeconds) break;
+        if (deadline && GetTickCount64() >= deadline) break;
     }
 
-    double total = (double)(now.QuadPart - t0.QuadPart) / freq.QuadPart;
-    Log(L"ran %.1fs: %llu vblanks (%.2f Hz), %llu presents, frames used upper=%llu lower=%llu, max GPU copy wait %.2fms",
-        total, vblanks, vblanks / std::max(total, 0.001), presents, src[0].consumed, src[1].consumed, gpuWaitMaxMs);
+    if (pendingFence)
+    {
+        fence->SetEventOnCompletion(pendingFence, fenceEvent);
+        WaitForSingleObject(fenceEvent, 250);
+    }
+    for (auto& s : src)
+    {
+        s.Release(shm.get());
+        s.Drop();
+    }
 
-    for (auto& s : src) s.Drop();
+    QueryPerformanceCounter(&now);
+    double total = (double)(now.QuadPart - t0.QuadPart) / freq.QuadPart;
+    Log(L"composited %.1fs: %llu vblanks (%.2f Hz), %llu presents, %llu copy stalls", total, vblanks, vblanks / std::max(total, 0.001), presents, stalls);
+
     CloseHandle(driverProc);
     CloseHandle(fenceEvent);
-    mgr.ReleaseTarget(target);
-    return 0;
+    try
+    {
+        mgr.ReleaseTarget(target);
+    }
+    catch (...)
+    {
+    }
+    return outcome;
+}
+
+// One full split session: plug, take over, composite until stop / loss.
+// Returns true if the session ended because a stop was requested.
+static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
+{
+    SharedView shm;
+    if (!shm.Open()) throw std::runtime_error("SplitDisplay driver not loaded");
+
+    // Counters survive from earlier sessions, so require fresh frames after this plug.
+    LONG64 base0 = shm->mon[0].frameSeq, base1 = shm->mon[1].frameSeq;
+    shm->config = { panel.width, panel.height / 2, (UINT32)std::lround(panel.refreshHz), panel.adapter };
+    MemoryBarrier();
+    InterlockedExchange(&shm->desiredPlugged, 1);
+    shm.Kick();
+    auto live = [&] {
+        return shm->mon[0].plugged && shm->mon[1].plugged && shm->mon[0].frameSeq > base0 && shm->mon[1].frameSeq > base1 &&
+               IsTargetActive(L"Split Upper") && IsTargetActive(L"Split Lower");
+    };
+    for (int i = 0; i < 100 && !live(); i++)
+        if (!Nap(100)) return true;
+    if (!live()) throw std::runtime_error("virtual monitors did not come up");
+    Log(L"virtual monitors live");
+    if (scale) SetScalePercentForMonitors(L"Split ", scale);
+    Beat();
+
+    LONG r = SetSpecialization(panel.adapter, panel.targetId, true);
+    Log(L"panel removed from desktop -> %ld", r);
+    if (r != ERROR_SUCCESS) throw std::runtime_error("could not remove panel from desktop");
+    for (int i = 0; i < 40 && IsTargetActive(L"Sculptor"); i++)
+        if (!Nap(250)) return true;
+    for (int i = 0; i < 10 && !ArrangeVirtualMonitors(); i++)
+        if (!Nap(300)) return true;
+
+    for (;;)
+    {
+        Outcome o = Composite(shm, panel, deadline);
+        if (o == Outcome::Stop) return true;
+        if (o == Outcome::Lost) return false;
+
+        // DisplaysOff: panel released (no signal -> it sleeps). Resume on the first new frame.
+        Log(L"virtual displays off, panel released");
+        while (!AnyVirtualSignal(shm.get()))
+        {
+            if (!Nap(200)) return true;
+            if (deadline && GetTickCount64() >= deadline) return true;
+        }
+        Log(L"virtual displays back on");
+    }
 }
 
 static int CmdRun(DWORD testSeconds)
 {
-    auto panel = FindPanel();
-    if (!panel || !panel->active)
+    HANDLE instance = CreateMutexW(nullptr, TRUE, kInstanceMutexName);
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        Log(L"Sculptor not found or not on the desktop (run 'splitdisplay revert' first?)");
+        Log(L"already running");
         return 1;
     }
-    if (panel->height % 2)
-    {
-        Log(L"unexpected panel height %u", panel->height);
-        return 1;
-    }
-    auto spec = GetSpecialization(panel->adapter, panel->targetId);
-    if (!spec.availableForMonitor || !spec.availableForSystem)
-    {
-        Log(L"panel cannot be removed from the desktop on this system");
-        return 1;
-    }
-    SharedView shm;
-    if (!shm.Open())
-    {
-        Log(L"SplitDisplay driver not loaded");
-        return 1;
-    }
-    Log(L"panel %ux%u@%.2f, driver pid %lu", panel->width, panel->height, panel->refreshHz, shm->driverPid);
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, kStopEventName);
 
     HANDLE hbMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(LONG64), HeartbeatName(GetCurrentProcessId()).c_str());
     g_heartbeat = (volatile LONG64*)MapViewOfFile(hbMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LONG64));
     Beat();
 
-    int scale = GetScalePercentForTarget(panel->adapter, panel->targetId);
-    SpawnWatchdog(*panel, testSeconds ? testSeconds + 30 : 0);
-
     std::thread hotkeys(HotkeyThread);
+    winrt::init_apartment();
 
-    int rc = 0;
-    try
+    ULONGLONG deadline = testSeconds ? GetTickCount64() + testSeconds * 1000ULL : 0;
+    bool watchdogArmed = false;
+    int scale = 0;
+    int failures = 0;
+    ULONGLONG firstFailure = 0;
+
+    while (!StopRequested())
     {
-        // 1. Virtual monitors, half the panel each, rendered on the panel's GPU.
-        // Counters survive from earlier sessions, so require fresh frames after this plug.
-        LONG64 base0 = shm->mon[0].frameSeq, base1 = shm->mon[1].frameSeq;
-        shm->config = { panel->width, panel->height / 2, (UINT32)std::lround(panel->refreshHz), panel->adapter };
-        MemoryBarrier();
-        InterlockedExchange(&shm->desiredPlugged, 1);
-        shm.Kick();
-        auto live = [&] {
-            return shm->mon[0].plugged && shm->mon[1].plugged && shm->mon[0].frameSeq > base0 && shm->mon[1].frameSeq > base1 &&
-                   IsTargetActive(L"Split Upper") && IsTargetActive(L"Split Lower");
-        };
-        for (int i = 0; i < 100 && !live(); i++)
+        auto panel = FindCombinedPanel();
+        if (!panel)
         {
-            Beat();
-            Sleep(100);
+            // Not connected, or connected over DP as two real monitors: nothing to do.
+            if (!Nap(2000)) break;
+            continue;
         }
-        if (!live()) throw std::runtime_error("virtual monitors did not come up");
-        Log(L"virtual monitors live");
-        if (scale) SetScalePercentForMonitors(L"Split ", scale);
-        Beat();
-
-        // 2. Take the panel off the desktop; Windows now only has the two virtual monitors.
-        LONG r = SetSpecialization(panel->adapter, panel->targetId, true);
-        Log(L"SetSpecialization(true) -> %ld", r);
-        if (r != ERROR_SUCCESS) throw std::runtime_error("specialization failed");
-        for (int i = 0; i < 40 && IsTargetActive(L"Sculptor"); i++)
+        if (!panel->active)
         {
-            Beat();
-            Sleep(250);
+            Log(L"panel found off the desktop (stale state), restoring it first");
+            RevertAll(panel->adapter, panel->targetId);
+            if (!Nap(1000)) break;
+            continue;
         }
-        for (int i = 0; i < 10 && !ArrangeVirtualMonitors(); i++)
+
+        SharedView probe;
+        if (!probe.Open())
         {
-            Beat();
-            Sleep(300);
+            Log(L"driver not loaded, waiting");
+            if (!Nap(5000)) break;
+            continue;
         }
-        Beat();
+        probe.Close();
 
-        // 3. Drive the panel ourselves.
-        winrt::init_apartment();
-        rc = Composite(shm, *panel, testSeconds);
-    }
-    catch (winrt::hresult_error const& e)
-    {
-        Log(L"WinRT error 0x%08X: %s", (UINT)e.code(), e.message().c_str());
-        rc = 7;
-    }
-    catch (std::exception const& e)
-    {
-        Log(L"error: %S", e.what());
-        rc = 8;
+        int s = GetScalePercentForTarget(panel->adapter, panel->targetId);
+        if (s) scale = s;
+        Log(L"session start: panel %ux%u@%.2f, scale %d%%", panel->width, panel->height, panel->refreshHz, scale);
+        if (!watchdogArmed)
+        {
+            SpawnWatchdog(*panel, testSeconds ? testSeconds + 30 : 0);
+            watchdogArmed = true;
+        }
+
+        bool stopped = false;
+        try
+        {
+            stopped = RunSession(*panel, scale, deadline);
+        }
+        catch (winrt::hresult_error const& e)
+        {
+            Log(L"WinRT error 0x%08X: %s", (UINT)e.code(), e.message().c_str());
+        }
+        catch (std::exception const& e)
+        {
+            Log(L"error: %S", e.what());
+        }
+        RevertAll(panel->adapter, panel->targetId);
+        if (stopped || StopRequested() || (deadline && GetTickCount64() >= deadline)) break;
+
+        // Back off on repeated failures so a persistent problem cannot flicker the screen forever.
+        ULONGLONG t = GetTickCount64();
+        if (!firstFailure || t - firstFailure > 120000)
+        {
+            firstFailure = t;
+            failures = 0;
+        }
+        if (++failures >= 3)
+        {
+            Log(L"3 failures within 2 minutes, giving up; panel stays a single display");
+            break;
+        }
+        Log(L"session lost, retrying in 3s");
+        if (!Nap(3000)) break;
     }
 
-    RevertAll(panel->adapter, panel->targetId);
     g_hotkeyQuit = true;
     hotkeys.join();
-    return rc;
+    Log(L"exit");
+    CloseHandle(instance);
+    return 0;
 }
 
 #pragma endregion
@@ -602,12 +786,13 @@ int wmain(int argc, wchar_t** argv)
         if (argc > 3 && std::wstring(argv[2]) == L"--test") test = (DWORD)_wtoi(argv[3]);
         return CmdRun(test);
     }
+    if (cmd == L"stop") return CmdStop();
     if (cmd == L"revert") return CmdRevert();
     if (cmd == L"watchdog" && argc >= 7)
     {
         LUID l{ (DWORD)wcstoul(argv[3], nullptr, 10), (LONG)wcstol(argv[4], nullptr, 10) };
         return CmdWatchdog(wcstoul(argv[2], nullptr, 10), l, wcstoul(argv[5], nullptr, 10), wcstoul(argv[6], nullptr, 10));
     }
-    Log(L"usage: splitdisplay run [--test SECONDS] | revert");
+    Log(L"usage: splitdisplay run [--test SECONDS] | stop | revert");
     return 1;
 }

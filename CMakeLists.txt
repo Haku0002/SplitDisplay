@@ -12,8 +12,6 @@ add_library(sdcommon STATIC src/common/panel.cpp src/common/log.cpp src/common/s
 target_include_directories(sdcommon PUBLIC src/common)
 target_link_libraries(sdcommon PUBLIC windowsapp d3d11 dxgi ntdll ole32)
 
-add_executable(panel_test src/panel_test/main.cpp)
-target_link_libraries(panel_test PRIVATE sdcommon)
 
 # ---- IDD driver (UMDF 2 / IddCx), built against the WDK NuGet package in third_party/wdk ----
 set(WDK_ROOT ${CMAKE_SOURCE_DIR}/third_party/wdk/c)
@@ -38,3 +36,5 @@ target_link_libraries(sdctl PRIVATE sdcommon setupapi newdev)
 
 add_executable(splitdisplay src/splitdisplay/main.cpp src/splitdisplay/topology.cpp)
 target_link_libraries(splitdisplay PRIVATE sdcommon)
+# No console window when started at logon; everything goes to splitdisplay.log.
+target_link_options(splitdisplay PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup)
