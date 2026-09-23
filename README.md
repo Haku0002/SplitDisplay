@@ -67,8 +67,8 @@ remaining desktop display. Disabling an override that is not set returns `ERROR_
 
 ## Download
 
-Prebuilt zips are on the [Releases](https://github.com/brkDOTstl/SplitDisplay/releases) page. Unzip, double-click
-`Install.cmd`, and pick the display to split. The installer signs the bundled driver with a certificate created on
+Prebuilt zips are on the [Releases](https://github.com/brkDOTstl/SplitDisplay/releases) page. Unzip and double-click
+`Install.cmd`; the display to split is detected automatically (with several displays, click it on the map). The installer signs the bundled driver with a certificate created on
 your machine and deletes its private key right after. Nothing needs to be built, and test-signing mode is not used.
 
 ## Requirements
@@ -109,7 +109,8 @@ key safe, or delete it from `CurrentUser\My` once the driver is installed.
 Start `splitdisplay.exe` without arguments (the installer opens it for you) to get the settings window:
 
 - **Status**: driver, display and split state.
-- **Display to split**: pick the monitor by name.
+- **Displays**: a map of all connected displays at their desktop positions (name, resolution, connector). Click
+  the one to split and press *Split this display*. Other displays are left where they are.
 - **Start / Stop split** and **Start automatically when I sign in**.
 - **Layout editor**: a live preview of the panel. Edits are a draft until you press *Apply layout*, which saves the
   layout and restarts a running split.
@@ -129,7 +130,8 @@ the panel.
 | `splitdisplay run` | split the panel and keep it split, recovering from GPU resets, hot-plug and display power-off |
 | `splitdisplay run --test 30` | split for 30 seconds, then restore |
 | `splitdisplay stop` | stop a running instance (it restores the panel) |
-| `splitdisplay --panel "<name>" configure` | save the display to split |
+| `splitdisplay --panel "<name>" configure` | select the display to split by name |
+| `splitdisplay autodetect` | select a display automatically if none is selected |
 | `splitdisplay autostart on\|off` | create/enable or disable the logon task |
 | `splitdisplay revert` | restore the panel and unplug the virtual monitors |
 | `Ctrl+Alt+Shift+F12` | emergency exit while running |
@@ -138,13 +140,14 @@ the panel.
 
 Logs are written to `%ProgramData%\SplitDisplay\`.
 
-Settings live in `%ProgramData%\SplitDisplay\config.ini`: `panel` (monitor name prefix, default `Sculptor`) and
-`layout`. A layout is a cut tree in panel pixels, `L` for one monitor, `R(size:node,...)` for rows and
+Settings live in `%ProgramData%\SplitDisplay\config.ini`: `panel_id` (the selected monitor's device path), `panel`
+(its name, used as a case-insensitive fallback) and `layout`. With nothing selected, the only taller-than-wide
+display (or the only display) is picked automatically. A layout is a cut tree in panel pixels, `L` for one monitor, `R(size:node,...)` for rows and
 `C(size:node,...)` for columns. For example, `R(1440:L,1440:C(1280:L,1280:L))` is a full-width top half and a bottom
 half split into two. When the panel resolution differs, sizes are applied proportionally.
 
-The display is split only if exactly one connected monitor matches the name. A foldable panel connected over DP
-appears as two monitors with the same name and is left alone.
+A display selected by name only is split if exactly one connected monitor matches; it is then remembered by device
+path. A foldable panel connected over DP appears as two different monitors and is left alone.
 
 ## Safety
 
