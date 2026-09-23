@@ -1,0 +1,67 @@
+;
+; SplitDisplayIdd.inf - SplitDisplay virtual monitor (indirect display) driver
+;
+
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=SplitDisplayIdd.cat
+DriverVer=09/23/2026,1.0.0.1
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64.10.0...22000
+
+[Standard.NTamd64.10.0...22000]
+%DeviceName%=SplitDisplay_Install, Root\SplitDisplayIdd
+
+[SourceDisksFiles]
+SplitDisplayIdd.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[SplitDisplay_Install.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+CopyFiles=UMDriverCopy
+
+[SplitDisplay_Install.NT.hw]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+AddReg=SplitDisplay_HardwareDeviceSettings
+
+[SplitDisplay_HardwareDeviceSettings]
+HKR,, "UpperFilters", %REG_MULTI_SZ%, "IndirectKmd"
+HKR, "WUDF", "DeviceGroupId", %REG_SZ%, "SplitDisplayIddGroup"
+
+[SplitDisplay_Install.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[SplitDisplay_Install.NT.Wdf]
+UmdfService=SplitDisplayIdd,SplitDisplayIdd_Install
+UmdfServiceOrder=SplitDisplayIdd
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+
+[SplitDisplayIdd_Install]
+UmdfLibraryVersion=2.25.0
+ServiceBinary=%13%\SplitDisplayIdd.dll
+UmdfExtensions=IddCx0102
+
+[DestinationDirs]
+UMDriverCopy=13
+
+[UMDriverCopy]
+SplitDisplayIdd.dll
+
+[Strings]
+ManufacturerName="SplitDisplay"
+DiskName="SplitDisplay Installation Disk"
+DeviceName="SplitDisplay Virtual Panel"
+
+REG_MULTI_SZ = 0x00010000
+REG_SZ       = 0x00000000
