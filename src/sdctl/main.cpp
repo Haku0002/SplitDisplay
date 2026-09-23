@@ -13,6 +13,7 @@
 #include <cfgmgr32.h>
 
 #include <cmath>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -75,6 +76,16 @@ static int DriverInstall(const wchar_t* inf)
         return 1;
     }
     Log(L"driver installed%s", reboot ? L" (reboot requested)" : L"");
+
+    // Installing an INF with a Root\ hardware id can make PnP create a second node; keep only one.
+    HDEVINFO set = SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, nullptr, nullptr, 0);
+    auto devs = FindOurDevices(set);
+    for (size_t i = 1; i < devs.size(); i++)
+    {
+        BOOL rb = FALSE;
+        Log(L"removing duplicate device node: %s", DiUninstallDevice(nullptr, set, &devs[i], 0, &rb) ? L"ok" : L"failed");
+    }
+    SetupDiDestroyDeviceInfoList(set);
     return 0;
 }
 
@@ -175,6 +186,42 @@ static int Status()
     return 0;
 }
 
+// Exercises the remove-from-desktop packet on the invisible "Split Lower" monitor only.
+static int SpecTest()
+{
+    if (Plug(1, nullptr) != 0) return 1;
+    Sleep(1500);
+    std::optional<PanelTarget> lower;
+    for (auto& t : EnumTargets())
+        if (t.friendlyName.rfind(L"Split Lower", 0) == 0) lower = t;
+    int rc = 1;
+    if (lower)
+    {
+        auto s = GetSpecialization(lower->adapter, lower->targetId);
+        Log(L"Split Lower: active=%d spec(ok=%d en=%d mon=%d sys=%d)", lower->active, s.ok, s.enabled, s.availableForMonitor, s.availableForSystem);
+        auto activeNow = [&] {
+            for (auto& t : EnumTargets())
+                if (t.targetId == lower->targetId && t.adapter.LowPart == lower->adapter.LowPart) return t.active;
+            return false;
+        };
+        LONG r1 = SetSpecialization(lower->adapter, lower->targetId, true);
+        Sleep(2000);
+        bool afterEnable = activeNow();
+        s = GetSpecialization(lower->adapter, lower->targetId);
+        Log(L"enable -> %ld, active=%d, GET en=%d", r1, afterEnable, s.enabled);
+        LONG r2 = SetSpecialization(lower->adapter, lower->targetId, false);
+        Sleep(2000);
+        bool afterDisable = activeNow();
+        Log(L"disable -> %ld, active=%d", r2, afterDisable);
+        LONG r3 = SetSpecialization(lower->adapter, lower->targetId, false);
+        Log(L"second disable -> %ld", r3);
+        rc = (r1 == 0 && !afterEnable && r2 == 0 && afterDisable) ? 0 : 2;
+        Log(L"spec-test %s", rc == 0 ? L"PASSED" : L"FAILED");
+    }
+    Unplug();
+    return rc;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     LogInit(L"sdctl.log");
@@ -184,6 +231,7 @@ int wmain(int argc, wchar_t** argv)
     if (cmd == L"plug") return Plug(argc, argv);
     if (cmd == L"unplug") return Unplug();
     if (cmd == L"status") return Status();
+    if (cmd == L"spec-test") return SpecTest();
     Log(L"usage: sdctl driver-install <inf> | driver-remove | plug [w h hz] | unplug | status");
     return 1;
 }

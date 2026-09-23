@@ -18,6 +18,10 @@ using namespace SplitDisplay;
 
 static SdShared* g_Shm = nullptr;
 
+// Only one adapter instance per host process may own the shared memory and plug monitors;
+// a duplicate root device node would otherwise double the monitors.
+static std::atomic<void*> g_Owner = nullptr;
+
 // Config captured when monitors were plugged; the mode callbacks answer from this snapshot.
 static SdConfig g_Cfg = { 2560, 1440, 100, {} };
 
@@ -536,6 +540,8 @@ IndirectDeviceContext::~IndirectDeviceContext()
         g_Shm = nullptr;
     }
     if (m_Section) CloseHandle(m_Section);
+    void* self = this;
+    g_Owner.compare_exchange_strong(self, nullptr);
 }
 
 void IndirectDeviceContext::InitAdapter()
@@ -577,6 +583,13 @@ void IndirectDeviceContext::InitAdapter()
 void IndirectDeviceContext::FinishInit()
 {
     if (m_Thread) return;
+
+    void* expected = nullptr;
+    if (!g_Owner.compare_exchange_strong(expected, this))
+    {
+        DLog(L"another SplitDisplay adapter already owns the shared memory; this one stays idle");
+        return;
+    }
 
     // SYSTEM, Administrators, LocalService, NetworkService.
     SECURITY_ATTRIBUTES sa = { sizeof(sa) };

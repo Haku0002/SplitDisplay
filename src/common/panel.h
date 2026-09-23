@@ -1,6 +1,7 @@
 #pragma once
 #include <Windows.h>
 #include <optional>
+#include <objbase.h>
 #include <string>
 #include <vector>
 

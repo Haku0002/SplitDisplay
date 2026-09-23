@@ -1,10 +1,79 @@
 #include "panel.h"
 
 #include <wingdi.h>
+#include <winternl.h>
 
-// {5B1C8E0A-6F43-4E7B-9C5D-2E1A7F3B9D10} / {5B1C8E0A-6F43-4E7B-9C5D-2E1A7F3B9D11}
-static constexpr GUID kSpecializationType = { 0x5b1c8e0a, 0x6f43, 0x4e7b, { 0x9c, 0x5d, 0x2e, 0x1a, 0x7f, 0x3b, 0x9d, 0x10 } };
-static constexpr GUID kSpecializationSubType = { 0x5b1c8e0a, 0x6f43, 0x4e7b, { 0x9c, 0x5d, 0x2e, 0x1a, 0x7f, 0x3b, 0x9d, 0x11 } };
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Devices.Display.Core.h>
+
+// Settings > Display > Advanced display > "Remove display from desktop" does not use the
+// documented SET_MONITOR_SPECIALIZATION packet. It hands SystemSettingsAdminFlows.exe a
+// "SpecializeDisplay" command, which sends this undocumented packet (type -23, 48 bytes).
+// Reverse engineered from SettingsHandlers_PCDisplay.dll / SystemSettingsAdminFlows.exe with
+// public symbols. Requires elevation.
+
+// {F196C02F-F86F-4F9A-AA15-E9CEBDFE3B96}, ntddvdeo.h
+static constexpr GUID kPseudoSpecialized = { 0xf196c02f, 0xf86f, 0x4f9a, { 0xaa, 0x15, 0xe9, 0xce, 0xbd, 0xfe, 0x3b, 0x96 } };
+static constexpr int kSetMonitorOverride = -23;
+
+#pragma pack(push, 4)
+struct MonitorOverridePacket
+{
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header; // 20 bytes
+    GUID overrideType;                       // offset 20
+    INT32 enable;                            // offset 36
+    UINT64 hash;                             // offset 40
+};
+#pragma pack(pop)
+static_assert(sizeof(MonitorOverridePacket) == 48);
+
+extern "C" NTSYSAPI NTSTATUS NTAPI RtlHashUnicodeString(PCUNICODE_STRING String, BOOLEAN CaseInSensitive, ULONG HashAlgorithm, PULONG HashValue);
+
+// Hash of StableMonitorId + "{GUID}", computed as two 32-bit halves exactly like Settings does.
+static UINT64 OverrideHash(const std::wstring& stableMonitorId)
+{
+    wchar_t guid[64];
+    StringFromGUID2(kPseudoSpecialized, guid, 64);
+    std::wstring s = stableMonitorId + guid;
+    if (s.size() > 0x140) s.resize(0x140); // Settings uses a 0x288-byte buffer
+
+    USHORT total = (USHORT)(s.size() * sizeof(wchar_t));
+    USHORT half = (USHORT)((total >> 1) & 0x7ffe);
+
+    ULONG lo = 0, hi = 0;
+    UNICODE_STRING u{ half, half, s.data() };
+    RtlHashUnicodeString(&u, TRUE, 0, &lo);
+    if (total > 2)
+    {
+        UNICODE_STRING v{ (USHORT)(total - half), (USHORT)(total - half), (PWSTR)((BYTE*)s.data() + half) };
+        RtlHashUnicodeString(&v, TRUE, 0, &hi);
+    }
+    return ((UINT64)hi << 32) | lo;
+}
+
+static std::wstring StableMonitorId(LUID adapter, UINT32 targetId)
+{
+    try
+    {
+        auto mgr = winrt::Windows::Devices::Display::Core::DisplayManager::Create(winrt::Windows::Devices::Display::Core::DisplayManagerOptions::None);
+        for (auto&& t : mgr.GetCurrentTargets())
+        {
+            auto id = t.Adapter().Id();
+            if (id.LowPart == adapter.LowPart && id.HighPart == adapter.HighPart && t.AdapterRelativeId() == targetId)
+            {
+                std::wstring s(t.StableMonitorId());
+                mgr.Close();
+                return s;
+            }
+        }
+        mgr.Close();
+    }
+    catch (...)
+    {
+    }
+    return L"";
+}
 
 static bool QueryAll(UINT32 flags, std::vector<DISPLAYCONFIG_PATH_INFO>& paths, std::vector<DISPLAYCONFIG_MODE_INFO>& modes)
 {
@@ -111,14 +180,16 @@ SpecializationState GetSpecialization(LUID adapter, UINT32 targetId)
 
 LONG SetSpecialization(LUID adapter, UINT32 targetId, bool enable)
 {
-    DISPLAYCONFIG_SET_MONITOR_SPECIALIZATION s{};
-    s.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_MONITOR_SPECIALIZATION;
-    s.header.size = sizeof(s);
-    s.header.adapterId = adapter;
-    s.header.id = targetId;
-    s.isSpecializationEnabled = enable ? 1 : 0;
-    s.specializationType = kSpecializationType;
-    s.specializationSubType = kSpecializationSubType;
-    wcscpy_s(s.specializationApplicationName, L"SplitDisplay");
-    return DisplayConfigSetDeviceInfo(&s.header);
+    std::wstring stable = StableMonitorId(adapter, targetId);
+    if (stable.empty()) return ERROR_NOT_FOUND;
+
+    MonitorOverridePacket p{};
+    p.header.type = (DISPLAYCONFIG_DEVICE_INFO_TYPE)kSetMonitorOverride;
+    p.header.size = sizeof(p);
+    p.header.adapterId = adapter;
+    p.header.id = targetId;
+    p.overrideType = kPseudoSpecialized;
+    p.enable = enable ? 1 : 0;
+    p.hash = OverrideHash(stable);
+    return DisplayConfigSetDeviceInfo(&p.header);
 }

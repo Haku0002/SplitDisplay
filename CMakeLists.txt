@@ -10,7 +10,7 @@ add_compile_options(/W4 /permissive- /EHsc /utf-8 /await:strict)
 
 add_library(sdcommon STATIC src/common/panel.cpp src/common/log.cpp src/common/shm.cpp)
 target_include_directories(sdcommon PUBLIC src/common)
-target_link_libraries(sdcommon PUBLIC windowsapp d3d11 dxgi)
+target_link_libraries(sdcommon PUBLIC windowsapp d3d11 dxgi ntdll ole32)
 
 add_executable(panel_test src/panel_test/main.cpp)
 target_link_libraries(panel_test PRIVATE sdcommon)
@@ -35,3 +35,6 @@ target_link_libraries(SplitDisplayIdd PRIVATE
 
 add_executable(sdctl src/sdctl/main.cpp)
 target_link_libraries(sdctl PRIVATE sdcommon setupapi newdev)
+
+add_executable(splitdisplay src/splitdisplay/main.cpp src/splitdisplay/topology.cpp)
+target_link_libraries(splitdisplay PRIVATE sdcommon)
