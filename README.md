@@ -62,10 +62,18 @@ and the second half's hash is the high 32 bits. The call requires elevation. Win
 remaining desktop display. Disabling an override that is not set returns `ERROR_GEN_FAILURE`. See
 `src/common/panel.cpp`.
 
+## Download
+
+Prebuilt zips are on the [Releases](https://github.com/brkDOTstl/SplitDisplay/releases) page. Unzip, double-click
+`Install.cmd`, and pick the display to split. The installer signs the bundled driver with a certificate created on
+your machine and deletes its private key right after. Nothing needs to be built, and test-signing mode is not used.
+
 ## Requirements
 
 - Windows 11 with a GPU driver that supports display specialization: the Settings toggle
-  "Remove display from desktop" must be available for the panel.
+  "Remove display from desktop" must be available for the panel. Nothing is vendor specific. Developed and tested on
+  an NVIDIA RTX 4060; AMD and Intel are untested. The virtual monitors must render on the GPU the panel is attached
+  to. The driver requests this, and the log warns if Windows picks another GPU.
 - Visual Studio 2022/2026 with the C++ workload and the Windows 11 SDK (10.0.26100), plus CMake.
 - Administrator rights.
 
@@ -97,6 +105,7 @@ key safe, or delete it from `CurrentUser\My` once the driver is installed.
 
 | command | effect |
 |---|---|
+| `splitdisplay --panel "<name>" ...` | any command: the monitor name prefix to split (default `Sculptor`) |
 | `splitdisplay run` | split the panel and keep it split, recovering from GPU resets, hot-plug and display power-off |
 | `splitdisplay run --test 30` | split for 30 seconds, then restore |
 | `splitdisplay stop` | stop a running instance (it restores the panel) |
@@ -107,7 +116,7 @@ key safe, or delete it from `CurrentUser\My` once the driver is installed.
 
 Logs are written to `%ProgramData%\SplitDisplay\`.
 
-The panel is matched by its EDID name prefix (`kPanelNamePrefix` in `src/common/panel.h`, default `Sculptor`).
+The panel is matched by its EDID name prefix (`--panel`, default `Sculptor`).
 Only a combined, taller-than-wide target is split. A panel connected over DP as two monitors is left alone.
 
 ## Safety

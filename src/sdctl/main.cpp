@@ -225,6 +225,7 @@ static int SpecTest()
 int wmain(int argc, wchar_t** argv)
 {
     LogInit(L"sdctl.log");
+    ParsePanelOption(argc, argv);
     std::wstring cmd = argc > 1 ? argv[1] : L"status";
     if (cmd == L"driver-install" && argc > 2) return DriverInstall(argv[2]);
     if (cmd == L"driver-remove") return DriverRemove();

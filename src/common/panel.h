@@ -5,9 +5,12 @@
 #include <string>
 #include <vector>
 
-// Monitor name (EDID friendly name prefix) of the physical panel to split. Change this for
-// panels other than the Sculptor foldable.
-inline constexpr wchar_t kPanelNamePrefix[] = L"Sculptor";
+// Monitor name (EDID friendly name prefix) of the physical panel to split. Defaults to the
+// Sculptor foldable; override with --panel "<name>" on the command line.
+const wchar_t* PanelNamePrefix();
+
+// Consumes "--panel <name>" from argv (compacting it) and applies it.
+void ParsePanelOption(int& argc, wchar_t** argv);
 
 // A display target as seen by the DisplayConfig (CCD) API.
 struct PanelTarget
@@ -24,7 +27,7 @@ struct PanelTarget
 // All targets with a connected monitor (active or not).
 std::vector<PanelTarget> EnumTargets();
 
-// The physical panel we split: friendly name starts with kPanelNamePrefix.
+// The physical panel we split: friendly name starts with PanelNamePrefix().
 std::optional<PanelTarget> FindPanel();
 
 // Number of active desktop paths whose target is not the given one.

@@ -75,6 +75,25 @@ static std::wstring StableMonitorId(LUID adapter, UINT32 targetId)
     return L"";
 }
 
+static std::wstring g_panelName = L"Sculptor";
+
+const wchar_t* PanelNamePrefix()
+{
+    return g_panelName.c_str();
+}
+
+void ParsePanelOption(int& argc, wchar_t** argv)
+{
+    for (int i = 1; i + 1 < argc; i++)
+    {
+        if (_wcsicmp(argv[i], L"--panel") != 0) continue;
+        g_panelName = argv[i + 1];
+        for (int j = i; j + 2 <= argc; j++) argv[j] = argv[j + 2];
+        argc -= 2;
+        return;
+    }
+}
+
 static bool QueryAll(UINT32 flags, std::vector<DISPLAYCONFIG_PATH_INFO>& paths, std::vector<DISPLAYCONFIG_MODE_INFO>& modes)
 {
     for (int attempt = 0; attempt < 5; attempt++)
@@ -147,7 +166,7 @@ std::vector<PanelTarget> EnumTargets()
 std::optional<PanelTarget> FindPanel()
 {
     for (auto& t : EnumTargets())
-        if (t.friendlyName.rfind(kPanelNamePrefix, 0) == 0)
+        if (t.friendlyName.rfind(PanelNamePrefix(), 0) == 0)
             return t;
     return std::nullopt;
 }
