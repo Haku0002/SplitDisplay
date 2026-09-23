@@ -281,8 +281,23 @@ std::vector<MapItem> BuildMap()
         for (auto& t : targets)
         {
             if (t.active || t.isVirtual || _wcsicmp(t.monitorDevicePath.c_str(), id) != 0) continue;
-            LONG x = (LONG)get(L"x"), y = (LONG)get(L"y");
-            items.push_back({ t, { x, y, x + (LONG)get(L"w"), y + (LONG)get(L"h") }, (int)get(L"count"), (int)get(L"first") });
+            int first = (int)get(L"first"), count = (int)get(L"count");
+            RECT area{};
+            bool any = false;
+            for (auto& v : targets)
+            {
+                int vi = VirtualIndex(v);
+                if (!v.active || vi <= first || vi > first + count) continue;
+                RECT r{ v.position.x, v.position.y, v.position.x + (LONG)v.width, v.position.y + (LONG)v.height };
+                area = any ? RECT{ std::min(area.left, r.left), std::min(area.top, r.top), std::max(area.right, r.right), std::max(area.bottom, r.bottom) } : r;
+                any = true;
+            }
+            if (!any)
+            {
+                LONG x = (LONG)get(L"x"), y = (LONG)get(L"y");
+                area = { x, y, x + (LONG)get(L"w"), y + (LONG)get(L"h") };
+            }
+            items.push_back({ t, area, count, first });
             break;
         }
     }
@@ -341,7 +356,6 @@ void PaintMap(HWND canvas, HDC dc)
     }
     auto tf = MapTransformFor(canvas);
     auto panels = LoadPanels();
-    auto targets = EnumTargets();
     for (auto& m : g.map)
     {
         RECT r = tf.ToCanvas(m.desk);
@@ -360,33 +374,6 @@ void PaintMap(HWND canvas, HDC dc)
         }
         DeleteObject(edge);
 
-        // Dashed lines show where a split display is currently cut.
-        if (m.splitInto)
-        {
-            HPEN pen = CreatePen(PS_DOT, 1, RGB(0x40, 0x40, 0x40));
-            HGDIOBJ old = SelectObject(mem, pen);
-            for (auto& t : targets)
-            {
-                int vi = VirtualIndex(t);
-                if (!t.active || vi <= m.first || vi > m.first + m.splitInto) continue;
-                // Only interior cuts: the top/left edges of pieces that are not on the outline.
-                if (t.position.y > m.desk.top)
-                {
-                    RECT v = tf.ToCanvas({ t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height });
-                    MoveToEx(mem, std::max(v.left, r.left), v.top, nullptr);
-                    LineTo(mem, std::min(v.right, r.right), v.top);
-                }
-                if (t.position.x > m.desk.left)
-                {
-                    RECT v = tf.ToCanvas({ t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height });
-                    MoveToEx(mem, v.left, std::max(v.top, r.top), nullptr);
-                    LineTo(mem, v.left, std::min(v.bottom, r.bottom));
-                }
-            }
-            SelectObject(mem, old);
-            DeleteObject(pen);
-        }
-
         std::wstring label = Trimmed(m.target.friendlyName);
         if (label.empty()) label = L"Display";
         label += L"\n" + std::to_wstring(m.target.width) + L"x" + std::to_wstring(m.target.height);
@@ -398,8 +385,7 @@ void PaintMap(HWND canvas, HDC dc)
         RECT measure = r;
         DrawTextW(mem, label.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
         RECT t = r;
-        // A split display keeps its label clear of the cut lines, at the top.
-        t.top = m.splitInto ? r.top + S(6) : std::max(r.top, (r.top + r.bottom - (measure.bottom - measure.top)) / 2);
+        t.top = std::max(r.top, (r.top + r.bottom - (measure.bottom - measure.top)) / 2);
         DrawTextW(mem, label.c_str(), -1, &t, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
     }
 
