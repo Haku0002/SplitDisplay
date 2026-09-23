@@ -5,7 +5,10 @@
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Devices.Display.h>
 #include <winrt/Windows.Devices.Display.Core.h>
+
+#include <cwctype>
 
 // Settings > Display > Advanced display > "Remove display from desktop" does not use the
 // documented SET_MONITOR_SPECIALIZATION packet. It hands SystemSettingsAdminFlows.exe a
@@ -75,18 +78,6 @@ static std::wstring StableMonitorId(LUID adapter, UINT32 targetId)
     return L"";
 }
 
-static std::wstring g_panelName = L"Sculptor";
-
-const wchar_t* PanelNamePrefix()
-{
-    return g_panelName.c_str();
-}
-
-void SetPanelNamePrefix(const std::wstring& name)
-{
-    if (!name.empty()) g_panelName = name;
-}
-
 static std::wstring ConfigPath()
 {
     wchar_t path[MAX_PATH];
@@ -110,28 +101,92 @@ bool SaveConfigValue(const wchar_t* key, const std::wstring& value)
     return WritePrivateProfileStringW(L"SplitDisplay", key, (L"\"" + value + L"\"").c_str(), ConfigPath().c_str()) != FALSE;
 }
 
-std::wstring LoadConfiguredPanel()
+#pragma region Panel selection
+
+static std::wstring g_panelId;   // monitor device path
+static std::wstring g_panelName; // fallback: name prefix
+
+static std::wstring Trim(std::wstring s)
 {
-    return LoadConfigValue(L"panel");
+    while (!s.empty() && iswspace(s.back())) s.pop_back();
+    while (!s.empty() && iswspace(s.front())) s.erase(0, 1);
+    return s;
 }
 
-bool SaveConfiguredPanel(const std::wstring& name)
+static bool StartsWithNoCase(const std::wstring& s, const std::wstring& prefix)
 {
-    return SaveConfigValue(L"panel", name);
+    return !prefix.empty() && s.size() >= prefix.size() && _wcsnicmp(s.c_str(), prefix.c_str(), prefix.size()) == 0;
+}
+
+std::wstring PanelId()
+{
+    return g_panelId;
+}
+
+std::wstring PanelNamePrefix()
+{
+    return g_panelName;
+}
+
+bool HasPanelSelection()
+{
+    return !g_panelId.empty() || !g_panelName.empty();
+}
+
+void SetPanelNamePrefix(const std::wstring& name)
+{
+    g_panelName = Trim(name);
+}
+
+void SelectPanel(const PanelTarget& t)
+{
+    g_panelId = t.monitorDevicePath;
+    g_panelName = Trim(t.friendlyName);
+    SaveConfigValue(L"panel_id", g_panelId);
+    SaveConfigValue(L"panel", g_panelName);
+}
+
+bool MatchesPanel(const PanelTarget& t)
+{
+    if (t.isVirtual) return false;
+    if (!g_panelId.empty()) return _wcsicmp(t.monitorDevicePath.c_str(), g_panelId.c_str()) == 0;
+    return StartsWithNoCase(Trim(t.friendlyName), g_panelName);
 }
 
 void ParsePanelOption(int& argc, wchar_t** argv)
 {
-    SetPanelNamePrefix(LoadConfiguredPanel());
+    g_panelId = LoadConfigValue(L"panel_id");
+    g_panelName = Trim(LoadConfigValue(L"panel"));
     for (int i = 1; i + 1 < argc; i++)
     {
         if (_wcsicmp(argv[i], L"--panel") != 0) continue;
-        g_panelName = argv[i + 1];
+        // An explicit name overrides the stored selection.
+        g_panelName = Trim(argv[i + 1]);
+        g_panelId.clear();
         for (int j = i; j + 2 <= argc; j++) argv[j] = argv[j + 2];
         argc -= 2;
         return;
     }
 }
+
+std::wstring ConnectorName(DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY t)
+{
+    switch (t)
+    {
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI: return L"HDMI";
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL: return L"DisplayPort";
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED: return L"Built-in (eDP)";
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_USB_TUNNEL: return L"USB-C";
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL: return L"Built-in";
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DVI: return L"DVI";
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HD15: return L"VGA";
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST: return L"Wireless";
+    case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED: return L"Indirect";
+    default: return L"";
+    }
+}
+
+#pragma endregion
 
 static bool QueryAll(UINT32 flags, std::vector<DISPLAYCONFIG_PATH_INFO>& paths, std::vector<DISPLAYCONFIG_MODE_INFO>& modes)
 {
@@ -149,6 +204,12 @@ static bool QueryAll(UINT32 flags, std::vector<DISPLAYCONFIG_PATH_INFO>& paths, 
         return true;
     }
     return false;
+}
+
+static bool IsOurVirtualName(const std::wstring& name)
+{
+    // "Split 1" .. "Split 8" from SplitDisplayIdd
+    return name.size() == 7 && name.rfind(L"Split ", 0) == 0 && name[6] >= L'1' && name[6] <= L'8';
 }
 
 std::vector<PanelTarget> EnumTargets()
@@ -175,6 +236,7 @@ std::vector<PanelTarget> EnumTargets()
         t.adapter = p.targetInfo.adapterId;
         t.targetId = p.targetInfo.id;
         t.active = active;
+        t.connector = p.targetInfo.outputTechnology;
 
         DISPLAYCONFIG_TARGET_DEVICE_NAME name{};
         name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
@@ -185,13 +247,17 @@ std::vector<PanelTarget> EnumTargets()
         {
             t.friendlyName = name.monitorFriendlyDeviceName;
             t.monitorDevicePath = name.monitorDevicePath;
+            if (t.connector == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER) t.connector = name.outputTechnology;
         }
+        t.isVirtual = IsOurVirtualName(Trim(t.friendlyName));
 
         if (active && p.sourceInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && p.sourceInfo.modeInfoIdx < modes.size())
         {
             auto& sm = modes[p.sourceInfo.modeInfoIdx].sourceMode;
             t.width = sm.width;
             t.height = sm.height;
+            t.position = { sm.position.x, sm.position.y };
+            t.primary = sm.position.x == 0 && sm.position.y == 0;
         }
         if (p.targetInfo.refreshRate.Denominator)
             t.refreshHz = (double)p.targetInfo.refreshRate.Numerator / p.targetInfo.refreshRate.Denominator;
@@ -219,10 +285,18 @@ std::vector<PanelTarget> EnumTargets()
             t.adapter = { id.LowPart, id.HighPart };
             t.targetId = dt.AdapterRelativeId();
             t.friendlyName = monitor.DisplayName();
+            t.monitorDevicePath = monitor.DeviceId();
             auto native = monitor.NativeResolutionInRawPixels();
             t.width = (UINT32)native.Width;
             t.height = (UINT32)native.Height;
+            switch (monitor.PhysicalConnector())
+            {
+            case winrt::Windows::Devices::Display::DisplayMonitorPhysicalConnectorKind::Hdmi: t.connector = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI; break;
+            case winrt::Windows::Devices::Display::DisplayMonitorPhysicalConnectorKind::DisplayPort: t.connector = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL; break;
+            default: break;
+            }
             t.active = false;
+            t.isVirtual = IsOurVirtualName(Trim(t.friendlyName));
             out.push_back(t);
         }
         mgr.Close();
@@ -235,21 +309,24 @@ std::vector<PanelTarget> EnumTargets()
 
 std::optional<PanelTarget> FindPanel()
 {
+    std::optional<PanelTarget> best;
     for (auto& t : EnumTargets())
-        if (t.friendlyName.rfind(PanelNamePrefix(), 0) == 0)
-            return t;
-    return std::nullopt;
+        if (MatchesPanel(t) && (!best || (t.active && !best->active))) best = t;
+    return best;
 }
 
-int CountOtherActiveDisplays(const PanelTarget& panel)
+std::optional<PanelTarget> AutodetectPanel()
 {
-    int n = 0;
+    std::vector<PanelTarget> real, tall;
     for (auto& t : EnumTargets())
     {
-        bool same = t.adapter.LowPart == panel.adapter.LowPart && t.adapter.HighPart == panel.adapter.HighPart && t.targetId == panel.targetId;
-        if (t.active && !same) n++;
+        if (t.isVirtual || !t.active || !t.width || !t.height) continue;
+        real.push_back(t);
+        if (t.height > t.width) tall.push_back(t);
     }
-    return n;
+    if (tall.size() == 1) return tall[0];
+    if (real.size() == 1) return real[0];
+    return std::nullopt;
 }
 
 SpecializationState GetSpecialization(LUID adapter, UINT32 targetId)

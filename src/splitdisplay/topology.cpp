@@ -116,14 +116,25 @@ void SetScalePercentForMonitors(const wchar_t* namePrefix, int percent)
     }
 }
 
-bool ArrangeRegions(const std::vector<RECT>& regions)
+static std::wstring TargetDevicePath(const DISPLAYCONFIG_PATH_INFO& p)
+{
+    DISPLAYCONFIG_TARGET_DEVICE_NAME name{};
+    name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    name.header.size = sizeof(name);
+    name.header.adapterId = p.targetInfo.adapterId;
+    name.header.id = p.targetInfo.id;
+    if (DisplayConfigGetDeviceInfo(&name.header) != ERROR_SUCCESS) return L"";
+    return name.monitorDevicePath;
+}
+
+bool ArrangeRegions(const std::vector<RECT>& regions, POINT origin, const std::vector<PlacedDisplay>& others)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     if (!QueryActive(paths, modes)) return false;
 
     std::vector<DISPLAYCONFIG_SOURCE_MODE*> slot(regions.size(), nullptr);
-    std::vector<DISPLAYCONFIG_SOURCE_MODE*> others;
+    std::vector<std::pair<DISPLAYCONFIG_SOURCE_MODE*, POINT>> keep; // other displays -> saved position
     for (auto& p : paths)
     {
         if (p.sourceInfo.modeInfoIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || p.sourceInfo.modeInfoIdx >= modes.size()) continue;
@@ -139,28 +150,24 @@ bool ArrangeRegions(const std::vector<RECT>& regions)
                 mine = true;
             }
         }
-        if (!mine) others.push_back(&mi.sourceMode);
+        if (mine) continue;
+        auto path = TargetDevicePath(p);
+        for (auto& o : others)
+            if (_wcsicmp(o.devicePath.c_str(), path.c_str()) == 0) keep.push_back({ &mi.sourceMode, o.position });
     }
     for (auto* s : slot)
         if (!s) return false;
 
-    bool done = others.empty();
+    auto want = [&](size_t i) { return POINTL{ origin.x + regions[i].left, origin.y + regions[i].top }; };
+    bool done = true;
     for (size_t i = 0; i < regions.size(); i++)
-        if (slot[i]->position.x != regions[i].left || slot[i]->position.y != regions[i].top) done = false;
+        if (slot[i]->position.x != want(i).x || slot[i]->position.y != want(i).y) done = false;
+    for (auto& [mode, pos] : keep)
+        if (mode->position.x != pos.x || mode->position.y != pos.y) done = false;
     if (done) return true;
 
-    LONG right = 0;
-    for (size_t i = 0; i < regions.size(); i++)
-    {
-        slot[i]->position = { regions[i].left, regions[i].top };
-        right = std::max(right, regions[i].right);
-    }
-    // Anything else still active (should be nothing once the panel is removed) goes to the right.
-    for (auto* s : others)
-    {
-        s->position = { right, 0 };
-        right += (LONG)s->width;
-    }
+    for (size_t i = 0; i < regions.size(); i++) slot[i]->position = want(i);
+    for (auto& [mode, pos] : keep) mode->position = { pos.x, pos.y };
 
     LONG r = SetDisplayConfig((UINT32)paths.size(), paths.data(), (UINT32)modes.size(), modes.data(),
         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);

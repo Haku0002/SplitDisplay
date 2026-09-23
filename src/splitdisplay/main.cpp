@@ -5,11 +5,12 @@
 //   splitdisplay stop                   ask a running instance to exit (it reverts on the way out)
 //   splitdisplay revert                 give the panel back to the desktop, unplug virtual monitors
 //   splitdisplay configure --panel NAME save NAME as the display to split (config.ini)
+//   splitdisplay autodetect             select a display if none is selected yet
 //   splitdisplay autostart on|off       create/enable or disable the logon task
 //   splitdisplay watchdog ...           (internal) guards a running compositor
 //   splitdisplay                        (no arguments) open the settings window
 //
-// Any command accepts --panel "<monitor name prefix>"; otherwise config.ini, then "Sculptor".
+// Any command accepts --panel "<monitor name prefix>"; otherwise the selection in config.ini.
 //
 // Emergency exit while running: Ctrl+Alt+Shift+F12.
 
@@ -93,14 +94,22 @@ static std::wstring HeartbeatName(DWORD pid)
     return L"Local\\SplitDisplay.Hb." + std::to_wstring(pid);
 }
 
-// The display to split: the one connected target whose name matches. A foldable over DP shows
-// up as two monitors with the same name; that is left alone.
+// The display to split: the selected monitor (by device path). With only a name selected, it must
+// match exactly one connected monitor (a foldable over DP shows up as two monitors with the same
+// name and is left alone); that match is then remembered by device path.
 static std::optional<PanelTarget> FindCombinedPanel()
 {
+    if (!HasPanelSelection())
+    {
+        auto guess = AutodetectPanel();
+        if (!guess) return std::nullopt;
+        SelectPanel(*guess);
+        Log(L"no display selected, auto-detected '%s' (%s)", guess->friendlyName.c_str(), guess->monitorDevicePath.c_str());
+    }
     std::vector<PanelTarget> active;
     for (auto& t : EnumTargets())
     {
-        if (t.friendlyName.rfind(PanelNamePrefix(), 0) != 0) continue;
+        if (!MatchesPanel(t)) continue;
         if (!t.active)
         {
             // Off the desktop: only ours if it is still removed via the override (e.g. left behind by a crash).
@@ -109,8 +118,9 @@ static std::optional<PanelTarget> FindCombinedPanel()
         }
         active.push_back(t);
     }
-    if (active.size() == 1 && active[0].width && active[0].height) return active[0];
-    return std::nullopt;
+    if (active.size() != 1 || !active[0].width || !active[0].height) return std::nullopt;
+    if (PanelId().empty()) SelectPanel(active[0]);
+    return active[0];
 }
 
 // The configured layout resolved for this panel (default: two halves along the long side).
@@ -176,13 +186,13 @@ static int CmdRevert()
     bool any = false;
     for (auto& t : EnumTargets())
     {
-        if (t.friendlyName.rfind(PanelNamePrefix(), 0) != 0) continue;
+        if (!MatchesPanel(t)) continue;
         any = true;
         RevertAll(t.adapter, t.targetId);
     }
     if (!any)
     {
-        Log(L"revert: panel '%s' not found", PanelNamePrefix());
+        Log(L"revert: selected display not found");
         UnplugVirtual();
         return 1;
     }
@@ -678,6 +688,11 @@ static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
             if (!Nap(100)) return true;
     }
 
+    // Where every other display sits now, so they can be put back after the desktop changes.
+    std::vector<PlacedDisplay> others;
+    for (auto& t : EnumTargets())
+        if (t.active && !t.isVirtual && !MatchesPanel(t)) others.push_back({ t.monitorDevicePath, t.position });
+
     auto regions = CurrentRegions(panel.width, panel.height);
     SdConfig cfg{};
     cfg.count = (UINT32)regions.size();
@@ -714,9 +729,10 @@ static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
     LONG r = SetSpecialization(panel.adapter, panel.targetId, true);
     Log(L"panel removed from desktop -> %ld", r);
     if (r != ERROR_SUCCESS) throw std::runtime_error("could not remove panel from desktop");
-    for (int i = 0; i < 40 && IsTargetActive(PanelNamePrefix()); i++)
+    for (int i = 0; i < 40 && PanelActive(panel.adapter, panel.targetId); i++)
         if (!Nap(250)) return true;
-    for (int i = 0; i < 10 && !ArrangeRegions(regions); i++)
+    // The split monitors take the panel's place in the desktop; everything else stays put.
+    for (int i = 0; i < 10 && !ArrangeRegions(regions, panel.position, others); i++)
         if (!Nap(300)) return true;
 
     for (;;)
@@ -847,9 +863,32 @@ int wmain(int argc, wchar_t** argv)
 
     if (cmd == L"configure")
     {
-        bool ok = SaveConfiguredPanel(PanelNamePrefix());
-        Log(L"configure: display to split = '%s' (%s)", PanelNamePrefix(), ok ? L"saved" : L"FAILED");
-        return ok ? 0 : 1;
+        // Resolve the name to a device path when it matches exactly one connected display.
+        std::vector<PanelTarget> hits;
+        for (auto& t : EnumTargets())
+            if (MatchesPanel(t)) hits.push_back(t);
+        if (hits.size() == 1) SelectPanel(hits[0]);
+        else SaveConfigValue(L"panel", PanelNamePrefix()), SaveConfigValue(L"panel_id", L"");
+        Log(L"configure: display to split = '%s' %s", PanelNamePrefix().c_str(), hits.size() == 1 ? PanelId().c_str() : L"(by name)");
+        return 0;
+    }
+    if (cmd == L"autodetect")
+    {
+        // Keeps an existing selection; otherwise picks the only tall display, or the only display.
+        if (HasPanelSelection())
+        {
+            Log(L"autodetect: keeping '%s'", PanelNamePrefix().c_str());
+            return 0;
+        }
+        auto t = AutodetectPanel();
+        if (!t)
+        {
+            Log(L"autodetect: several displays, choose one in the settings window");
+            return 2;
+        }
+        SelectPanel(*t);
+        Log(L"autodetect: selected '%s' (%s)", t->friendlyName.c_str(), t->monitorDevicePath.c_str());
+        return 0;
     }
     if (cmd == L"autostart" && argc > 2)
     {
@@ -869,6 +908,6 @@ int wmain(int argc, wchar_t** argv)
         LUID l{ (DWORD)wcstoul(argv[3], nullptr, 10), (LONG)wcstol(argv[4], nullptr, 10) };
         return CmdWatchdog(wcstoul(argv[2], nullptr, 10), l, wcstoul(argv[5], nullptr, 10), wcstoul(argv[6], nullptr, 10));
     }
-    Log(L"usage: splitdisplay [--panel NAME] run [--test SECONDS] | stop | revert | configure | autostart on|off");
+    Log(L"usage: splitdisplay [--panel NAME] run [--test SECONDS] | stop | revert | configure | autodetect | autostart on|off");
     return 1;
 }

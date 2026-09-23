@@ -1,10 +1,11 @@
-# SplitDisplay installer (run through Install.cmd, which elevates).
+﻿# SplitDisplay installer (run through Install.cmd, which elevates).
 #
 # 1. Signs the bundled driver with a brand-new certificate created on THIS machine, trusts that
 #    certificate, then deletes its private key. Nothing signed by anyone else is trusted, and
 #    nobody (including you) can sign anything else with it afterwards.
 # 2. Installs the virtual monitor driver.
-# 3. Copies SplitDisplay to Program Files and registers a logon task that runs it.
+# 3. Copies SplitDisplay to Program Files, picks the display to split and registers a logon task.
+#    Optional: -Panel "<monitor name>" to choose the display without asking.
 param([string]$Panel)
 
 $ErrorActionPreference = 'Stop'
@@ -21,28 +22,11 @@ foreach ($f in 'splitdisplay.exe', 'sdctl.exe', 'driver\SplitDisplayIdd.dll', 'd
 }
 
 Step 'Stopping a running SplitDisplay'
-# Restores the single display first, so the real panel (not the virtual halves) is listed below.
+# Restores the single display first.
 if (Test-Path (Join-Path $dest 'splitdisplay.exe')) {
     & (Join-Path $dest 'splitdisplay.exe') stop | Out-Null
     Get-Process splitdisplay -ErrorAction SilentlyContinue | Wait-Process -Timeout 20 -ErrorAction SilentlyContinue
 }
-
-Step 'Choose the display to split'
-$monitors = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | Where-Object Active |
-    ForEach-Object { -join ($_.UserFriendlyName | Where-Object { $_ } | ForEach-Object { [char]$_ }) } |
-    Where-Object { $_ -and $_ -notlike 'Split Upper*' -and $_ -notlike 'Split Lower*' } | Select-Object -Unique)
-if (-not $Panel) {
-    for ($i = 0; $i -lt $monitors.Count; $i++) { Write-Host "  [$i] $($monitors[$i])" }
-    $default = ($monitors | Where-Object { $_ -like 'Sculptor*' } | Select-Object -First 1)
-    if (-not $default -and $monitors.Count) { $default = $monitors[0] }
-    $answer = Read-Host "Number of the display to split (Enter = '$default')"
-    $Panel = if ($answer -match '^\d+$' -and [int]$answer -lt $monitors.Count) { $monitors[[int]$answer] }
-             elseif ($answer.Trim()) { $answer.Trim() }
-             else { $default }
-}
-$Panel = $Panel.Trim()
-if (-not $Panel) { throw 'no display selected' }
-Write-Host "Display: '$Panel' (it is split only while it runs as one tall display, e.g. over HDMI)"
 
 # From here on, any failure restarts the previous SplitDisplay (if one was installed) and cleans up.
 $pkg = $null
@@ -92,8 +76,14 @@ foreach ($f in 'splitdisplay.exe', 'sdctl.exe', 'uninstall.ps1', 'Uninstall.cmd'
 Unregister-ScheduledTask -TaskName 'SplitDisplay Failsafe Revert' -Confirm:$false -ErrorAction SilentlyContinue
 # splitdisplay.exe is a windowed app, so wait for it explicitly.
 $exe = Join-Path $dest 'splitdisplay.exe'
-$r = Start-Process $exe -ArgumentList '--panel', "`"$Panel`"", 'configure' -Wait -PassThru
-if ($r.ExitCode) { throw 'saving the display choice failed' }
+# Which display to split: -Panel "<name>" if given, otherwise auto-detect (keeps an earlier choice).
+# With several candidates nothing is chosen here; the settings window opened below asks.
+if ($Panel) {
+    $r = Start-Process $exe -ArgumentList '--panel', "`"$Panel`"", 'configure' -Wait -PassThru
+} else {
+    $r = Start-Process $exe -ArgumentList 'autodetect' -Wait -PassThru
+    if ($r.ExitCode -eq 2) { Write-Host 'Several displays found: pick the one to split in the settings window.' -ForegroundColor Yellow }
+}
 $r = Start-Process $exe -ArgumentList 'autostart', 'on' -Wait -PassThru
 if ($r.ExitCode) { throw 'creating the logon task failed' }
 

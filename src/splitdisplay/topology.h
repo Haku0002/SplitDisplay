@@ -9,10 +9,18 @@ int GetScalePercentForTarget(LUID adapter, UINT32 targetId);
 // Applies a scale percentage to every active source whose monitor name starts with namePrefix.
 void SetScalePercentForMonitors(const wchar_t* namePrefix, int percent);
 
-// Places virtual monitor "Split <i+1>" at regions[i].left/top, so the Windows desktop mirrors the
-// panel (the region at 0,0 becomes the primary display). Returns true once all were found and
-// the arrangement is in effect.
-bool ArrangeRegions(const std::vector<RECT>& regions);
+#include <string>
+
+struct PlacedDisplay
+{
+    std::wstring devicePath;
+    POINT position;
+};
+
+// Places virtual monitor "Split <i+1>" at origin + regions[i].left/top (the panel's old desktop
+// position, so the split mirrors the panel), and puts every display in `others` back at its saved
+// position. Returns true once the arrangement is in effect.
+bool ArrangeRegions(const std::vector<RECT>& regions, POINT origin, const std::vector<PlacedDisplay>& others);
 
 // Returns true if the target with this name is part of the desktop.
 bool IsTargetActive(const wchar_t* namePrefix);

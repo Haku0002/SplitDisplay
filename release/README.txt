@@ -6,9 +6,10 @@ layout of up to 8 monitors. Built for foldable dual-panel monitors that show up 
 single 2560x2880 display over HDMI.
 
 Install
-  Double-click Install.cmd and accept the administrator prompt. Pick the display
-  to split when asked. SplitDisplay then starts right away, and again every time
-  you sign in.
+  Double-click Install.cmd and accept the administrator prompt. The display to
+  split is detected automatically; with several displays, click the one to split
+  in the settings window that opens. SplitDisplay starts right away, and again
+  every time you sign in.
 
   The installer signs the bundled driver with a certificate created on your PC,
   then deletes that certificate's private key. Test-signing mode is not used.

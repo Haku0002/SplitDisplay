@@ -41,9 +41,10 @@ enum : int
     IDC_DISPLAY,
     IDC_SPLIT_L,
     IDC_SPLIT,
-    IDC_PANEL_L,
-    IDC_PANEL,
-    IDC_APPLY,
+    IDC_DISPLAYS_L,
+    IDC_MAP,
+    IDC_PICK_INFO,
+    IDC_PICK,
     IDC_START,
     IDC_STOP,
     IDC_AUTOSTART,
@@ -73,6 +74,15 @@ enum : int
 constexpr UINT WM_APP_BUSY_DONE = WM_APP + 1;
 constexpr UINT_PTR kTimer = 1;
 constexpr wchar_t kCanvasClass[] = L"SplitDisplayLayoutCanvas";
+constexpr wchar_t kMapClass[] = L"SplitDisplayMonitorMap";
+
+// One display on the monitor map, at its Windows desktop position.
+struct MapItem
+{
+    PanelTarget target;
+    RECT desk;         // desktop coordinates
+    int splitInto = 0; // > 0: the selected display, currently split into this many monitors
+};
 
 struct Ui
 {
@@ -92,6 +102,10 @@ struct Ui
     std::optional<LayoutSplitter> selSplitter;
     bool dragging = false;
     int hoverSplitter = -1;
+
+    // monitor map
+    std::vector<MapItem> map;
+    std::wstring pick; // device path highlighted on the map
 } g;
 
 struct Item
@@ -114,14 +128,15 @@ const Item kItems[] = {
     { IDC_DISPLAY, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 100, 80, 330, 20, 0 },
     { IDC_SPLIT_L, WC_STATIC, L"Split", SS_LEFT, 16, 104, 80, 20, 1 },
     { IDC_SPLIT, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 100, 104, 330, 20, 0 },
-    { IDC_PANEL_L, WC_STATIC, L"Display to split", SS_LEFT, 16, 144, 200, 20, 1 },
-    { IDC_PANEL, WC_COMBOBOX, L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, 16, 166, 316, 200, 0 },
-    { IDC_APPLY, WC_BUTTON, L"Apply", BS_PUSHBUTTON | WS_TABSTOP, 340, 165, 90, 26, 0 },
-    { IDC_START, WC_BUTTON, L"Start split", BS_PUSHBUTTON | WS_TABSTOP, 16, 208, 203, 34, 0 },
-    { IDC_STOP, WC_BUTTON, L"Stop split", BS_PUSHBUTTON | WS_TABSTOP, 227, 208, 203, 34, 0 },
-    { IDC_AUTOSTART, WC_BUTTON, L"Start splitting automatically when I sign in", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 256, 414, 22, 0 },
-    { IDC_LOGS, WC_BUTTON, L"Open logs", BS_PUSHBUTTON | WS_TABSTOP, 16, 290, 120, 28, 0 },
-    { IDC_UNINSTALL, WC_BUTTON, L"Uninstall...", BS_PUSHBUTTON | WS_TABSTOP, 144, 290, 120, 28, 0 },
+    { IDC_DISPLAYS_L, WC_STATIC, L"Displays: click the one to split", SS_LEFT, 16, 140, 414, 20, 1 },
+    { IDC_MAP, kMapClass, L"", WS_TABSTOP, 16, 162, 414, 158, 0 },
+    { IDC_PICK_INFO, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 16, 330, 270, 20, 0 },
+    { IDC_PICK, WC_BUTTON, L"Split this display", BS_PUSHBUTTON | WS_TABSTOP, 294, 325, 136, 28, 0 },
+    { IDC_START, WC_BUTTON, L"Start split", BS_PUSHBUTTON | WS_TABSTOP, 16, 366, 203, 34, 0 },
+    { IDC_STOP, WC_BUTTON, L"Stop split", BS_PUSHBUTTON | WS_TABSTOP, 227, 366, 203, 34, 0 },
+    { IDC_AUTOSTART, WC_BUTTON, L"Start splitting automatically when I sign in", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 412, 414, 22, 0 },
+    { IDC_LOGS, WC_BUTTON, L"Open logs", BS_PUSHBUTTON | WS_TABSTOP, 16, 444, 120, 28, 0 },
+    { IDC_UNINSTALL, WC_BUTTON, L"Uninstall...", BS_PUSHBUTTON | WS_TABSTOP, 144, 444, 120, 28, 0 },
     { IDC_HINT, WC_STATIC, L"Emergency exit while split: Ctrl+Alt+Shift+F12", SS_LEFT, 16, 514, 414, 20, 3 },
     { IDC_LINK, WC_LINK, L"<a href=\"https://github.com/brkDOTstl/SplitDisplay\">github.com/brkDOTstl/SplitDisplay</a>", WS_TABSTOP, 16, 536, 414, 20, 3 },
 
@@ -206,33 +221,224 @@ bool IsRunning()
     return true;
 }
 
-bool IsVirtualName(const std::wstring& n)
+std::wstring Trimmed(std::wstring s)
 {
-    return n.rfind(L"Split ", 0) == 0 && n.size() <= 8;
+    while (!s.empty() && s.back() == L' ') s.pop_back();
+    return s;
 }
 
-std::vector<std::wstring> MonitorNames()
+std::wstring Describe(const PanelTarget& t)
 {
-    std::vector<std::wstring> names;
-    for (auto& t : EnumTargets())
+    std::wstring d = Trimmed(t.friendlyName);
+    if (d.empty()) d = L"Unknown display";
+    d += L"  " + std::to_wstring(t.width) + L"x" + std::to_wstring(t.height);
+    auto c = ConnectorName(t.connector);
+    if (!c.empty()) d += L"  " + c;
+    return d;
+}
+
+// Every display on the desktop, plus the selected display while it is split (drawn where its
+// split monitors are).
+std::vector<MapItem> BuildMap()
+{
+    std::vector<MapItem> items;
+    RECT splitArea{};
+    int splitCount = 0;
+    auto targets = EnumTargets();
+    for (auto& t : targets)
     {
-        std::wstring n = t.friendlyName;
-        while (!n.empty() && n.back() == L' ') n.pop_back();
-        if (n.empty() || IsVirtualName(n)) continue;
-        if (std::find(names.begin(), names.end(), n) == names.end()) names.push_back(n);
+        if (!t.active || !t.width) continue;
+        RECT r{ t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height };
+        if (t.isVirtual)
+        {
+            splitArea = splitCount++ ? RECT{ std::min(splitArea.left, r.left), std::min(splitArea.top, r.top), std::max(splitArea.right, r.right),
+                                            std::max(splitArea.bottom, r.bottom) }
+                                     : r;
+            continue;
+        }
+        items.push_back({ t, r, 0 });
     }
-    return names;
+    if (splitCount)
+    {
+        for (auto& t : targets)
+        {
+            if (!t.active && !t.isVirtual && MatchesPanel(t))
+            {
+                items.push_back({ t, splitArea, splitCount });
+                break;
+            }
+        }
+    }
+    return items;
 }
 
-void FillPanelCombo()
+const MapItem* PickedItem()
 {
-    HWND c = Ctl(IDC_PANEL);
-    SendMessageW(c, CB_RESETCONTENT, 0, 0);
-    auto names = MonitorNames();
-    std::wstring current = PanelNamePrefix();
-    if (std::find(names.begin(), names.end(), current) == names.end()) names.insert(names.begin(), current);
-    for (auto& n : names) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)n.c_str());
-    SetWindowTextW(c, current.c_str());
+    for (auto& m : g.map)
+        if (_wcsicmp(m.target.monitorDevicePath.c_str(), g.pick.c_str()) == 0) return &m;
+    return nullptr;
+}
+
+struct MapTransform
+{
+    double scale, ox, oy;
+    RECT ToCanvas(const RECT& r) const
+    {
+        return { (LONG)std::lround(ox + r.left * scale), (LONG)std::lround(oy + r.top * scale), (LONG)std::lround(ox + r.right * scale),
+            (LONG)std::lround(oy + r.bottom * scale) };
+    }
+};
+
+MapTransform MapTransformFor(HWND canvas)
+{
+    RECT rc;
+    GetClientRect(canvas, &rc);
+    if (g.map.empty()) return { 1, 0, 0 };
+    RECT box = g.map[0].desk;
+    for (auto& m : g.map)
+        box = { std::min(box.left, m.desk.left), std::min(box.top, m.desk.top), std::max(box.right, m.desk.right), std::max(box.bottom, m.desk.bottom) };
+    int margin = S(10);
+    double sc = std::min((rc.right - 2.0 * margin) / std::max(1L, box.right - box.left), (rc.bottom - 2.0 * margin) / std::max(1L, box.bottom - box.top));
+    double ox = (rc.right - (box.right - box.left) * sc) / 2 - box.left * sc;
+    double oy = (rc.bottom - (box.bottom - box.top) * sc) / 2 - box.top * sc;
+    return { sc, ox, oy };
+}
+
+void PaintMap(HWND canvas, HDC dc)
+{
+    RECT rc;
+    GetClientRect(canvas, &rc);
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+    HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    HBRUSH bg = CreateSolidBrush(RGB(0xF3, 0xF3, 0xF3));
+    FillRect(mem, &rc, bg);
+    DeleteObject(bg);
+    SetBkMode(mem, TRANSPARENT);
+
+    if (g.map.empty())
+    {
+        SelectObject(mem, g.font);
+        SetTextColor(mem, GetSysColor(COLOR_GRAYTEXT));
+        DrawTextW(mem, L"No displays found", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    auto tf = MapTransformFor(canvas);
+    for (auto& m : g.map)
+    {
+        RECT r = tf.ToCanvas(m.desk);
+        InflateRect(&r, -S(2), -S(2));
+        bool picked = _wcsicmp(m.target.monitorDevicePath.c_str(), g.pick.c_str()) == 0;
+        bool selected = MatchesPanel(m.target);
+        HBRUSH fill = CreateSolidBrush(picked ? RGB(0xCC, 0xE4, 0xF7) : RGB(0xFF, 0xFF, 0xFF));
+        FillRect(mem, &r, fill);
+        DeleteObject(fill);
+        HBRUSH edge = CreateSolidBrush(picked ? kAccent : RGB(0x80, 0x80, 0x80));
+        RECT e = r;
+        for (int k = 0; k < (picked ? S(3) : 1); k++)
+        {
+            FrameRect(mem, &e, edge);
+            InflateRect(&e, -1, -1);
+        }
+        DeleteObject(edge);
+
+        // Dashed lines show where a split display is currently cut.
+        if (m.splitInto)
+        {
+            HPEN pen = CreatePen(PS_DOT, 1, RGB(0x40, 0x40, 0x40));
+            HGDIOBJ old = SelectObject(mem, pen);
+            for (auto& t : EnumTargets())
+            {
+                if (!t.active || !t.isVirtual) continue;
+                // Only interior cuts: the top/left edges of pieces that are not on the outline.
+                if (t.position.y > m.desk.top)
+                {
+                    RECT v = tf.ToCanvas({ t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height });
+                    MoveToEx(mem, std::max(v.left, r.left), v.top, nullptr);
+                    LineTo(mem, std::min(v.right, r.right), v.top);
+                }
+                if (t.position.x > m.desk.left)
+                {
+                    RECT v = tf.ToCanvas({ t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height });
+                    MoveToEx(mem, v.left, std::max(v.top, r.top), nullptr);
+                    LineTo(mem, v.left, std::min(v.bottom, r.bottom));
+                }
+            }
+            SelectObject(mem, old);
+            DeleteObject(pen);
+        }
+
+        std::wstring label = Trimmed(m.target.friendlyName);
+        if (label.empty()) label = L"Display";
+        label += L"\n" + std::to_wstring(m.target.width) + L"x" + std::to_wstring(m.target.height);
+        if (m.splitInto) label += L"\nsplit into " + std::to_wstring(m.splitInto);
+        else if (selected) label += L"\nselected";
+        else if (m.target.primary) label += L"\nprimary";
+        SelectObject(mem, selected ? g.bold : g.font);
+        SetTextColor(mem, RGB(0x20, 0x20, 0x20));
+        RECT measure = r;
+        DrawTextW(mem, label.c_str(), -1, &measure, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+        RECT t = r;
+        // A split display keeps its label clear of the cut lines, at the top.
+        t.top = m.splitInto ? r.top + S(6) : std::max(r.top, (r.top + r.bottom - (measure.bottom - measure.top)) / 2);
+        DrawTextW(mem, label.c_str(), -1, &t, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+    }
+
+    BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+}
+
+void UpdatePick()
+{
+    const MapItem* m = PickedItem();
+    SetWindowTextW(Ctl(IDC_PICK_INFO), m ? Describe(m->target).c_str() : L"Click a display above.");
+    bool isCurrent = m && !PanelId().empty() && _wcsicmp(m->target.monitorDevicePath.c_str(), PanelId().c_str()) == 0;
+    EnableWindow(Ctl(IDC_PICK), m && !isCurrent && !g.busy && m->splitInto == 0);
+    InvalidateRect(Ctl(IDC_MAP), nullptr, FALSE);
+}
+
+void RefreshMap()
+{
+    g.map = BuildMap();
+    if (g.pick.empty() || !PickedItem())
+    {
+        g.pick.clear();
+        for (auto& m : g.map)
+            if (MatchesPanel(m.target)) g.pick = m.target.monitorDevicePath;
+    }
+    UpdatePick();
+}
+
+LRESULT CALLBACK MapProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(wnd, &ps);
+        PaintMap(wnd, dc);
+        EndPaint(wnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_LBUTTONDOWN:
+    {
+        SetFocus(wnd);
+        POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        auto tf = MapTransformFor(wnd);
+        for (auto& m : g.map)
+        {
+            RECT r = tf.ToCanvas(m.desk);
+            if (PtInRect(&r, pt)) g.pick = m.target.monitorDevicePath;
+        }
+        UpdatePick();
+        return 0;
+    }
+    }
+    return DefWindowProcW(wnd, msg, wp, lp);
 }
 
 void UpdateAutostart()
@@ -243,10 +449,7 @@ void UpdateAutostart()
 
 std::optional<PanelTarget> FindConfiguredPanel()
 {
-    std::optional<PanelTarget> panel;
-    for (auto& t : EnumTargets())
-        if (t.friendlyName.rfind(PanelNamePrefix(), 0) == 0 && (!panel || (t.active && !panel->active))) panel = t;
-    return panel;
+    return FindPanel();
 }
 
 #pragma region Layout editor
@@ -643,14 +846,19 @@ void UpdateStatus()
     bool driver = shm.Open();
     SetWindowTextW(Ctl(IDC_DRIVER), driver ? L"Installed and loaded" : L"Not loaded (reinstall SplitDisplay)");
 
-    const wchar_t* prefix = PanelNamePrefix();
+    std::wstring name = Trimmed(PanelNamePrefix());
+    const wchar_t* prefix = name.empty() ? L"(none)" : name.c_str();
     auto panel = FindConfiguredPanel();
     bool first = IsTargetActive(L"Split 1");
 
     g.running = IsRunning();
     g.splitActive = first && panel && !panel->active;
     g.problem = !driver;
-    if (!panel)
+    if (!HasPanelSelection())
+    {
+        swprintf_s(buf, L"No display selected: click one below");
+    }
+    else if (!panel)
     {
         swprintf_s(buf, L"'%s' is not connected", prefix);
     }
@@ -675,9 +883,9 @@ void UpdateStatus()
 
     EnableWindow(Ctl(IDC_START), !g.busy && driver && !g.running);
     EnableWindow(Ctl(IDC_STOP), !g.busy && g.running);
-    EnableWindow(Ctl(IDC_APPLY), !g.busy);
     EnableWindow(Ctl(IDC_UNINSTALL), !g.busy && GetFileAttributesW((ExeDir() + L"\\Uninstall.cmd").c_str()) != INVALID_FILE_ATTRIBUTES);
     UpdateLayoutControls();
+    RefreshMap();
 }
 
 void StartCompositor()
@@ -731,17 +939,12 @@ void RestartIfRunning()
     });
 }
 
-void OnApply()
+void OnPick()
 {
-    wchar_t text[256];
-    GetWindowTextW(Ctl(IDC_PANEL), text, 256);
-    std::wstring name = text;
-    while (!name.empty() && name.back() == L' ') name.pop_back();
-    while (!name.empty() && name.front() == L' ') name.erase(0, 1);
-    if (name.empty()) return;
-    SaveConfiguredPanel(name);
-    SetPanelNamePrefix(name);
-    Log(L"gui: display to split set to '%s'", name.c_str());
+    const MapItem* m = PickedItem();
+    if (!m) return;
+    SelectPanel(m->target);
+    Log(L"gui: display to split set to '%s' (%s)", m->target.friendlyName.c_str(), m->target.monitorDevicePath.c_str());
     LoadDraftFromConfig();
     RestartIfRunning();
     UpdateStatus();
@@ -796,7 +999,6 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         SetWindowTextW(Ctl(IDC_VERSION), L"v" _CRT_WIDE(SPLITDISPLAY_VERSION));
         Layout();
         InitLayoutControls();
-        FillPanelCombo();
         LoadDraftFromConfig();
         UpdateAutostart();
         UpdateStatus();
@@ -832,7 +1034,7 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         switch (LOWORD(wp))
         {
-        case IDC_APPLY: OnApply(); break;
+        case IDC_PICK: OnPick(); break;
         case IDC_START:
             Busy([] {
                 StartCompositor();
@@ -855,9 +1057,6 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
             break;
         }
         case IDC_UNINSTALL: OnUninstall(); break;
-        case IDC_PANEL:
-            if (HIWORD(wp) == CBN_DROPDOWN) FillPanelCombo();
-            break;
         case IDC_PRESET:
             if (HIWORD(wp) == CBN_SELCHANGE) OnPreset();
             break;
@@ -907,6 +1106,9 @@ int RunGui()
     cc.hInstance = inst;
     cc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     cc.lpszClassName = kCanvasClass;
+    RegisterClassExW(&cc);
+    cc.lpfnWndProc = MapProc;
+    cc.lpszClassName = kMapClass;
     RegisterClassExW(&cc);
 
     WNDCLASSEXW wc{ sizeof(wc) };
