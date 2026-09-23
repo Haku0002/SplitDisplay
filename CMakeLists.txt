@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(SplitDisplay LANGUAGES CXX)
+project(SplitDisplay VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,7 +8,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 add_compile_options(/W4 /permissive- /EHsc /utf-8 /await:strict)
 
-add_library(sdcommon STATIC src/common/panel.cpp src/common/log.cpp src/common/shm.cpp)
+add_library(sdcommon STATIC src/common/panel.cpp src/common/log.cpp src/common/shm.cpp src/common/layout.cpp)
 target_include_directories(sdcommon PUBLIC src/common)
 target_link_libraries(sdcommon PUBLIC windowsapp d3d11 dxgi ntdll ole32)
 
@@ -34,7 +34,13 @@ target_link_libraries(SplitDisplayIdd PRIVATE
 add_executable(sdctl src/sdctl/main.cpp)
 target_link_libraries(sdctl PRIVATE sdcommon setupapi newdev)
 
-add_executable(splitdisplay src/splitdisplay/main.cpp src/splitdisplay/topology.cpp)
-target_link_libraries(splitdisplay PRIVATE sdcommon)
+add_executable(splitdisplay
+    src/splitdisplay/main.cpp src/splitdisplay/topology.cpp src/splitdisplay/gui.cpp src/splitdisplay/autostart.cpp
+    src/splitdisplay/splitdisplay.manifest)
+target_link_libraries(splitdisplay PRIVATE sdcommon comctl32 shcore taskschd secur32 comsuppw oleaut32 shell32)
+target_compile_definitions(splitdisplay PRIVATE SPLITDISPLAY_VERSION="${PROJECT_VERSION}")
 # No console window when started at logon; everything goes to splitdisplay.log.
-target_link_options(splitdisplay PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup)
+target_link_options(splitdisplay PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /MANIFESTUAC:NO)
+
+add_executable(layout_test tests/layout_test.cpp)
+target_link_libraries(layout_test PRIVATE sdcommon)

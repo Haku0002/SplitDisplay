@@ -95,7 +95,7 @@ namespace SplitDisplay
 
         WDFDEVICE m_WdfDevice;
         IDDCX_ADAPTER m_Adapter = nullptr;
-        IDDCX_MONITOR m_Monitors[SD_MONITORS] = {};
+        IDDCX_MONITOR m_Monitors[SD_MAX_MONITORS] = {};
         bool m_Plugged = false;
         HANDLE m_Section = nullptr;
         HANDLE m_CmdEvent = nullptr;
@@ -111,6 +111,7 @@ namespace SplitDisplay
 
         void AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent);
         void UnassignSwapChain();
+        UINT Index() const { return m_Index; }
 
     private:
         IDDCX_MONITOR m_Monitor;

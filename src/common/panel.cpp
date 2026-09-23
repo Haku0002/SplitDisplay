@@ -82,8 +82,47 @@ const wchar_t* PanelNamePrefix()
     return g_panelName.c_str();
 }
 
+void SetPanelNamePrefix(const std::wstring& name)
+{
+    if (!name.empty()) g_panelName = name;
+}
+
+static std::wstring ConfigPath()
+{
+    wchar_t path[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay\\config.ini", path, MAX_PATH);
+    return path;
+}
+
+std::wstring LoadConfigValue(const wchar_t* key)
+{
+    wchar_t buf[1024] = {};
+    GetPrivateProfileStringW(L"SplitDisplay", key, L"", buf, 1024, ConfigPath().c_str());
+    return buf;
+}
+
+bool SaveConfigValue(const wchar_t* key, const std::wstring& value)
+{
+    wchar_t dir[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay", dir, MAX_PATH);
+    CreateDirectoryW(dir, nullptr);
+    // Quoted so leading/trailing spaces (EDID names) survive.
+    return WritePrivateProfileStringW(L"SplitDisplay", key, (L"\"" + value + L"\"").c_str(), ConfigPath().c_str()) != FALSE;
+}
+
+std::wstring LoadConfiguredPanel()
+{
+    return LoadConfigValue(L"panel");
+}
+
+bool SaveConfiguredPanel(const std::wstring& name)
+{
+    return SaveConfigValue(L"panel", name);
+}
+
 void ParsePanelOption(int& argc, wchar_t** argv)
 {
+    SetPanelNamePrefix(LoadConfiguredPanel());
     for (int i = 1; i + 1 < argc; i++)
     {
         if (_wcsicmp(argv[i], L"--panel") != 0) continue;
@@ -159,6 +198,37 @@ std::vector<PanelTarget> EnumTargets()
 
         if (existing) *existing = t;
         else out.push_back(t);
+    }
+
+    // A display removed from the desktop disappears from CCD entirely; DisplayCore still lists it.
+    try
+    {
+        namespace wdc = winrt::Windows::Devices::Display::Core;
+        auto mgr = wdc::DisplayManager::Create(wdc::DisplayManagerOptions::None);
+        for (auto&& dt : mgr.GetCurrentTargets())
+        {
+            if (!dt.IsConnected()) continue;
+            auto id = dt.Adapter().Id();
+            bool known = false;
+            for (auto& e : out)
+                if (e.adapter.LowPart == id.LowPart && e.adapter.HighPart == id.HighPart && e.targetId == dt.AdapterRelativeId()) known = true;
+            if (known) continue;
+            auto monitor = dt.TryGetMonitor();
+            if (!monitor) continue;
+            PanelTarget t;
+            t.adapter = { id.LowPart, id.HighPart };
+            t.targetId = dt.AdapterRelativeId();
+            t.friendlyName = monitor.DisplayName();
+            auto native = monitor.NativeResolutionInRawPixels();
+            t.width = (UINT32)native.Width;
+            t.height = (UINT32)native.Height;
+            t.active = false;
+            out.push_back(t);
+        }
+        mgr.Close();
+    }
+    catch (...)
+    {
     }
     return out;
 }

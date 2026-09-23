@@ -1,8 +1,9 @@
 SplitDisplay
 ============
 
-Splits one physical display into two real Windows monitors, for example a foldable
-dual-panel monitor that shows up as a single 2560x2880 display over HDMI.
+Splits one physical display into real Windows monitors: two halves by default, or any
+layout of up to 8 monitors. Built for foldable dual-panel monitors that show up as a
+single 2560x2880 display over HDMI.
 
 Install
   Double-click Install.cmd and accept the administrator prompt. Pick the display
@@ -13,9 +14,12 @@ Install
   then deletes that certificate's private key. Test-signing mode is not used.
 
 Use
+  Settings, start/stop and the layout editor:
+               C:\Program Files\SplitDisplay\splitdisplay.exe  (opens after install)
+  Layout editor: pick a preset, or click a region and cut it into equal rows or
+               columns; drag a split line or type its exact position. Nothing
+               changes until you press "Apply layout".
   Emergency exit (restores the single display):  Ctrl+Alt+Shift+F12
-  Stop:        "C:\Program Files\SplitDisplay\splitdisplay.exe" stop
-  Split again: "C:\Program Files\SplitDisplay\splitdisplay.exe" --panel "<name>" run
   Logs:        C:\ProgramData\SplitDisplay\
 
 Uninstall

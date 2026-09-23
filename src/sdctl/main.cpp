@@ -119,28 +119,27 @@ static int Plug(int argc, wchar_t** argv)
     SharedView v;
     if (!OpenShm(v)) return 1;
 
-    SdConfig cfg{ 2560, 1440, 100, {} };
+    // Default: two halves of the panel. "plug W H HZ" plugs two monitors of W x H.
+    SdConfig cfg{};
+    cfg.count = 2;
+    cfg.refreshHz = 100;
+    cfg.size[0] = cfg.size[1] = { 2560, 1440 };
     if (auto p = FindPanel())
     {
         cfg.renderAdapter = p->adapter;
-        if (p->width && p->height)
-        {
-            cfg.width = p->width;
-            cfg.height = p->height / 2;
-        }
+        if (p->width && p->height) cfg.size[0] = cfg.size[1] = { p->width, p->height / 2 };
         if (p->refreshHz > 1) cfg.refreshHz = (UINT32)std::lround(p->refreshHz);
     }
     if (argc >= 5)
     {
-        cfg.width = _wtoi(argv[2]);
-        cfg.height = _wtoi(argv[3]);
+        cfg.size[0] = cfg.size[1] = { (UINT32)_wtoi(argv[2]), (UINT32)_wtoi(argv[3]) };
         cfg.refreshHz = _wtoi(argv[4]);
     }
     v->config = cfg;
     MemoryBarrier();
     InterlockedExchange(&v->desiredPlugged, 1);
     v.Kick();
-    Log(L"plug requested: %ux%u@%u on adapter %08X:%08X", cfg.width, cfg.height, cfg.refreshHz, cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
+    Log(L"plug requested: 2 x %ux%u@%u on adapter %08X:%08X", cfg.size[0].width, cfg.size[0].height, cfg.refreshHz, cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
 
     for (int i = 0; i < 50; i++)
     {
@@ -171,13 +170,13 @@ static int Status()
     SharedView v;
     if (!OpenShm(v)) return 1;
     auto* s = v.get();
-    Log(L"driver pid %lu, heartbeat %lld ms ago, desiredPlugged=%ld, cfg %ux%u@%u adapter %08X:%08X", s->driverPid,
-        (LONG64)GetTickCount64() - s->driverHeartbeat, s->desiredPlugged, s->config.width, s->config.height, s->config.refreshHz,
+    Log(L"driver pid %lu, heartbeat %lld ms ago, desiredPlugged=%ld, %u monitors @%u Hz on adapter %08X:%08X", s->driverPid,
+        (LONG64)GetTickCount64() - s->driverHeartbeat, s->desiredPlugged, s->config.count, s->config.refreshHz,
         s->config.renderAdapter.HighPart, s->config.renderAdapter.LowPart);
-    for (int i = 0; i < SD_MONITORS; i++)
+    for (UINT i = 0; i < s->config.count && i < SD_MAX_MONITORS; i++)
     {
         auto& m = s->mon[i];
-        Log(L"  mon%d plugged=%ld gen=%ld latest=%ld frames=%lld %ux%u fmt=%u adapter %08X:%08X", i, m.plugged, m.handleGeneration, m.latest,
+        Log(L"  mon%u plugged=%ld gen=%ld latest=%ld frames=%lld %ux%u fmt=%u adapter %08X:%08X", i, m.plugged, m.handleGeneration, m.latest,
             m.frameSeq, m.width, m.height, m.format, m.adapter.HighPart, m.adapter.LowPart);
     }
     for (auto& t : EnumTargets())
@@ -186,19 +185,19 @@ static int Status()
     return 0;
 }
 
-// Exercises the remove-from-desktop packet on the invisible "Split Lower" monitor only.
+// Exercises the remove-from-desktop packet on the invisible "Split 2" monitor only.
 static int SpecTest()
 {
     if (Plug(1, nullptr) != 0) return 1;
     Sleep(1500);
     std::optional<PanelTarget> lower;
     for (auto& t : EnumTargets())
-        if (t.friendlyName.rfind(L"Split Lower", 0) == 0) lower = t;
+        if (t.friendlyName.rfind(L"Split 2", 0) == 0) lower = t;
     int rc = 1;
     if (lower)
     {
         auto s = GetSpecialization(lower->adapter, lower->targetId);
-        Log(L"Split Lower: active=%d spec(ok=%d en=%d mon=%d sys=%d)", lower->active, s.ok, s.enabled, s.availableForMonitor, s.availableForSystem);
+        Log(L"Split 2: active=%d spec(ok=%d en=%d mon=%d sys=%d)", lower->active, s.ok, s.enabled, s.availableForMonitor, s.availableForSystem);
         auto activeNow = [&] {
             for (auto& t : EnumTargets())
                 if (t.targetId == lower->targetId && t.adapter.LowPart == lower->adapter.LowPart) return t.active;

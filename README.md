@@ -14,25 +14,28 @@ Window-manager tools such as FancyZones and DisplayFusion's monitor splitting on
 SplitDisplay does not emulate anything. Windows sees genuine monitors: each has its own resolution, scaling and
 taskbar, and maximize, fullscreen, `Win+Arrow` and DXGI fullscreen all behave natively.
 
+You choose how to cut the panel: the default is two halves, and the layout editor splits it into up to 8 monitors of
+any size, with equal cuts and freely placed lines that can be nested inside one another.
+
 All split monitors share the physical panel's refresh rate. A single cable carries one signal, so they cannot
 refresh independently.
 
 ## How it works
 
 ```
-Windows desktop --> virtual monitor "Split Upper" (2560x1440@100) --+
-                \-> virtual monitor "Split Lower" (2560x1440@100) --+  SplitDisplayIdd (IddCx UMDF driver)
+Windows desktop --> virtual monitor "Split 1"     (2560x1440@100) --+
+                \-> virtual monitor "Split 2"     (2560x1440@100) --+  SplitDisplayIdd (IddCx UMDF driver)
                                                                      |  shared D3D11 textures + fences,
                                                                      v  same GPU, no CPU copies
                                   splitdisplay.exe (compositor)
-                                  copies each frame into its rectangle of the panel
+                                  copies each frame into its region of the panel
                                                                      |  Windows.Devices.Display.Core
                                                                      v  exclusive ownership
                                   physical panel, removed from the desktop (2560x2880@100 over HDMI)
 ```
 
 1. **`SplitDisplayIdd`** is an Indirect Display driver based on Microsoft's IddSampleDriver. It plugs virtual
-   monitors on request, with a generated EDID and modes matching half the panel. It asks Windows to render them on
+   monitors on request (up to 8), each with a generated EDID and modes matching its region. It asks Windows to render them on
    the panel's GPU and republishes every desktop frame into a ring of shared textures.
 2. **`splitdisplay.exe`** removes the physical panel from the Windows desktop. This is the same mechanism as
    *Settings > Display > Advanced display > Remove display from desktop*. The program then takes exclusive ownership
@@ -103,12 +106,31 @@ key safe, or delete it from `CurrentUser\My` once the driver is installed.
 
 ## Usage
 
+Start `splitdisplay.exe` without arguments (the installer opens it for you) to get the settings window:
+
+- **Status**: driver, display and split state.
+- **Display to split**: pick the monitor by name.
+- **Start / Stop split** and **Start automatically when I sign in**.
+- **Layout editor**: a live preview of the panel. Edits are a draft until you press *Apply layout*, which saves the
+  layout and restarts a running split.
+  - *Presets*: top/bottom, left/right, 2 x 2, top + bottom halved, three rows, three columns.
+  - *Equal split*: click a region, pick rows or columns and a count (2 to 8), press *Cut*. Every piece can be cut
+    again.
+  - *Manual*: drag a split line (it snaps to 8 px; hold Shift for single pixels), or click it and type an exact
+    position.
+  - *Undo this cut* merges a region back with its siblings. Limits: 8 regions, 320 px minimum per side.
+
+The Windows desktop arrangement mirrors the layout, so the cursor moves between the monitors exactly as they sit on
+the panel.
+
 | command | effect |
 |---|---|
 | `splitdisplay --panel "<name>" ...` | any command: the monitor name prefix to split (default `Sculptor`) |
 | `splitdisplay run` | split the panel and keep it split, recovering from GPU resets, hot-plug and display power-off |
 | `splitdisplay run --test 30` | split for 30 seconds, then restore |
 | `splitdisplay stop` | stop a running instance (it restores the panel) |
+| `splitdisplay --panel "<name>" configure` | save the display to split |
+| `splitdisplay autostart on\|off` | create/enable or disable the logon task |
 | `splitdisplay revert` | restore the panel and unplug the virtual monitors |
 | `Ctrl+Alt+Shift+F12` | emergency exit while running |
 | `sdctl status` | driver, virtual monitor and frame state |
@@ -116,8 +138,13 @@ key safe, or delete it from `CurrentUser\My` once the driver is installed.
 
 Logs are written to `%ProgramData%\SplitDisplay\`.
 
-The panel is matched by its EDID name prefix (`--panel`, default `Sculptor`).
-Only a combined, taller-than-wide target is split. A panel connected over DP as two monitors is left alone.
+Settings live in `%ProgramData%\SplitDisplay\config.ini`: `panel` (monitor name prefix, default `Sculptor`) and
+`layout`. A layout is a cut tree in panel pixels, `L` for one monitor, `R(size:node,...)` for rows and
+`C(size:node,...)` for columns. For example, `R(1440:L,1440:C(1280:L,1280:L))` is a full-width top half and a bottom
+half split into two. When the panel resolution differs, sizes are applied proportionally.
+
+The display is split only if exactly one connected monitor matches the name. A foldable panel connected over DP
+appears as two monitors with the same name and is left alone.
 
 ## Safety
 
@@ -135,9 +162,9 @@ Taking over your only display is risky, so there are several layers of protectio
 - The login screen before sign-in shows the panel as a single display. The split starts at logon. Running the
   compositor as a service in the console session would fix this.
 - Hardware-DRM video may be black on the virtual monitors.
-- Roadmap: arbitrary layouts (any number of rectangles of any size on the panel), layout presets and a layout
-  editor. The architecture already supports this: GPU cost depends only on the panel's pixel count, not on the
-  number of virtual monitors.
+- Changing the layout re-plugs the virtual monitors, so the screen flickers for a second and Windows re-places
+  windows.
+- GPU cost depends only on the panel's pixel count, not on the number of regions.
 
 ## License
 

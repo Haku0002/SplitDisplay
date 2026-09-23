@@ -1,7 +1,7 @@
 /*++
     SplitDisplay indirect display driver.
 
-    Derived from the Microsoft IddSampleDriver (MIT). Exposes up to two virtual monitors that are
+    Derived from the Microsoft IddSampleDriver (MIT). Exposes up to eight virtual monitors that are
     plugged on demand through the shared-memory contract in protocol.h, and republishes every
     desktop frame into a ring of shared textures consumed by the SplitDisplay compositor.
 --*/
@@ -23,15 +23,19 @@ static SdShared* g_Shm = nullptr;
 static std::atomic<void*> g_Owner = nullptr;
 
 // Config captured when monitors were plugged; the mode callbacks answer from this snapshot.
-static SdConfig g_Cfg = { 2560, 1440, 100, {} };
+static SdConfig g_Cfg = { 2, 100, {}, { { 2560, 1440 }, { 2560, 1440 } } };
 
-// {9A3C7E41-2B6D-4F18-8E0C-5D7A1B2C3E01} / ...02 : stable container IDs for the two monitors
-static const GUID kContainerId[SD_MONITORS] = {
-    { 0x9a3c7e41, 0x2b6d, 0x4f18, { 0x8e, 0x0c, 0x5d, 0x7a, 0x1b, 0x2c, 0x3e, 0x01 } },
-    { 0x9a3c7e41, 0x2b6d, 0x4f18, { 0x8e, 0x0c, 0x5d, 0x7a, 0x1b, 0x2c, 0x3e, 0x02 } },
-};
+// Stable container ID per monitor slot: {9A3C7E41-2B6D-4F18-8E0C-5D7A1B2C3Exx}, xx = slot + 1.
+static GUID ContainerId(UINT index)
+{
+    GUID g = { 0x9a3c7e41, 0x2b6d, 0x4f18, { 0x8e, 0x0c, 0x5d, 0x7a, 0x1b, 0x2c, 0x3e, 0x00 } };
+    g.Data4[7] = (BYTE)(index + 1);
+    return g;
+}
 
-static const char* kMonitorName[SD_MONITORS] = { "Split Upper", "Split Lower" };
+// Pixel pitch used for the EDID's physical size (a 13.3" 2560-wide panel), so Windows'
+// scaling recommendation matches the real panel.
+static constexpr double kMmPerPixel = 0.1148;
 
 void SplitDisplay::DLog(const wchar_t* fmt, ...)
 {
@@ -64,9 +68,11 @@ void SplitDisplay::DLog(const wchar_t* fmt, ...)
 
 #pragma region EDID and modes
 
-// Builds a 128-byte EDID 1.4 block describing one half of the panel.
+// Builds a 128-byte EDID 1.4 block describing one region of the panel, named "Split <index+1>".
 static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
 {
+    const UINT w = cfg.size[index].width, h = cfg.size[index].height, hz = cfg.refreshHz;
+    const UINT hmm = (UINT)(w * kMmPerPixel + 0.5), vmm = (UINT)(h * kMmPerPixel + 0.5);
     ZeroMemory(e, sizeof(e));
     const BYTE header[8] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
     memcpy(e, header, 8);
@@ -83,8 +89,8 @@ static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
     e[18] = 1;
     e[19] = 4;                 // EDID 1.4
     e[20] = 0xA5;              // digital, 8 bpc, DisplayPort
-    e[21] = 30;                // cm, a 13.3" 16:9 half panel is ~29.4 x 16.6
-    e[22] = 17;
+    e[21] = (BYTE)((hmm + 5) / 10); // cm
+    e[22] = (BYTE)((vmm + 5) / 10);
     e[23] = 120;               // gamma 2.2
     e[24] = 0x06;              // sRGB default, preferred timing is native
     const BYTE srgb[10] = { 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54 };
@@ -92,7 +98,6 @@ static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
     for (int i = 38; i < 54; i++) e[i] = 0x01; // no standard timings
 
     // Detailed timing descriptor: reduced-blanking style numbers, only the active area really matters.
-    UINT w = cfg.width, h = cfg.height, hz = cfg.refreshHz;
     UINT hblank = 160, hfront = 48, hsync = 32;
     UINT vblank = 60, vfront = 3, vsync = 5;
     UINT64 pclk10k = ((UINT64)(w + hblank) * (h + vblank) * hz + 5000) / 10000;
@@ -109,7 +114,6 @@ static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
     d[9] = (BYTE)(hsync & 0xFF);
     d[10] = (BYTE)(((vfront & 0xF) << 4) | (vsync & 0xF));
     d[11] = (BYTE)(((hfront >> 8) << 6) | ((hsync >> 8) << 4) | ((vfront >> 4) << 2) | (vsync >> 4));
-    UINT hmm = 294, vmm = 166;
     d[12] = (BYTE)(hmm & 0xFF);
     d[13] = (BYTE)(vmm & 0xFF);
     d[14] = (BYTE)(((hmm >> 8) << 4) | (vmm >> 8));
@@ -118,9 +122,11 @@ static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
     // Monitor name descriptor.
     BYTE* n = e + 72;
     n[3] = 0xFC;
-    size_t len = strlen(kMonitorName[index]);
+    char name[14];
+    sprintf_s(name, "Split %u", index + 1);
+    size_t len = strlen(name);
     for (int i = 0; i < 13; i++)
-        n[5 + i] = (BYTE)(i < (int)len ? kMonitorName[index][i] : (i == (int)len ? 0x0A : 0x20));
+        n[5 + i] = (BYTE)(i < (int)len ? name[i] : (i == (int)len ? 0x0A : 0x20));
 
     // Range limits descriptor.
     BYTE* r = e + 90;
@@ -161,13 +167,14 @@ struct ModeTriple
     DWORD w, h, hz;
 };
 
-// First entry is the preferred mode.
-static std::vector<ModeTriple> ModeList()
+// Modes for monitor slot `index`: its region size at the panel rate (preferred) and at 60 Hz.
+static std::vector<ModeTriple> ModeList(UINT index)
 {
+    if (index >= SD_MAX_MONITORS) index = 0;
+    const auto& s = g_Cfg.size[index];
     std::vector<ModeTriple> m;
-    m.push_back({ g_Cfg.width, g_Cfg.height, g_Cfg.refreshHz });
-    if (g_Cfg.refreshHz != 60) m.push_back({ g_Cfg.width, g_Cfg.height, 60 });
-    if (g_Cfg.width != 1920) m.push_back({ 1920, 1080, 60 });
+    m.push_back({ s.width, s.height, g_Cfg.refreshHz });
+    if (g_Cfg.refreshHz != 60) m.push_back({ s.width, s.height, 60 });
     return m;
 }
 
@@ -548,7 +555,7 @@ void IndirectDeviceContext::InitAdapter()
 {
     IDDCX_ADAPTER_CAPS AdapterCaps = {};
     AdapterCaps.Size = sizeof(AdapterCaps);
-    AdapterCaps.MaxMonitorsSupported = SD_MONITORS;
+    AdapterCaps.MaxMonitorsSupported = SD_MAX_MONITORS;
     AdapterCaps.EndPointDiagnostics.Size = sizeof(AdapterCaps.EndPointDiagnostics);
     AdapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
     AdapterCaps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
@@ -656,9 +663,12 @@ void IndirectDeviceContext::CommandLoop()
 void IndirectDeviceContext::PlugMonitors()
 {
     SdConfig cfg = g_Shm->config;
-    if (cfg.width < 640 || cfg.height < 480 || cfg.refreshHz < 24 || cfg.refreshHz > 500)
+    bool valid = cfg.count >= 1 && cfg.count <= SD_MAX_MONITORS && cfg.refreshHz >= 24 && cfg.refreshHz <= 500;
+    for (UINT i = 0; valid && i < cfg.count; i++)
+        valid = cfg.size[i].width >= 160 && cfg.size[i].height >= 160 && cfg.size[i].width <= 16384 && cfg.size[i].height <= 16384;
+    if (!valid)
     {
-        DLog(L"rejecting bad config %ux%u@%u", cfg.width, cfg.height, cfg.refreshHz);
+        DLog(L"rejecting bad config: %u monitors @%u Hz", cfg.count, cfg.refreshHz);
         g_Shm->desiredPlugged = 0;
         return;
     }
@@ -672,7 +682,7 @@ void IndirectDeviceContext::PlugMonitors()
         DLog(L"preferred render adapter %08X:%08X", cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
     }
 
-    for (UINT i = 0; i < SD_MONITORS; i++)
+    for (UINT i = 0; i < cfg.count; i++)
     {
         BYTE edid[128];
         BuildEdid(i, cfg, edid);
@@ -692,7 +702,7 @@ void IndirectDeviceContext::PlugMonitors()
         MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
         MonitorInfo.MonitorDescription.DataSize = sizeof(edid);
         MonitorInfo.MonitorDescription.pData = edid;
-        MonitorInfo.MonitorContainerId = kContainerId[i];
+        MonitorInfo.MonitorContainerId = ContainerId(i);
 
         IDARG_IN_MONITORCREATE MonitorCreate = {};
         MonitorCreate.ObjectAttributes = &Attr;
@@ -709,7 +719,7 @@ void IndirectDeviceContext::PlugMonitors()
 
         IDARG_OUT_MONITORARRIVAL ArrivalOut;
         Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
-        DLog(L"MonitorArrival(%u) status=0x%08X", i, Status);
+        DLog(L"MonitorArrival(%u) %ux%u status=0x%08X", i, cfg.size[i].width, cfg.size[i].height, Status);
         if (NT_SUCCESS(Status))
         {
             m_Monitors[i] = MonitorCreateOut.MonitorObject;
@@ -725,7 +735,7 @@ void IndirectDeviceContext::PlugMonitors()
 
 void IndirectDeviceContext::UnplugMonitors()
 {
-    for (UINT i = 0; i < SD_MONITORS; i++)
+    for (UINT i = 0; i < SD_MAX_MONITORS; i++)
     {
         if (!m_Monitors[i]) continue;
         NTSTATUS Status = IddCxMonitorDeparture(m_Monitors[i]);
@@ -793,7 +803,10 @@ NTSTATUS SdAdapterCommitModes(IDDCX_ADAPTER AdapterObject, const IDARG_IN_COMMIT
 _Use_decl_annotations_
 NTSTATUS SdParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInArgs, IDARG_OUT_PARSEMONITORDESCRIPTION* pOutArgs)
 {
-    auto modes = ModeList();
+    UINT index = 0;
+    if (pInArgs->MonitorDescription.DataSize >= 11 && pInArgs->MonitorDescription.pData)
+        index = ((const BYTE*)pInArgs->MonitorDescription.pData)[10] - 1u; // product code = slot + 1
+    auto modes = ModeList(index);
     pOutArgs->MonitorModeBufferOutputCount = (UINT)modes.size();
     if (pInArgs->MonitorModeBufferInputCount < modes.size())
         return pInArgs->MonitorModeBufferInputCount > 0 ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
@@ -815,8 +828,7 @@ NTSTATUS SdParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInAr
 _Use_decl_annotations_
 NTSTATUS SdMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* pInArgs, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
 {
-    UNREFERENCED_PARAMETER(MonitorObject);
-    auto modes = ModeList();
+    auto modes = ModeList(WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject)->pContext->Index());
     pOutArgs->DefaultMonitorModeBufferOutputCount = (UINT)modes.size();
     if (pInArgs->DefaultMonitorModeBufferInputCount == 0) return STATUS_SUCCESS;
     if (pInArgs->DefaultMonitorModeBufferInputCount < modes.size()) return STATUS_BUFFER_TOO_SMALL;
@@ -835,8 +847,7 @@ NTSTATUS SdMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GE
 _Use_decl_annotations_
 NTSTATUS SdMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTARGETMODES* pInArgs, IDARG_OUT_QUERYTARGETMODES* pOutArgs)
 {
-    UNREFERENCED_PARAMETER(MonitorObject);
-    auto modes = ModeList();
+    auto modes = ModeList(WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject)->pContext->Index());
     pOutArgs->TargetModeBufferOutputCount = (UINT)modes.size();
     if (pInArgs->TargetModeBufferInputCount >= modes.size())
     {

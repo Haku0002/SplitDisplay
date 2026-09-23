@@ -10,7 +10,7 @@ Class=Display
 ClassVer=2.0
 Provider=%ManufacturerName%
 CatalogFile=SplitDisplayIdd.cat
-DriverVer=09/23/2026,1.0.0.1
+DriverVer=09/23/2026,1.0.1.0
 
 [Manufacturer]
 %ManufacturerName%=Standard,NTamd64.10.0...22000

@@ -5,12 +5,19 @@
 #include <string>
 #include <vector>
 
-// Monitor name (EDID friendly name prefix) of the physical panel to split. Defaults to the
-// Sculptor foldable; override with --panel "<name>" on the command line.
+// Monitor name (EDID friendly name prefix) of the physical panel to split.
+// Precedence: --panel "<name>" on the command line, then config.ini, then "Sculptor".
 const wchar_t* PanelNamePrefix();
+void SetPanelNamePrefix(const std::wstring& name);
 
-// Consumes "--panel <name>" from argv (compacting it) and applies it.
+// Loads the configured name, then consumes "--panel <name>" from argv (compacting it).
 void ParsePanelOption(int& argc, wchar_t** argv);
+
+// %ProgramData%\SplitDisplay\config.ini
+std::wstring LoadConfiguredPanel();
+bool SaveConfiguredPanel(const std::wstring& name);
+std::wstring LoadConfigValue(const wchar_t* key);
+bool SaveConfigValue(const wchar_t* key, const std::wstring& value);
 
 // A display target as seen by the DisplayConfig (CCD) API.
 struct PanelTarget

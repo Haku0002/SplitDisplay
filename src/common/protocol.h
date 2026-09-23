@@ -14,20 +14,26 @@
 
 #include <Windows.h>
 
-#define SD_SHM_NAME L"Global\\SplitDisplay.Shm.v1"
-#define SD_CMD_EVENT_NAME L"Global\\SplitDisplay.Cmd.v1"
+#define SD_SHM_NAME L"Global\\SplitDisplay.Shm.v2"
+#define SD_CMD_EVENT_NAME L"Global\\SplitDisplay.Cmd.v2"
 
-constexpr UINT32 SD_MAGIC = 0x31445053; // 'SPD1'
-constexpr UINT32 SD_VERSION = 1;
-constexpr int SD_MONITORS = 2;
+constexpr UINT32 SD_MAGIC = 0x32445053; // 'SPD2'
+constexpr UINT32 SD_VERSION = 2;
+constexpr int SD_MAX_MONITORS = 8;
 constexpr int SD_BUFFERS = 3;
+
+struct SdMonitorSize
+{
+    UINT32 width;
+    UINT32 height;
+};
 
 struct SdConfig
 {
-    UINT32 width;        // per virtual monitor
-    UINT32 height;
-    UINT32 refreshHz;
-    LUID renderAdapter;  // GPU the physical panel is attached to
+    UINT32 count;                        // virtual monitors to plug (1..SD_MAX_MONITORS)
+    UINT32 refreshHz;                    // shared by all of them: the panel's refresh rate
+    LUID renderAdapter;                  // GPU the physical panel is attached to
+    SdMonitorSize size[SD_MAX_MONITORS]; // monitor i is "Split <i+1>"
 };
 
 struct SdMonitorFrames
@@ -53,5 +59,5 @@ struct SdShared
     volatile LONG desiredPlugged;   // controller -> driver
     SdConfig config;                // controller -> driver, read when plugging
     volatile LONG64 driverHeartbeat; // GetTickCount64 of the driver's command thread
-    SdMonitorFrames mon[SD_MONITORS];
+    SdMonitorFrames mon[SD_MAX_MONITORS];
 };

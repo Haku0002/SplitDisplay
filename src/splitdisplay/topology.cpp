@@ -1,5 +1,6 @@
 #include "topology.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -115,46 +116,56 @@ void SetScalePercentForMonitors(const wchar_t* namePrefix, int percent)
     }
 }
 
-bool ArrangeVirtualMonitors()
+bool ArrangeRegions(const std::vector<RECT>& regions)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     if (!QueryActive(paths, modes)) return false;
 
-    DISPLAYCONFIG_SOURCE_MODE* upper = nullptr;
-    DISPLAYCONFIG_SOURCE_MODE* lower = nullptr;
+    std::vector<DISPLAYCONFIG_SOURCE_MODE*> slot(regions.size(), nullptr);
+    std::vector<DISPLAYCONFIG_SOURCE_MODE*> others;
     for (auto& p : paths)
     {
         if (p.sourceInfo.modeInfoIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || p.sourceInfo.modeInfoIdx >= modes.size()) continue;
         auto& mi = modes[p.sourceInfo.modeInfoIdx];
         if (mi.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) continue;
         auto n = TargetName(p);
-        if (StartsWith(n, L"Split Upper")) upper = &mi.sourceMode;
-        else if (StartsWith(n, L"Split Lower")) lower = &mi.sourceMode;
+        bool mine = false;
+        for (size_t i = 0; i < regions.size(); i++)
+        {
+            if (n == L"Split " + std::to_wstring(i + 1))
+            {
+                slot[i] = &mi.sourceMode;
+                mine = true;
+            }
+        }
+        if (!mine) others.push_back(&mi.sourceMode);
     }
-    if (!upper || !lower) return false;
+    for (auto* s : slot)
+        if (!s) return false;
 
-    if (upper->position.x == 0 && upper->position.y == 0 && lower->position.x == 0 && lower->position.y == (LONG)upper->height && paths.size() == 2)
-        return true;
+    bool done = others.empty();
+    for (size_t i = 0; i < regions.size(); i++)
+        if (slot[i]->position.x != regions[i].left || slot[i]->position.y != regions[i].top) done = false;
+    if (done) return true;
 
-    upper->position = { 0, 0 };
-    lower->position = { 0, (LONG)upper->height };
-
-    // Anything else still active (should be nothing once the panel is specialized) goes to the right.
-    LONG x = (LONG)upper->width;
-    for (auto& p : paths)
+    LONG right = 0;
+    for (size_t i = 0; i < regions.size(); i++)
     {
-        if (p.sourceInfo.modeInfoIdx >= modes.size()) continue;
-        auto& sm = modes[p.sourceInfo.modeInfoIdx].sourceMode;
-        if (&sm == upper || &sm == lower) continue;
-        sm.position = { x, 0 };
-        x += (LONG)sm.width;
+        slot[i]->position = { regions[i].left, regions[i].top };
+        right = std::max(right, regions[i].right);
+    }
+    // Anything else still active (should be nothing once the panel is removed) goes to the right.
+    for (auto* s : others)
+    {
+        s->position = { right, 0 };
+        right += (LONG)s->width;
     }
 
     LONG r = SetDisplayConfig((UINT32)paths.size(), paths.data(), (UINT32)modes.size(), modes.data(),
         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
-    Log(L"arrange upper(0,0) lower(0,%u), %zu active paths: %ld", upper->height, paths.size(), r);
-    return r == ERROR_SUCCESS;
+    Log(L"arrange %zu regions, %zu active paths: %ld", regions.size(), paths.size(), r);
+    return false; // verify on the next call
 }
 
 bool IsTargetActive(const wchar_t* namePrefix)

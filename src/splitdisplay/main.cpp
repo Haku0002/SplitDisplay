@@ -4,9 +4,12 @@
 //                                       without --test it keeps running and heals itself
 //   splitdisplay stop                   ask a running instance to exit (it reverts on the way out)
 //   splitdisplay revert                 give the panel back to the desktop, unplug virtual monitors
+//   splitdisplay configure --panel NAME save NAME as the display to split (config.ini)
+//   splitdisplay autostart on|off       create/enable or disable the logon task
 //   splitdisplay watchdog ...           (internal) guards a running compositor
+//   splitdisplay                        (no arguments) open the settings window
 //
-// Any command accepts --panel "<monitor name prefix>" (default: Sculptor).
+// Any command accepts --panel "<monitor name prefix>"; otherwise config.ini, then "Sculptor".
 //
 // Emergency exit while running: Ctrl+Alt+Shift+F12.
 
@@ -26,8 +29,12 @@
 #include <cmath>
 #include <string>
 #include <thread>
+#include <vector>
 
+#include "autostart.h"
+#include "layout.h"
 #include "log.h"
+#include "names.h"
 #include "panel.h"
 #include "shm.h"
 #include "topology.h"
@@ -36,8 +43,6 @@ namespace wdc = winrt::Windows::Devices::Display::Core;
 namespace wdd = winrt::Windows::Devices::Display;
 namespace wgd = winrt::Windows::Graphics::DirectX;
 
-static constexpr wchar_t kStopEventName[] = L"Local\\SplitDisplay.Stop";
-static constexpr wchar_t kInstanceMutexName[] = L"Local\\SplitDisplay.Instance";
 
 static std::atomic_bool g_stop = false;
 static HANDLE g_stopEvent = nullptr;
@@ -88,10 +93,11 @@ static std::wstring HeartbeatName(DWORD pid)
     return L"Local\\SplitDisplay.Hb." + std::to_wstring(pid);
 }
 
-// Over HDMI the panel is one tall target. Over DP it shows up as two ordinary monitors,
-// which must be left alone.
+// The display to split: the one connected target whose name matches. A foldable over DP shows
+// up as two monitors with the same name; that is left alone.
 static std::optional<PanelTarget> FindCombinedPanel()
 {
+    std::vector<PanelTarget> active;
     for (auto& t : EnumTargets())
     {
         if (t.friendlyName.rfind(PanelNamePrefix(), 0) != 0) continue;
@@ -101,9 +107,26 @@ static std::optional<PanelTarget> FindCombinedPanel()
             if (GetSpecialization(t.adapter, t.targetId).enabled) return t;
             continue;
         }
-        if (t.height > t.width && t.height % 2 == 0) return t;
+        active.push_back(t);
     }
+    if (active.size() == 1 && active[0].width && active[0].height) return active[0];
     return std::nullopt;
+}
+
+// The configured layout resolved for this panel (default: two halves along the long side).
+static std::vector<RECT> CurrentRegions(UINT width, UINT height)
+{
+    LayoutNode layout;
+    std::wstring text = LoadConfigValue(L"layout");
+    if (text.empty() || !ParseLayout(text, layout) || CountRegions(layout) < 1) layout = DefaultLayout((int)width, (int)height);
+    std::vector<RECT> out;
+    for (auto& r : ResolveLayout(layout, (int)width, (int)height)) out.push_back(r.rc);
+    return out;
+}
+
+static std::wstring VirtualName(size_t index)
+{
+    return L"Split " + std::to_wstring(index + 1);
 }
 
 #pragma region Revert / watchdog
@@ -374,12 +397,12 @@ static void HotkeyThread()
 
 static bool AnyVirtualSignal(SdShared* s)
 {
-    for (auto& m : s->mon)
-        if (m.fenceHandle != 0 && m.latest >= 0) return true;
+    for (UINT i = 0; i < s->config.count && i < SD_MAX_MONITORS; i++)
+        if (s->mon[i].fenceHandle != 0 && s->mon[i].latest >= 0) return true;
     return false;
 }
 
-static Outcome Composite(SharedView& shm, const PanelTarget& panel, ULONGLONG deadline)
+static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::vector<RECT>& regions, ULONGLONG deadline)
 {
     auto mgr = wdc::DisplayManager::Create(wdc::DisplayManagerOptions::None);
     auto target = WaitForOwnableTarget(mgr, panel.adapter, panel.targetId, 10000);
@@ -486,8 +509,8 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, ULONGLONG de
         return Outcome::Lost;
     }
 
-    FrameSource src[SD_MONITORS];
-    for (int i = 0; i < SD_MONITORS; i++)
+    std::vector<FrameSource> src(regions.size());
+    for (int i = 0; i < (int)src.size(); i++)
     {
         src[i].index = i;
         LUID a = shm->mon[i].adapter;
@@ -495,7 +518,6 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, ULONGLONG de
             Log(L"warning: virtual monitor %d renders on GPU %08X:%08X but the panel is on %08X:%08X; cross-GPU copy is not supported, it will stay black",
                 i, a.HighPart, a.LowPart, panel.adapter.HighPart, panel.adapter.LowPart);
     }
-    const UINT halfH = (UINT)res.Height / SD_MONITORS;
     const float black[4] = { 0, 0, 0, 1 };
 
     LARGE_INTEGER freq, t0, now{};
@@ -578,7 +600,12 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, ULONGLONG de
                 auto& m = shm->mon[s.index];
                 if (s.gen != m.handleGeneration) s.Refresh(dev.get(), shm.get(), driverProc);
 
-                D3D11_RECT area{ 0, (LONG)(s.index * halfH), res.Width, (LONG)((s.index + 1) * halfH) };
+                // Region on the panel, clipped to the scanout size.
+                RECT rc = regions[s.index];
+                rc.right = std::min<LONG>(rc.right, res.Width);
+                rc.bottom = std::min<LONG>(rc.bottom, res.Height);
+                if (rc.right <= rc.left || rc.bottom <= rc.top) continue;
+                D3D11_RECT area{ rc.left, rc.top, rc.right, rc.bottom };
                 LONG64 seq = m.frameSeq;
                 UINT64 fv = 0;
                 int idx = s.gen >= 0 ? s.Acquire(shm.get(), fv) : -1;
@@ -590,8 +617,8 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, ULONGLONG de
                 }
                 s.lastSeq = seq;
                 ctx->Wait(s.fence.get(), fv);
-                D3D11_BOX box{ 0, 0, 0, std::min<UINT>(s.width, (UINT)res.Width), std::min<UINT>(s.height, halfH), 1 };
-                ctx->CopySubresourceRegion(primTex[back].get(), 0, 0, s.index * halfH, 0, s.tex[idx].get(), 0, &box);
+                D3D11_BOX box{ 0, 0, 0, std::min<UINT>(s.width, (UINT)(rc.right - rc.left)), std::min<UINT>(s.height, (UINT)(rc.bottom - rc.top)), 1 };
+                ctx->CopySubresourceRegion(primTex[back].get(), 0, (UINT)rc.left, (UINT)rc.top, 0, s.tex[idx].get(), 0, &box);
             }
             ctx->Signal(fence.get(), ++fenceValue);
             ctx->Flush();
@@ -642,15 +669,40 @@ static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
     SharedView shm;
     if (!shm.Open()) throw std::runtime_error("SplitDisplay driver not loaded");
 
+    // Start from a clean slate: monitors left plugged by an earlier session would keep old sizes.
+    if (shm->desiredPlugged)
+    {
+        InterlockedExchange(&shm->desiredPlugged, 0);
+        shm.Kick();
+        for (int i = 0; i < 50 && std::any_of(std::begin(shm->mon), std::end(shm->mon), [](auto& m) { return m.plugged != 0; }); i++)
+            if (!Nap(100)) return true;
+    }
+
+    auto regions = CurrentRegions(panel.width, panel.height);
+    SdConfig cfg{};
+    cfg.count = (UINT32)regions.size();
+    cfg.refreshHz = (UINT32)std::lround(panel.refreshHz);
+    cfg.renderAdapter = panel.adapter;
+    std::wstring desc;
+    for (size_t i = 0; i < regions.size(); i++)
+    {
+        cfg.size[i] = { (UINT32)(regions[i].right - regions[i].left), (UINT32)(regions[i].bottom - regions[i].top) };
+        desc += L" " + std::to_wstring(cfg.size[i].width) + L"x" + std::to_wstring(cfg.size[i].height) + L"@" +
+                std::to_wstring(regions[i].left) + L"," + std::to_wstring(regions[i].top);
+    }
+    Log(L"layout: %u regions:%s", cfg.count, desc.c_str());
+
     // Counters survive from earlier sessions, so require fresh frames after this plug.
-    LONG64 base0 = shm->mon[0].frameSeq, base1 = shm->mon[1].frameSeq;
-    shm->config = { panel.width, panel.height / 2, (UINT32)std::lround(panel.refreshHz), panel.adapter };
+    LONG64 base[SD_MAX_MONITORS];
+    for (int i = 0; i < SD_MAX_MONITORS; i++) base[i] = shm->mon[i].frameSeq;
+    shm->config = cfg;
     MemoryBarrier();
     InterlockedExchange(&shm->desiredPlugged, 1);
     shm.Kick();
     auto live = [&] {
-        return shm->mon[0].plugged && shm->mon[1].plugged && shm->mon[0].frameSeq > base0 && shm->mon[1].frameSeq > base1 &&
-               IsTargetActive(L"Split Upper") && IsTargetActive(L"Split Lower");
+        for (UINT i = 0; i < cfg.count; i++)
+            if (!shm->mon[i].plugged || shm->mon[i].frameSeq <= base[i] || !IsTargetActive(VirtualName(i).c_str())) return false;
+        return true;
     };
     for (int i = 0; i < 100 && !live(); i++)
         if (!Nap(100)) return true;
@@ -664,12 +716,12 @@ static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
     if (r != ERROR_SUCCESS) throw std::runtime_error("could not remove panel from desktop");
     for (int i = 0; i < 40 && IsTargetActive(PanelNamePrefix()); i++)
         if (!Nap(250)) return true;
-    for (int i = 0; i < 10 && !ArrangeVirtualMonitors(); i++)
+    for (int i = 0; i < 10 && !ArrangeRegions(regions); i++)
         if (!Nap(300)) return true;
 
     for (;;)
     {
-        Outcome o = Composite(shm, panel, deadline);
+        Outcome o = Composite(shm, panel, regions, deadline);
         if (o == Outcome::Stop) return true;
         if (o == Outcome::Lost) return false;
 
@@ -783,13 +835,27 @@ static int CmdRun(DWORD testSeconds)
 
 #pragma endregion
 
+int RunGui();
+
 int wmain(int argc, wchar_t** argv)
 {
     LogInit(L"splitdisplay.log");
     SetConsoleCtrlHandler(OnCtrl, TRUE);
     ParsePanelOption(argc, argv);
-    std::wstring cmd = argc > 1 ? argv[1] : L"";
+    if (argc == 1) return RunGui();
+    std::wstring cmd = argv[1];
 
+    if (cmd == L"configure")
+    {
+        bool ok = SaveConfiguredPanel(PanelNamePrefix());
+        Log(L"configure: display to split = '%s' (%s)", PanelNamePrefix(), ok ? L"saved" : L"FAILED");
+        return ok ? 0 : 1;
+    }
+    if (cmd == L"autostart" && argc > 2)
+    {
+        bool on = _wcsicmp(argv[2], L"on") == 0;
+        return SetAutostart(on) ? 0 : 1;
+    }
     if (cmd == L"run")
     {
         DWORD test = 0;
@@ -803,6 +869,6 @@ int wmain(int argc, wchar_t** argv)
         LUID l{ (DWORD)wcstoul(argv[3], nullptr, 10), (LONG)wcstol(argv[4], nullptr, 10) };
         return CmdWatchdog(wcstoul(argv[2], nullptr, 10), l, wcstoul(argv[5], nullptr, 10), wcstoul(argv[6], nullptr, 10));
     }
-    Log(L"usage: splitdisplay [--panel NAME] run [--test SECONDS] | stop | revert");
+    Log(L"usage: splitdisplay [--panel NAME] run [--test SECONDS] | stop | revert | configure | autostart on|off");
     return 1;
 }
