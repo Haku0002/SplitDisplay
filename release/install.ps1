@@ -62,6 +62,14 @@ Step 'Installing the virtual monitor driver'
 & (Join-Path $here 'sdctl.exe') driver-install (Join-Path $pkg 'SplitDisplayIdd.inf')
 if ($LASTEXITCODE) { throw "driver install failed (see $env:ProgramData\SplitDisplay\sdctl.log)" }
 
+# Driver packages from earlier installs are no longer needed (the one in use cannot be deleted).
+$lines = pnputil /enum-drivers
+for ($i = 1; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match 'Original Name:\s+splitdisplayidd\.inf' -and $lines[$i - 1] -match 'Published Name:\s+(oem\d+\.inf)') {
+        pnputil /delete-driver $Matches[1] 2>&1 | Out-Null
+    }
+}
+
 # Certificates from earlier installs are no longer needed.
 foreach ($store in 'Root', 'TrustedPublisher') {
     Get-ChildItem "Cert:\LocalMachine\$store" | Where-Object { $_.Subject -like "$subject*" -and $_.Thumbprint -ne $cert.Thumbprint } |
