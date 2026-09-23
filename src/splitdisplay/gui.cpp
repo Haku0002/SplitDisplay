@@ -81,7 +81,8 @@ struct MapItem
 {
     PanelTarget target;
     RECT desk;         // desktop coordinates
-    int splitInto = 0; // > 0: the selected display, currently split into this many monitors
+    int splitInto = 0; // > 0: currently split into this many monitors ("Split first+1" ...)
+    int first = 0;
 };
 
 struct Ui
@@ -105,7 +106,8 @@ struct Ui
 
     // monitor map
     std::vector<MapItem> map;
-    std::wstring pick; // device path highlighted on the map
+    std::wstring pick;    // device path highlighted on the map
+    std::wstring editing; // device path whose layout is in the editor
 } g;
 
 struct Item
@@ -128,7 +130,7 @@ const Item kItems[] = {
     { IDC_DISPLAY, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 100, 80, 330, 20, 0 },
     { IDC_SPLIT_L, WC_STATIC, L"Split", SS_LEFT, 16, 104, 80, 20, 1 },
     { IDC_SPLIT, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 100, 104, 330, 20, 0 },
-    { IDC_DISPLAYS_L, WC_STATIC, L"Displays: click the one to split", SS_LEFT, 16, 140, 414, 20, 1 },
+    { IDC_DISPLAYS_L, WC_STATIC, L"Displays: click one to choose and edit it", SS_LEFT, 16, 140, 414, 20, 1 },
     { IDC_MAP, kMapClass, L"", WS_TABSTOP, 16, 162, 414, 158, 0 },
     { IDC_PICK_INFO, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 16, 330, 270, 20, 0 },
     { IDC_PICK, WC_BUTTON, L"Split this display", BS_PUSHBUTTON | WS_TABSTOP, 294, 325, 136, 28, 0 },
@@ -237,36 +239,51 @@ std::wstring Describe(const PanelTarget& t)
     return d;
 }
 
-// Every display on the desktop, plus the selected display while it is split (drawn where its
-// split monitors are).
+std::wstring RuntimePath()
+{
+    wchar_t p[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay\\runtime.ini", p, MAX_PATH);
+    return p;
+}
+
+// Index of the display in the split list (config.ini), or -1.
+int ConfigIndex(const std::vector<PanelConfig>& panels, const PanelTarget& t)
+{
+    for (size_t i = 0; i < panels.size(); i++)
+        if (Matches(panels[i], t)) return (int)i;
+    return -1;
+}
+
+int VirtualIndex(const PanelTarget& t)
+{
+    return t.isVirtual ? _wtoi(Trimmed(t.friendlyName).c_str() + 6) : 0; // "Split N" -> N
+}
+
+// Every display on the desktop, plus each split display (drawn where its split monitors are,
+// as recorded by the compositor in runtime.ini).
 std::vector<MapItem> BuildMap()
 {
     std::vector<MapItem> items;
-    RECT splitArea{};
-    int splitCount = 0;
     auto targets = EnumTargets();
     for (auto& t : targets)
     {
-        if (!t.active || !t.width) continue;
-        RECT r{ t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height };
-        if (t.isVirtual)
-        {
-            splitArea = splitCount++ ? RECT{ std::min(splitArea.left, r.left), std::min(splitArea.top, r.top), std::max(splitArea.right, r.right),
-                                            std::max(splitArea.bottom, r.bottom) }
-                                     : r;
-            continue;
-        }
-        items.push_back({ t, r, 0 });
+        if (!t.active || !t.width || t.isVirtual) continue;
+        items.push_back({ t, { t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height }, 0, 0 });
     }
-    if (splitCount)
+    auto path = RuntimePath();
+    int n = GetPrivateProfileIntW(L"Runtime", L"panels", 0, path.c_str());
+    for (int i = 1; i <= n; i++)
     {
+        auto sec = L"Panel" + std::to_wstring(i);
+        wchar_t id[1024] = {};
+        GetPrivateProfileStringW(sec.c_str(), L"id", L"", id, 1024, path.c_str());
+        auto get = [&](const wchar_t* k) { return GetPrivateProfileIntW(sec.c_str(), k, 0, path.c_str()); };
         for (auto& t : targets)
         {
-            if (!t.active && !t.isVirtual && MatchesPanel(t))
-            {
-                items.push_back({ t, splitArea, splitCount });
-                break;
-            }
+            if (t.active || t.isVirtual || _wcsicmp(t.monitorDevicePath.c_str(), id) != 0) continue;
+            LONG x = (LONG)get(L"x"), y = (LONG)get(L"y");
+            items.push_back({ t, { x, y, x + (LONG)get(L"w"), y + (LONG)get(L"h") }, (int)get(L"count"), (int)get(L"first") });
+            break;
         }
     }
     return items;
@@ -323,12 +340,14 @@ void PaintMap(HWND canvas, HDC dc)
         DrawTextW(mem, L"No displays found", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     auto tf = MapTransformFor(canvas);
+    auto panels = LoadPanels();
+    auto targets = EnumTargets();
     for (auto& m : g.map)
     {
         RECT r = tf.ToCanvas(m.desk);
         InflateRect(&r, -S(2), -S(2));
         bool picked = _wcsicmp(m.target.monitorDevicePath.c_str(), g.pick.c_str()) == 0;
-        bool selected = MatchesPanel(m.target);
+        bool selected = ConfigIndex(panels, m.target) >= 0;
         HBRUSH fill = CreateSolidBrush(picked ? RGB(0xCC, 0xE4, 0xF7) : RGB(0xFF, 0xFF, 0xFF));
         FillRect(mem, &r, fill);
         DeleteObject(fill);
@@ -346,9 +365,10 @@ void PaintMap(HWND canvas, HDC dc)
         {
             HPEN pen = CreatePen(PS_DOT, 1, RGB(0x40, 0x40, 0x40));
             HGDIOBJ old = SelectObject(mem, pen);
-            for (auto& t : EnumTargets())
+            for (auto& t : targets)
             {
-                if (!t.active || !t.isVirtual) continue;
+                int vi = VirtualIndex(t);
+                if (!t.active || vi <= m.first || vi > m.first + m.splitInto) continue;
                 // Only interior cuts: the top/left edges of pieces that are not on the outline.
                 if (t.position.y > m.desk.top)
                 {
@@ -371,7 +391,7 @@ void PaintMap(HWND canvas, HDC dc)
         if (label.empty()) label = L"Display";
         label += L"\n" + std::to_wstring(m.target.width) + L"x" + std::to_wstring(m.target.height);
         if (m.splitInto) label += L"\nsplit into " + std::to_wstring(m.splitInto);
-        else if (selected) label += L"\nselected";
+        else if (selected) label += L"\nwill be split";
         else if (m.target.primary) label += L"\nprimary";
         SelectObject(mem, selected ? g.bold : g.font);
         SetTextColor(mem, RGB(0x20, 0x20, 0x20));
@@ -389,12 +409,16 @@ void PaintMap(HWND canvas, HDC dc)
     DeleteDC(mem);
 }
 
+void LoadDraftFromConfig();
+
 void UpdatePick()
 {
     const MapItem* m = PickedItem();
     SetWindowTextW(Ctl(IDC_PICK_INFO), m ? Describe(m->target).c_str() : L"Click a display above.");
-    bool isCurrent = m && !PanelId().empty() && _wcsicmp(m->target.monitorDevicePath.c_str(), PanelId().c_str()) == 0;
-    EnableWindow(Ctl(IDC_PICK), m && !isCurrent && !g.busy && m->splitInto == 0);
+    bool selected = m && ConfigIndex(LoadPanels(), m->target) >= 0;
+    SetWindowTextW(Ctl(IDC_PICK), selected ? L"Don't split this display" : L"Split this display");
+    EnableWindow(Ctl(IDC_PICK), m && !g.busy);
+    if (g.pick != g.editing) LoadDraftFromConfig(); // the editor follows the picked display
     InvalidateRect(Ctl(IDC_MAP), nullptr, FALSE);
 }
 
@@ -403,9 +427,12 @@ void RefreshMap()
     g.map = BuildMap();
     if (g.pick.empty() || !PickedItem())
     {
+        // Prefer a display that is (to be) split, else the first one.
         g.pick.clear();
+        auto panels = LoadPanels();
         for (auto& m : g.map)
-            if (MatchesPanel(m.target)) g.pick = m.target.monitorDevicePath;
+            if (g.pick.empty() && ConfigIndex(panels, m.target) >= 0) g.pick = m.target.monitorDevicePath;
+        if (g.pick.empty() && !g.map.empty()) g.pick = g.map[0].target.monitorDevicePath;
     }
     UpdatePick();
 }
@@ -445,11 +472,6 @@ void UpdateAutostart()
 {
     auto s = GetAutostart();
     Button_SetCheck(Ctl(IDC_AUTOSTART), s == AutostartState::Enabled ? BST_CHECKED : BST_UNCHECKED);
-}
-
-std::optional<PanelTarget> FindConfiguredPanel()
-{
-    return FindPanel();
 }
 
 #pragma region Layout editor
@@ -530,23 +552,26 @@ void LayoutChanged()
     InvalidateCanvas();
 }
 
+// Loads the picked display's layout (or the default halves) into the editor.
 void LoadDraftFromConfig()
 {
-    if (auto p = FindConfiguredPanel(); p && p->width && p->height)
+    g.editing = g.pick;
+    const MapItem* m = PickedItem();
+    if (m && m->target.width && m->target.height)
     {
-        g.panelW = (int)p->width;
-        g.panelH = (int)p->height;
+        g.panelW = (int)m->target.width;
+        g.panelH = (int)m->target.height;
     }
-    g.applied = LoadConfigValue(L"layout");
+    auto panels = LoadPanels();
+    int idx = m ? ConfigIndex(panels, m->target) : -1;
+    g.applied = idx >= 0 ? panels[idx].layout : L"";
     LayoutNode n;
-    if (g.applied.empty() || !ParseLayout(g.applied, n))
-    {
-        n = DefaultLayout(g.panelW, g.panelH);
-        g.applied.clear();
-    }
+    if (g.applied.empty() || !ParseLayout(g.applied, n)) n = DefaultLayout(g.panelW, g.panelH);
     NormalizeLayout(n, g.panelW, g.panelH);
     g.draft = n;
-    if (g.applied.empty()) g.applied = SerializeLayout(g.draft); // the default is what runs today
+    // A split display with no stored layout runs the default; a display that is not split yet
+    // stays "unsaved" so Apply adds it.
+    if (idx >= 0 && g.applied.empty()) g.applied = SerializeLayout(g.draft);
     g.selRegion.reset();
     g.selSplitter.reset();
     SendMessageW(Ctl(IDC_PRESET), CB_SETCURSEL, 0, 0);
@@ -846,33 +871,30 @@ void UpdateStatus()
     bool driver = shm.Open();
     SetWindowTextW(Ctl(IDC_DRIVER), driver ? L"Installed and loaded" : L"Not loaded (reinstall SplitDisplay)");
 
-    std::wstring name = Trimmed(PanelNamePrefix());
-    const wchar_t* prefix = name.empty() ? L"(none)" : name.c_str();
-    auto panel = FindConfiguredPanel();
-    bool first = IsTargetActive(L"Split 1");
+    auto panels = LoadPanels();
+    int splitPanels = GetPrivateProfileIntW(L"Runtime", L"panels", 0, RuntimePath().c_str());
 
     g.running = IsRunning();
-    g.splitActive = first && panel && !panel->active;
+    g.splitActive = splitPanels > 0 && IsTargetActive(L"Split 1");
     g.problem = !driver;
-    if (!HasPanelSelection())
+    if (panels.empty())
     {
         swprintf_s(buf, L"No display selected: click one below");
     }
-    else if (!panel)
-    {
-        swprintf_s(buf, L"'%s' is not connected", prefix);
-    }
     else if (g.splitActive)
     {
-        swprintf_s(buf, L"%s: split into %u monitors @ %u Hz", prefix, driver ? shm->config.count : 0, driver ? shm->config.refreshHz : 0);
+        swprintf_s(buf, L"%d of %zu selected display%s split into %u monitors", splitPanels, panels.size(), panels.size() == 1 ? L"" : L"s",
+            driver ? shm->config.count : 0);
     }
-    else if (panel->active)
+    else if (panels.size() == 1)
     {
-        swprintf_s(buf, L"%s: %ux%u @ %.0f Hz, one display", prefix, panel->width, panel->height, panel->refreshHz);
+        auto t = FindTarget(panels[0]);
+        if (t && t->active) swprintf_s(buf, L"%s: %ux%u @ %.0f Hz, one display", panels[0].name.c_str(), t->width, t->height, t->refreshHz);
+        else swprintf_s(buf, L"'%s' is not connected", panels[0].name.c_str());
     }
     else
     {
-        swprintf_s(buf, L"%s: removed from the desktop", prefix);
+        swprintf_s(buf, L"%zu displays selected, not split", panels.size());
     }
     SetWindowTextW(Ctl(IDC_DISPLAY), buf);
 
@@ -884,8 +906,8 @@ void UpdateStatus()
     EnableWindow(Ctl(IDC_START), !g.busy && driver && !g.running);
     EnableWindow(Ctl(IDC_STOP), !g.busy && g.running);
     EnableWindow(Ctl(IDC_UNINSTALL), !g.busy && GetFileAttributesW((ExeDir() + L"\\Uninstall.cmd").c_str()) != INVALID_FILE_ATTRIBUTES);
-    UpdateLayoutControls();
     RefreshMap();
+    UpdateLayoutControls();
 }
 
 void StartCompositor()
@@ -939,23 +961,49 @@ void RestartIfRunning()
     });
 }
 
+// Adds the picked display to the split list (with the layout in the editor) or removes it.
 void OnPick()
 {
     const MapItem* m = PickedItem();
     if (!m) return;
-    SelectPanel(m->target);
-    Log(L"gui: display to split set to '%s' (%s)", m->target.friendlyName.c_str(), m->target.monitorDevicePath.c_str());
+    auto panels = LoadPanels();
+    int idx = ConfigIndex(panels, m->target);
+    if (idx >= 0)
+    {
+        panels.erase(panels.begin() + idx);
+        Log(L"gui: stop splitting '%s'", m->target.friendlyName.c_str());
+    }
+    else
+    {
+        NormalizeLayout(g.draft, g.panelW, g.panelH);
+        PanelConfig c = ConfigFor(m->target);
+        c.layout = SerializeLayout(g.draft);
+        panels.push_back(c);
+        Log(L"gui: split '%s' with %s", m->target.friendlyName.c_str(), c.layout.c_str());
+    }
+    SavePanels(panels);
     LoadDraftFromConfig();
     RestartIfRunning();
     UpdateStatus();
 }
 
+// Saves the editor's layout for the picked display (adding it to the split list if needed).
 void OnApplyLayout()
 {
+    const MapItem* m = PickedItem();
+    if (!m) return;
     NormalizeLayout(g.draft, g.panelW, g.panelH);
     g.applied = SerializeLayout(g.draft);
-    SaveConfigValue(L"layout", g.applied);
-    Log(L"gui: layout set to %s", g.applied.c_str());
+    auto panels = LoadPanels();
+    int idx = ConfigIndex(panels, m->target);
+    if (idx < 0)
+    {
+        panels.push_back(ConfigFor(m->target));
+        idx = (int)panels.size() - 1;
+    }
+    panels[idx].layout = g.applied;
+    SavePanels(panels);
+    Log(L"gui: layout of '%s' set to %s", m->target.friendlyName.c_str(), g.applied.c_str());
     RestartIfRunning();
     UpdateStatus();
 }

@@ -89,7 +89,7 @@ int GetScalePercentForTarget(LUID adapter, UINT32 targetId)
     return 0;
 }
 
-void SetScalePercentForMonitors(const wchar_t* namePrefix, int percent)
+void SetScalePercent(const std::vector<std::wstring>& names, int percent)
 {
     int want = -1;
     for (int i = 0; i < (int)std::size(kDpiValues); i++)
@@ -101,7 +101,7 @@ void SetScalePercentForMonitors(const wchar_t* namePrefix, int percent)
     if (!QueryActive(paths, modes)) return;
     for (auto& p : paths)
     {
-        if (!StartsWith(TargetName(p), namePrefix)) continue;
+        if (std::find(names.begin(), names.end(), TargetName(p)) == names.end()) continue;
         int rec = 0;
         int cur = ScalePercentForSource(p.sourceInfo.adapterId, p.sourceInfo.id, &rec);
         if (cur == percent) continue;
@@ -127,7 +127,7 @@ static std::wstring TargetDevicePath(const DISPLAYCONFIG_PATH_INFO& p)
     return name.monitorDevicePath;
 }
 
-bool ArrangeRegions(const std::vector<RECT>& regions, POINT origin, const std::vector<PlacedDisplay>& others)
+bool ArrangeMonitors(const std::vector<RECT>& regions, const std::vector<PlacedDisplay>& others)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
@@ -158,7 +158,7 @@ bool ArrangeRegions(const std::vector<RECT>& regions, POINT origin, const std::v
     for (auto* s : slot)
         if (!s) return false;
 
-    auto want = [&](size_t i) { return POINTL{ origin.x + regions[i].left, origin.y + regions[i].top }; };
+    auto want = [&](size_t i) { return POINTL{ regions[i].left, regions[i].top }; };
     bool done = true;
     for (size_t i = 0; i < regions.size(); i++)
         if (slot[i]->position.x != want(i).x || slot[i]->position.y != want(i).y) done = false;
@@ -171,7 +171,7 @@ bool ArrangeRegions(const std::vector<RECT>& regions, POINT origin, const std::v
 
     LONG r = SetDisplayConfig((UINT32)paths.size(), paths.data(), (UINT32)modes.size(), modes.data(),
         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
-    Log(L"arrange %zu regions, %zu active paths: %ld", regions.size(), paths.size(), r);
+    Log(L"arrange %zu monitors, %zu active paths: %ld", regions.size(), paths.size(), r);
     return false; // verify on the next call
 }
 

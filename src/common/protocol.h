@@ -14,26 +14,28 @@
 
 #include <Windows.h>
 
-#define SD_SHM_NAME L"Global\\SplitDisplay.Shm.v2"
-#define SD_CMD_EVENT_NAME L"Global\\SplitDisplay.Cmd.v2"
+#define SD_SHM_NAME L"Global\\SplitDisplay.Shm.v3"
+#define SD_CMD_EVENT_NAME L"Global\\SplitDisplay.Cmd.v3"
 
-constexpr UINT32 SD_MAGIC = 0x32445053; // 'SPD2'
-constexpr UINT32 SD_VERSION = 2;
-constexpr int SD_MAX_MONITORS = 8;
+constexpr UINT32 SD_MAGIC = 0x33445053; // 'SPD3'
+constexpr UINT32 SD_VERSION = 3;
+constexpr int SD_MAX_MONITORS = 16;
 constexpr int SD_BUFFERS = 3;
 
-struct SdMonitorSize
+struct SdMonitorConfig
 {
     UINT32 width;
     UINT32 height;
+    UINT32 refreshHz; // the refresh rate of the physical panel this monitor is part of
+    UINT32 reserved;
 };
 
 struct SdConfig
 {
-    UINT32 count;                        // virtual monitors to plug (1..SD_MAX_MONITORS)
-    UINT32 refreshHz;                    // shared by all of them: the panel's refresh rate
-    LUID renderAdapter;                  // GPU the physical panel is attached to
-    SdMonitorSize size[SD_MAX_MONITORS]; // monitor i is "Split <i+1>"
+    UINT32 count;                          // virtual monitors to plug (1..SD_MAX_MONITORS)
+    UINT32 reserved;
+    LUID renderAdapter;                    // GPU the physical panels are attached to
+    SdMonitorConfig mon[SD_MAX_MONITORS];  // monitor i is "Split <i+1>"
 };
 
 struct SdMonitorFrames

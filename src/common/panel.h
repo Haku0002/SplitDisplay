@@ -28,23 +28,29 @@ struct PanelTarget
 // All targets with a connected monitor (active or not).
 std::vector<PanelTarget> EnumTargets();
 
-// Which display to split. Selected by monitor device path (from the settings window or
-// "autodetect"); a name prefix (--panel, case-insensitive) is the fallback.
-std::wstring PanelId();
-std::wstring PanelNamePrefix();
-bool HasPanelSelection();
-void SelectPanel(const PanelTarget& t); // saves id + name to config.ini
-void SetPanelNamePrefix(const std::wstring& name);
-bool MatchesPanel(const PanelTarget& t);
+// Displays to split, each with its own layout. Stored in config.ini as [Panel1]..[PanelN]
+// (id = monitor device path, name, layout); the single-panel keys of v0.1 are migrated.
+struct PanelConfig
+{
+    std::wstring id;     // monitor device path (preferred key)
+    std::wstring name;   // EDID name; case-insensitive prefix match when id is empty
+    std::wstring layout; // SerializeLayout() text; empty = default halves
+};
 
-// Loads the selection from config.ini, then consumes "--panel <name>" from argv (compacting it).
+std::vector<PanelConfig> LoadPanels();
+void SavePanels(const std::vector<PanelConfig>& panels);
+bool Matches(const PanelConfig& c, const PanelTarget& t);
+PanelConfig ConfigFor(const PanelTarget& t);
+
+// The panels to work on: "--panel <name>" from the command line (not saved), else config.ini.
+std::vector<PanelConfig> SelectedPanels();
 void ParsePanelOption(int& argc, wchar_t** argv);
 
 // Picks a display when none is selected: the only taller-than-wide display, else the only display.
 std::optional<PanelTarget> AutodetectPanel();
 
-// The configured panel, preferring an active target over an inactive one.
-std::optional<PanelTarget> FindPanel();
+// The connected target for a panel config, preferring an active target over an inactive one.
+std::optional<PanelTarget> FindTarget(const PanelConfig& c);
 
 std::wstring ConnectorName(DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY t);
 

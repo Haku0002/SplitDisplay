@@ -1,9 +1,10 @@
 SplitDisplay
 ============
 
-Splits one physical display into real Windows monitors: two halves by default, or any
-layout of up to 8 monitors. Built for foldable dual-panel monitors that show up as a
-single 2560x2880 display over HDMI.
+Splits physical displays into real Windows monitors: two halves by default, or any
+layout of up to 8 monitors per display. Several displays can be split at once, each
+with its own layout. Built for foldable dual-panel monitors that show up as a single
+2560x2880 display over HDMI.
 
 Install
   Double-click Install.cmd and accept the administrator prompt. The display to

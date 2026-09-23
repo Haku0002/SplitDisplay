@@ -122,24 +122,21 @@ static int Plug(int argc, wchar_t** argv)
     // Default: two halves of the panel. "plug W H HZ" plugs two monitors of W x H.
     SdConfig cfg{};
     cfg.count = 2;
-    cfg.refreshHz = 100;
-    cfg.size[0] = cfg.size[1] = { 2560, 1440 };
-    if (auto p = FindPanel())
+    SdMonitorConfig m{ 2560, 1440, 100, 0 };
+    auto panels = SelectedPanels();
+    if (auto p = panels.empty() ? AutodetectPanel() : FindTarget(panels[0]))
     {
         cfg.renderAdapter = p->adapter;
-        if (p->width && p->height) cfg.size[0] = cfg.size[1] = { p->width, p->height / 2 };
-        if (p->refreshHz > 1) cfg.refreshHz = (UINT32)std::lround(p->refreshHz);
+        if (p->width && p->height) m.width = p->width, m.height = p->height / 2;
+        if (p->refreshHz > 1) m.refreshHz = (UINT32)std::lround(p->refreshHz);
     }
-    if (argc >= 5)
-    {
-        cfg.size[0] = cfg.size[1] = { (UINT32)_wtoi(argv[2]), (UINT32)_wtoi(argv[3]) };
-        cfg.refreshHz = _wtoi(argv[4]);
-    }
+    if (argc >= 5) m = { (UINT32)_wtoi(argv[2]), (UINT32)_wtoi(argv[3]), (UINT32)_wtoi(argv[4]), 0 };
+    cfg.mon[0] = cfg.mon[1] = m;
     v->config = cfg;
     MemoryBarrier();
     InterlockedExchange(&v->desiredPlugged, 1);
     v.Kick();
-    Log(L"plug requested: 2 x %ux%u@%u on adapter %08X:%08X", cfg.size[0].width, cfg.size[0].height, cfg.refreshHz, cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
+    Log(L"plug requested: 2 x %ux%u@%u on adapter %08X:%08X", m.width, m.height, m.refreshHz, cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
 
     for (int i = 0; i < 50; i++)
     {
@@ -170,8 +167,8 @@ static int Status()
     SharedView v;
     if (!OpenShm(v)) return 1;
     auto* s = v.get();
-    Log(L"driver pid %lu, heartbeat %lld ms ago, desiredPlugged=%ld, %u monitors @%u Hz on adapter %08X:%08X", s->driverPid,
-        (LONG64)GetTickCount64() - s->driverHeartbeat, s->desiredPlugged, s->config.count, s->config.refreshHz,
+    Log(L"driver pid %lu, heartbeat %lld ms ago, desiredPlugged=%ld, %u monitors on adapter %08X:%08X", s->driverPid,
+        (LONG64)GetTickCount64() - s->driverHeartbeat, s->desiredPlugged, s->config.count,
         s->config.renderAdapter.HighPart, s->config.renderAdapter.LowPart);
     for (UINT i = 0; i < s->config.count && i < SD_MAX_MONITORS; i++)
     {

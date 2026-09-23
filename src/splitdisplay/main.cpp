@@ -1,16 +1,16 @@
-// splitdisplay: turns the single 2560x2880 Sculptor panel into two native Windows monitors.
+// splitdisplay: turns physical displays into several native Windows monitors each.
 //
-//   splitdisplay run [--test SECONDS]   plug virtual monitors, take over the panel, composite;
+//   splitdisplay run [--test SECONDS]   plug virtual monitors, take over the panels, composite;
 //                                       without --test it keeps running and heals itself
 //   splitdisplay stop                   ask a running instance to exit (it reverts on the way out)
-//   splitdisplay revert                 give the panel back to the desktop, unplug virtual monitors
-//   splitdisplay configure --panel NAME save NAME as the display to split (config.ini)
+//   splitdisplay revert                 give the panels back to the desktop, unplug virtual monitors
+//   splitdisplay configure --panel NAME split only the display called NAME (config.ini)
 //   splitdisplay autodetect             select a display if none is selected yet
 //   splitdisplay autostart on|off       create/enable or disable the logon task
 //   splitdisplay watchdog ...           (internal) guards a running compositor
 //   splitdisplay                        (no arguments) open the settings window
 //
-// Any command accepts --panel "<monitor name prefix>"; otherwise the selection in config.ini.
+// Any command accepts --panel "<monitor name prefix>" to work on that display only (not saved).
 //
 // Emergency exit while running: Ctrl+Alt+Shift+F12.
 
@@ -28,6 +28,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -44,14 +45,17 @@ namespace wdc = winrt::Windows::Devices::Display::Core;
 namespace wdd = winrt::Windows::Devices::Display;
 namespace wgd = winrt::Windows::Graphics::DirectX;
 
-
 static std::atomic_bool g_stop = false;
+static std::atomic_bool g_abort = false; // a panel worker lost its panel; end the session
 static HANDLE g_stopEvent = nullptr;
 static volatile LONG64* g_heartbeat = nullptr;
+// Panel workers report here; the main thread only beats while every worker is alive.
+static thread_local std::atomic<ULONGLONG>* t_workerBeat = nullptr;
 
 static void Beat()
 {
-    if (g_heartbeat) InterlockedExchange64(g_heartbeat, (LONG64)GetTickCount64());
+    if (t_workerBeat) *t_workerBeat = GetTickCount64();
+    else if (g_heartbeat) InterlockedExchange64(g_heartbeat, (LONG64)GetTickCount64());
 }
 
 static bool StopRequested()
@@ -60,16 +64,21 @@ static bool StopRequested()
     return g_stop;
 }
 
-// Sleeps in small steps, keeping the heartbeat alive. Returns false if a stop was requested.
+static bool ShouldExit()
+{
+    return StopRequested() || g_abort;
+}
+
+// Sleeps in small steps, keeping the heartbeat alive. Returns false if the session should end.
 static bool Nap(DWORD ms)
 {
     for (DWORD t = 0; t < ms; t += 100)
     {
         Beat();
-        if (StopRequested()) return false;
+        if (ShouldExit()) return false;
         Sleep(100);
     }
-    return !StopRequested();
+    return !ShouldExit();
 }
 
 static BOOL WINAPI OnCtrl(DWORD)
@@ -94,54 +103,131 @@ static std::wstring HeartbeatName(DWORD pid)
     return L"Local\\SplitDisplay.Hb." + std::to_wstring(pid);
 }
 
-// The display to split: the selected monitor (by device path). With only a name selected, it must
-// match exactly one connected monitor (a foldable over DP shows up as two monitors with the same
-// name and is left alone); that match is then remembered by device path.
-static std::optional<PanelTarget> FindCombinedPanel()
-{
-    if (!HasPanelSelection())
-    {
-        auto guess = AutodetectPanel();
-        if (!guess) return std::nullopt;
-        SelectPanel(*guess);
-        Log(L"no display selected, auto-detected '%s' (%s)", guess->friendlyName.c_str(), guess->monitorDevicePath.c_str());
-    }
-    std::vector<PanelTarget> active;
-    for (auto& t : EnumTargets())
-    {
-        if (!MatchesPanel(t)) continue;
-        if (!t.active)
-        {
-            // Off the desktop: only ours if it is still removed via the override (e.g. left behind by a crash).
-            if (GetSpecialization(t.adapter, t.targetId).enabled) return t;
-            continue;
-        }
-        active.push_back(t);
-    }
-    if (active.size() != 1 || !active[0].width || !active[0].height) return std::nullopt;
-    if (PanelId().empty()) SelectPanel(active[0]);
-    return active[0];
-}
-
-// The configured layout resolved for this panel (default: two halves along the long side).
-static std::vector<RECT> CurrentRegions(UINT width, UINT height)
-{
-    LayoutNode layout;
-    std::wstring text = LoadConfigValue(L"layout");
-    if (text.empty() || !ParseLayout(text, layout) || CountRegions(layout) < 1) layout = DefaultLayout((int)width, (int)height);
-    std::vector<RECT> out;
-    for (auto& r : ResolveLayout(layout, (int)width, (int)height)) out.push_back(r.rc);
-    return out;
-}
-
 static std::wstring VirtualName(size_t index)
 {
     return L"Split " + std::to_wstring(index + 1);
 }
 
+static bool SameTarget(const PanelTarget& a, const PanelTarget& b)
+{
+    return a.adapter.LowPart == b.adapter.LowPart && a.adapter.HighPart == b.adapter.HighPart && a.targetId == b.targetId;
+}
+
+#pragma region Runtime state (read by the settings window)
+
+static std::wstring RuntimePath()
+{
+    wchar_t p[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay\\runtime.ini", p, MAX_PATH);
+    return p;
+}
+
+struct PanelSession
+{
+    PanelConfig cfg;
+    PanelTarget target;
+    std::vector<RECT> regions; // on the panel
+    UINT first = 0;            // index of its first virtual monitor
+    int scale = 0;
+};
+
+static void WriteRuntime(const std::vector<PanelSession>& ps)
+{
+    auto path = RuntimePath();
+    DeleteFileW(path.c_str());
+    WritePrivateProfileStringW(L"Runtime", L"panels", std::to_wstring(ps.size()).c_str(), path.c_str());
+    for (size_t i = 0; i < ps.size(); i++)
+    {
+        auto sec = L"Panel" + std::to_wstring(i + 1);
+        auto& p = ps[i];
+        auto put = [&](const wchar_t* k, const std::wstring& v) { WritePrivateProfileStringW(sec.c_str(), k, v.c_str(), path.c_str()); };
+        put(L"id", p.target.monitorDevicePath);
+        put(L"x", std::to_wstring(p.target.position.x));
+        put(L"y", std::to_wstring(p.target.position.y));
+        put(L"w", std::to_wstring(p.target.width));
+        put(L"h", std::to_wstring(p.target.height));
+        put(L"first", std::to_wstring(p.first));
+        put(L"count", std::to_wstring(p.regions.size()));
+    }
+}
+
+static void ClearRuntime()
+{
+    DeleteFileW(RuntimePath().c_str());
+}
+
+#pragma endregion
+
+#pragma region Panels
+
+struct PanelScan
+{
+    std::vector<std::pair<PanelConfig, PanelTarget>> ready; // on the desktop, can be split
+    std::vector<PanelTarget> stale;                          // still removed from the desktop by us
+};
+
+// Resolves the configured panels to connected targets. A name-only entry must match exactly one
+// active display (a foldable over DP shows up as two monitors with the same name and is left
+// alone); it is then remembered by device path.
+static PanelScan ScanPanels()
+{
+    PanelScan scan;
+    auto panels = SelectedPanels();
+    bool fromConfig = !panels.empty() && LoadPanels().size() == panels.size();
+    if (panels.empty())
+    {
+        auto guess = AutodetectPanel();
+        if (!guess) return scan;
+        panels = { ConfigFor(*guess) };
+        SavePanels(panels);
+        fromConfig = true;
+        Log(L"no display selected, auto-detected '%s'", guess->friendlyName.c_str());
+    }
+
+    auto targets = EnumTargets();
+    bool upgraded = false;
+    for (auto& c : panels)
+    {
+        std::vector<PanelTarget> active;
+        for (auto& t : targets)
+        {
+            if (!Matches(c, t)) continue;
+            if (!t.active)
+            {
+                // Off the desktop: ours if it is still removed via the override (e.g. after a crash).
+                if (GetSpecialization(t.adapter, t.targetId).enabled) scan.stale.push_back(t);
+                continue;
+            }
+            active.push_back(t);
+        }
+        if (active.size() != 1 || !active[0].width || !active[0].height) continue;
+        if (c.id.empty())
+        {
+            c = { active[0].monitorDevicePath, c.name, c.layout };
+            upgraded = true;
+        }
+        bool dup = false;
+        for (auto& r : scan.ready) dup |= SameTarget(r.second, active[0]);
+        if (!dup) scan.ready.push_back({ c, active[0] });
+    }
+    if (upgraded && fromConfig) SavePanels(panels);
+    return scan;
+}
+
+static std::vector<RECT> RegionsFor(const PanelConfig& c, UINT width, UINT height)
+{
+    LayoutNode layout;
+    if (c.layout.empty() || !ParseLayout(c.layout, layout) || CountRegions(layout) < 1) layout = DefaultLayout((int)width, (int)height);
+    std::vector<RECT> out;
+    for (auto& r : ResolveLayout(layout, (int)width, (int)height)) out.push_back(r.rc);
+    return out;
+}
+
+#pragma endregion
+
 #pragma region Revert / watchdog
 
-static bool PanelActive(LUID luid, UINT32 targetId)
+static bool TargetActive(LUID luid, UINT32 targetId)
 {
     for (auto& t : EnumTargets())
         if (t.adapter.LowPart == luid.LowPart && t.adapter.HighPart == luid.HighPart && t.targetId == targetId) return t.active;
@@ -154,49 +240,59 @@ static void UnplugVirtual()
     if (!v.Open()) return;
     InterlockedExchange(&v->desiredPlugged, 0);
     v.Kick();
-    for (int i = 0; i < 50 && (v->mon[0].plugged || v->mon[1].plugged); i++) Sleep(100);
-    Log(L"revert: virtual monitors unplugged (%ld,%ld)", v->mon[0].plugged, v->mon[1].plugged);
+    auto anyPlugged = [&] { return std::any_of(std::begin(v->mon), std::end(v->mon), [](auto& m) { return m.plugged != 0; }); };
+    for (int i = 0; i < 50 && anyPlugged(); i++) Sleep(100);
+    Log(L"revert: virtual monitors unplugged%s", anyPlugged() ? L" (some still plugged)" : L"");
 }
 
-// Idempotent: panel back on the desktop first, then remove the virtual monitors.
-static void RevertAll(LUID luid, UINT32 targetId)
+// Idempotent: panels back on the desktop first, then remove the virtual monitors.
+static void RevertTargets(const std::vector<std::pair<LUID, UINT32>>& targets)
 {
-    for (int i = 0; i < 10; i++)
+    for (auto& [luid, id] : targets)
     {
-        LONG r = SetSpecialization(luid, targetId, false);
-        if (r == ERROR_SUCCESS) Log(L"revert: panel returned to the desktop");
-        if (r == ERROR_SUCCESS || r == ERROR_GEN_FAILURE) break; // GEN_FAILURE: nothing to undo
-        Log(L"revert: SetSpecialization(false) -> %ld", r);
-        Sleep(500);
+        for (int i = 0; i < 10; i++)
+        {
+            LONG r = SetSpecialization(luid, id, false);
+            if (r == ERROR_SUCCESS) Log(L"revert: panel %u returned to the desktop", id);
+            if (r == ERROR_SUCCESS || r == ERROR_GEN_FAILURE) break; // GEN_FAILURE: nothing to undo
+            Log(L"revert: SetSpecialization(false) -> %ld", r);
+            Sleep(500);
+        }
     }
-    for (int i = 0; i < 20 && !PanelActive(luid, targetId); i++) Sleep(250);
+    for (auto& [luid, id] : targets)
+        for (int i = 0; i < 20 && !TargetActive(luid, id); i++) Sleep(250);
 
     UnplugVirtual();
+    ClearRuntime();
 
-    if (!PanelActive(luid, targetId))
+    bool allActive = true;
+    for (auto& [luid, id] : targets) allActive &= TargetActive(luid, id);
+    if (!allActive)
     {
         Sleep(1000);
-        if (!PanelActive(luid, targetId)) ForceExtendTopology();
+        allActive = true;
+        for (auto& [luid, id] : targets) allActive &= TargetActive(luid, id);
+        if (!allActive) ForceExtendTopology();
     }
-    Log(L"revert: panel active=%d", PanelActive(luid, targetId));
+    Log(L"revert: done, all panels active=%d", allActive);
+}
+
+static std::vector<std::pair<LUID, UINT32>> Keys(const std::vector<PanelTarget>& ts)
+{
+    std::vector<std::pair<LUID, UINT32>> out;
+    for (auto& t : ts) out.push_back({ t.adapter, t.targetId });
+    return out;
 }
 
 static int CmdRevert()
 {
-    bool any = false;
+    std::vector<PanelTarget> ts;
+    auto panels = SelectedPanels();
     for (auto& t : EnumTargets())
-    {
-        if (!MatchesPanel(t)) continue;
-        any = true;
-        RevertAll(t.adapter, t.targetId);
-    }
-    if (!any)
-    {
-        Log(L"revert: selected display not found");
-        UnplugVirtual();
-        return 1;
-    }
-    return 0;
+        for (auto& c : panels)
+            if (Matches(c, t)) ts.push_back(t);
+    RevertTargets(Keys(ts));
+    return ts.empty() ? 1 : 0;
 }
 
 static int CmdStop()
@@ -213,61 +309,68 @@ static int CmdStop()
     return 0;
 }
 
-static int CmdWatchdog(DWORD parentPid, LUID luid, UINT32 targetId, DWORD maxSeconds)
+// watchdog <parentPid> <maxSeconds> <luidLow>:<luidHigh>:<targetId> ...
+static int CmdWatchdog(int argc, wchar_t** argv)
 {
+    DWORD parentPid = wcstoul(argv[2], nullptr, 10);
+    DWORD maxSeconds = wcstoul(argv[3], nullptr, 10);
+    std::vector<std::pair<LUID, UINT32>> targets;
+    for (int i = 4; i < argc; i++)
+    {
+        unsigned long lo = 0, id = 0;
+        long hi = 0;
+        if (swscanf_s(argv[i], L"%lu:%ld:%lu", &lo, &hi, &id) == 3) targets.push_back({ LUID{ lo, hi }, (UINT32)id });
+    }
+
     HANDLE parent = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, parentPid);
-    if (!parent)
-    {
-        RevertAll(luid, targetId);
-        return 1;
-    }
-
-    volatile LONG64* hb = nullptr;
-    HANDLE map = nullptr;
-    ULONGLONG start = GetTickCount64();
     const wchar_t* reason = L"compositor exited";
-
-    for (;;)
+    if (parent)
     {
-        if (WaitForSingleObject(parent, 250) == WAIT_OBJECT_0) break;
-        if (!hb)
+        volatile LONG64* hb = nullptr;
+        ULONGLONG start = GetTickCount64();
+        for (;;)
         {
-            map = OpenFileMappingW(FILE_MAP_READ, FALSE, HeartbeatName(parentPid).c_str());
-            if (map) hb = (volatile LONG64*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(LONG64));
+            if (WaitForSingleObject(parent, 250) == WAIT_OBJECT_0) break;
+            if (!hb)
+            {
+                HANDLE map = OpenFileMappingW(FILE_MAP_READ, FALSE, HeartbeatName(parentPid).c_str());
+                if (map) hb = (volatile LONG64*)MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(LONG64));
+            }
+            ULONGLONG now = GetTickCount64();
+            LONG64 last = hb ? *hb : 0;
+            if (last && now - (ULONGLONG)last > 6000)
+            {
+                reason = L"heartbeat lost";
+                TerminateProcess(parent, 0xDEAD);
+                break;
+            }
+            if (maxSeconds && now - start > maxSeconds * 1000ULL)
+            {
+                reason = L"test time limit";
+                TerminateProcess(parent, 0xDEAD);
+                break;
+            }
         }
-        ULONGLONG now = GetTickCount64();
-        LONG64 last = hb ? *hb : 0;
-        if (last && now - (ULONGLONG)last > 6000)
-        {
-            reason = L"heartbeat lost";
-            TerminateProcess(parent, 0xDEAD);
-            break;
-        }
-        if (maxSeconds && now - start > maxSeconds * 1000ULL)
-        {
-            reason = L"test time limit";
-            TerminateProcess(parent, 0xDEAD);
-            break;
-        }
+        WaitForSingleObject(parent, 5000);
     }
-    WaitForSingleObject(parent, 5000);
-    Log(L"watchdog: %s, reverting", reason);
-    RevertAll(luid, targetId);
+    Log(L"watchdog: %s, reverting %zu panel(s)", reason, targets.size());
+    RevertTargets(targets);
     return 0;
 }
 
-static void SpawnWatchdog(const PanelTarget& p, DWORD maxSeconds)
+static void SpawnWatchdog(const std::vector<PanelTarget>& ts, DWORD maxSeconds)
 {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    wchar_t cmd[512];
-    swprintf_s(cmd, L"\"%s\" watchdog %lu %lu %ld %u %lu", exe, GetCurrentProcessId(), p.adapter.LowPart, p.adapter.HighPart, p.targetId, maxSeconds);
+    std::wstring cmd = L"\"" + std::wstring(exe) + L"\" watchdog " + std::to_wstring(GetCurrentProcessId()) + L" " + std::to_wstring(maxSeconds);
+    for (auto& t : ts)
+        cmd += L" " + std::to_wstring(t.adapter.LowPart) + L":" + std::to_wstring(t.adapter.HighPart) + L":" + std::to_wstring(t.targetId);
     STARTUPINFOW si{ sizeof(si) };
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi) &&
-        !CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &si, &pi))
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &si, &pi) &&
+        !CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &si, &pi))
         throw std::runtime_error("failed to start watchdog");
-    Log(L"watchdog pid %lu armed (limit %lus)", pi.dwProcessId, maxSeconds);
+    Log(L"watchdog pid %lu armed for %zu panel(s) (limit %lus)", pi.dwProcessId, ts.size(), maxSeconds);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 }
@@ -361,7 +464,7 @@ struct FrameSource
 
 enum class Outcome
 {
-    Stop,        // user asked to stop or test finished
+    Stop,        // user asked to stop, test finished, or another panel ended the session
     DisplaysOff, // Windows powered the virtual monitors off; panel released so it can sleep
     Lost,        // panel/GPU went away; caller reverts and retries
 };
@@ -405,20 +508,22 @@ static void HotkeyThread()
     UnregisterHotKey(nullptr, 1);
 }
 
-static bool AnyVirtualSignal(SdShared* s)
+static bool AnyVirtualSignal(SdShared* s, const PanelSession& p)
 {
-    for (UINT i = 0; i < s->config.count && i < SD_MAX_MONITORS; i++)
+    for (UINT i = p.first; i < p.first + p.regions.size() && i < SD_MAX_MONITORS; i++)
         if (s->mon[i].fenceHandle != 0 && s->mon[i].latest >= 0) return true;
     return false;
 }
 
-static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::vector<RECT>& regions, ULONGLONG deadline)
+// Drives one panel until the session ends. Runs on its own thread.
+static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadline)
 {
+    const PanelTarget& panel = p.target;
     auto mgr = wdc::DisplayManager::Create(wdc::DisplayManagerOptions::None);
     auto target = WaitForOwnableTarget(mgr, panel.adapter, panel.targetId, 10000);
     if (!target)
     {
-        Log(L"panel never became ownable");
+        Log(L"panel %u never became ownable", panel.targetId);
         return Outcome::Lost;
     }
 
@@ -465,7 +570,7 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
     path = state.GetPathForTarget(target);
     auto res = path.SourceResolution().Value();
     auto rate = path.PresentationRate().Value().VerticalSyncRate;
-    Log(L"panel owned: %dx%d @ %.3f Hz", res.Width, res.Height, (double)rate.Numerator / rate.Denominator);
+    Log(L"panel %u owned: %dx%d @ %.3f Hz", panel.targetId, res.Width, res.Height, (double)rate.Numerator / rate.Denominator);
     Beat();
 
     winrt::com_ptr<IDXGIFactory6> factory;
@@ -519,14 +624,14 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
         return Outcome::Lost;
     }
 
-    std::vector<FrameSource> src(regions.size());
+    std::vector<FrameSource> src(p.regions.size());
     for (int i = 0; i < (int)src.size(); i++)
     {
-        src[i].index = i;
-        LUID a = shm->mon[i].adapter;
+        src[i].index = (int)p.first + i;
+        LUID a = shm->mon[src[i].index].adapter;
         if ((a.LowPart || a.HighPart) && (a.LowPart != panel.adapter.LowPart || a.HighPart != panel.adapter.HighPart))
             Log(L"warning: virtual monitor %d renders on GPU %08X:%08X but the panel is on %08X:%08X; cross-GPU copy is not supported, it will stay black",
-                i, a.HighPart, a.LowPart, panel.adapter.HighPart, panel.adapter.LowPart);
+                src[i].index, a.HighPart, a.LowPart, panel.adapter.HighPart, panel.adapter.LowPart);
     }
     const float black[4] = { 0, 0, 0, 1 };
 
@@ -540,7 +645,7 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
     bool poweredOff = false;
     Outcome outcome = Outcome::Stop;
 
-    while (!StopRequested())
+    while (!ShouldExit())
     {
         Beat();
         device.WaitForVBlank(source);
@@ -549,7 +654,7 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
         {
             // Windows blanked all displays (idle timeout / sleep). The session stays intact;
             // everything is repainted once power returns.
-            if (!poweredOff) Log(L"panel powered off by Windows, waiting");
+            if (!poweredOff) Log(L"panel %u powered off by Windows, waiting", panel.targetId);
             poweredOff = true;
             presented = false;
             darkSince = 0;
@@ -559,12 +664,12 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
         }
         if (poweredOff && status == wdc::DisplaySourceStatus::Active)
         {
-            Log(L"panel powered on again");
+            Log(L"panel %u powered on again", panel.targetId);
             poweredOff = false;
         }
         if (status != wdc::DisplaySourceStatus::Active)
         {
-            Log(L"panel source status %d", static_cast<int>(status));
+            Log(L"panel %u source status %d", panel.targetId, static_cast<int>(status));
             outcome = Outcome::Lost;
             break;
         }
@@ -580,8 +685,8 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
         for (auto& s : src) s.Release(shm.get());
         pendingFence = 0;
 
-        // Windows turned the (virtual) displays off: let the panel lose signal and sleep too.
-        if (!AnyVirtualSignal(shm.get()))
+        // Windows turned this panel's virtual monitors off: let the panel lose signal and sleep too.
+        if (!AnyVirtualSignal(shm.get(), p))
         {
             if (!darkSince) darkSince = GetTickCount64();
             if (GetTickCount64() - darkSince > 2000)
@@ -605,13 +710,14 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
         if (changed)
         {
             int back = (int)(presents & 1);
-            for (auto& s : src)
+            for (size_t k = 0; k < src.size(); k++)
             {
+                auto& s = src[k];
                 auto& m = shm->mon[s.index];
                 if (s.gen != m.handleGeneration) s.Refresh(dev.get(), shm.get(), driverProc);
 
                 // Region on the panel, clipped to the scanout size.
-                RECT rc = regions[s.index];
+                RECT rc = p.regions[k];
                 rc.right = std::min<LONG>(rc.right, res.Width);
                 rc.bottom = std::min<LONG>(rc.bottom, res.Height);
                 if (rc.right <= rc.left || rc.bottom <= rc.top) continue;
@@ -658,7 +764,8 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
 
     QueryPerformanceCounter(&now);
     double total = (double)(now.QuadPart - t0.QuadPart) / freq.QuadPart;
-    Log(L"composited %.1fs: %llu vblanks (%.2f Hz), %llu presents, %llu copy stalls", total, vblanks, vblanks / std::max(total, 0.001), presents, stalls);
+    Log(L"panel %u composited %.1fs: %llu vblanks (%.2f Hz), %llu presents, %llu copy stalls", panel.targetId, total, vblanks,
+        vblanks / std::max(total, 0.001), presents, stalls);
 
     CloseHandle(driverProc);
     CloseHandle(fenceEvent);
@@ -672,9 +779,41 @@ static Outcome Composite(SharedView& shm, const PanelTarget& panel, const std::v
     return outcome;
 }
 
-// One full split session: plug, take over, composite until stop / loss.
-// Returns true if the session ended because a stop was requested.
-static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
+// One panel's thread: composite, sit out display power-off, repeat.
+static Outcome PanelWorker(SharedView& shm, const PanelSession& p, ULONGLONG deadline)
+{
+    try
+    {
+        winrt::init_apartment();
+        for (;;)
+        {
+            Outcome o = Composite(shm, p, deadline);
+            if (o != Outcome::DisplaysOff) return o;
+
+            // Panel released (no signal -> it sleeps). Resume on the first new frame.
+            Log(L"panel %u: virtual displays off, panel released", p.target.targetId);
+            while (!AnyVirtualSignal(shm.get(), p))
+            {
+                if (!Nap(200)) return Outcome::Stop;
+                if (deadline && GetTickCount64() >= deadline) return Outcome::Stop;
+            }
+            Log(L"panel %u: virtual displays back on", p.target.targetId);
+        }
+    }
+    catch (winrt::hresult_error const& e)
+    {
+        Log(L"panel %u: WinRT error 0x%08X: %s", p.target.targetId, (UINT)e.code(), e.message().c_str());
+    }
+    catch (std::exception const& e)
+    {
+        Log(L"panel %u: error: %S", p.target.targetId, e.what());
+    }
+    return Outcome::Lost;
+}
+
+// One full split session: plug every panel's monitors, take the panels over, composite until
+// stop / loss. Returns true if the session ended because a stop was requested.
+static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
 {
     SharedView shm;
     if (!shm.Open()) throw std::runtime_error("SplitDisplay driver not loaded");
@@ -691,21 +830,29 @@ static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
     // Where every other display sits now, so they can be put back after the desktop changes.
     std::vector<PlacedDisplay> others;
     for (auto& t : EnumTargets())
-        if (t.active && !t.isVirtual && !MatchesPanel(t)) others.push_back({ t.monitorDevicePath, t.position });
-
-    auto regions = CurrentRegions(panel.width, panel.height);
-    SdConfig cfg{};
-    cfg.count = (UINT32)regions.size();
-    cfg.refreshHz = (UINT32)std::lround(panel.refreshHz);
-    cfg.renderAdapter = panel.adapter;
-    std::wstring desc;
-    for (size_t i = 0; i < regions.size(); i++)
     {
-        cfg.size[i] = { (UINT32)(regions[i].right - regions[i].left), (UINT32)(regions[i].bottom - regions[i].top) };
-        desc += L" " + std::to_wstring(cfg.size[i].width) + L"x" + std::to_wstring(cfg.size[i].height) + L"@" +
-                std::to_wstring(regions[i].left) + L"," + std::to_wstring(regions[i].top);
+        bool mine = false;
+        for (auto& p : ps) mine |= SameTarget(p.target, t);
+        if (t.active && !t.isVirtual && !mine) others.push_back({ t.monitorDevicePath, t.position });
     }
-    Log(L"layout: %u regions:%s", cfg.count, desc.c_str());
+
+    SdConfig cfg{};
+    cfg.renderAdapter = ps[0].target.adapter;
+    std::vector<RECT> desktop; // where each virtual monitor goes on the Windows desktop
+    for (auto& p : ps)
+    {
+        p.first = cfg.count;
+        std::wstring desc;
+        for (auto& r : p.regions)
+        {
+            cfg.mon[cfg.count++] = { (UINT32)(r.right - r.left), (UINT32)(r.bottom - r.top), (UINT32)std::lround(p.target.refreshHz), 0 };
+            desktop.push_back({ p.target.position.x + r.left, p.target.position.y + r.top, p.target.position.x + r.right, p.target.position.y + r.bottom });
+            desc += L" " + std::to_wstring(r.right - r.left) + L"x" + std::to_wstring(r.bottom - r.top) + L"@" + std::to_wstring(r.left) + L"," +
+                    std::to_wstring(r.top);
+        }
+        Log(L"panel '%s' %ux%u@%.2f at (%ld,%ld), scale %d%%, monitors %u..%u:%s", p.cfg.name.c_str(), p.target.width, p.target.height,
+            p.target.refreshHz, p.target.position.x, p.target.position.y, p.scale, p.first + 1, cfg.count, desc.c_str());
+    }
 
     // Counters survive from earlier sessions, so require fresh frames after this plug.
     LONG64 base[SD_MAX_MONITORS];
@@ -722,34 +869,65 @@ static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
     for (int i = 0; i < 100 && !live(); i++)
         if (!Nap(100)) return true;
     if (!live()) throw std::runtime_error("virtual monitors did not come up");
-    Log(L"virtual monitors live");
-    if (scale) SetScalePercentForMonitors(L"Split ", scale);
+    Log(L"%u virtual monitors live", cfg.count);
+    for (auto& p : ps)
+    {
+        if (!p.scale) continue;
+        std::vector<std::wstring> names;
+        for (UINT i = 0; i < p.regions.size(); i++) names.push_back(VirtualName(p.first + i));
+        SetScalePercent(names, p.scale);
+    }
     Beat();
 
-    LONG r = SetSpecialization(panel.adapter, panel.targetId, true);
-    Log(L"panel removed from desktop -> %ld", r);
-    if (r != ERROR_SUCCESS) throw std::runtime_error("could not remove panel from desktop");
-    for (int i = 0; i < 40 && PanelActive(panel.adapter, panel.targetId); i++)
-        if (!Nap(250)) return true;
-    // The split monitors take the panel's place in the desktop; everything else stays put.
-    for (int i = 0; i < 10 && !ArrangeRegions(regions, panel.position, others); i++)
+    for (auto& p : ps)
+    {
+        LONG r = SetSpecialization(p.target.adapter, p.target.targetId, true);
+        Log(L"panel '%s' removed from desktop -> %ld", p.cfg.name.c_str(), r);
+        if (r != ERROR_SUCCESS) throw std::runtime_error("could not remove a panel from the desktop");
+    }
+    for (auto& p : ps)
+        for (int i = 0; i < 40 && TargetActive(p.target.adapter, p.target.targetId); i++)
+            if (!Nap(250)) return true;
+    // The split monitors take each panel's place in the desktop; everything else stays put.
+    for (int i = 0; i < 10 && !ArrangeMonitors(desktop, others); i++)
         if (!Nap(300)) return true;
+    WriteRuntime(ps);
 
+    // One thread per panel, each paced by its own panel's vblank.
+    g_abort = false;
+    std::vector<std::unique_ptr<std::atomic<ULONGLONG>>> beats;
+    std::vector<Outcome> results(ps.size(), Outcome::Stop);
+    std::vector<std::thread> workers;
+    for (size_t i = 0; i < ps.size(); i++)
+    {
+        beats.push_back(std::make_unique<std::atomic<ULONGLONG>>(GetTickCount64()));
+        workers.emplace_back([&, i] {
+            t_workerBeat = beats[i].get();
+            results[i] = PanelWorker(shm, ps[i], deadline);
+            *beats[i] = ULLONG_MAX; // finished: never counts as stale
+            if (results[i] == Outcome::Lost) g_abort = true;
+        });
+    }
+    // Beat only while every worker is alive, so a hung panel thread trips the watchdog.
     for (;;)
     {
-        Outcome o = Composite(shm, panel, regions, deadline);
-        if (o == Outcome::Stop) return true;
-        if (o == Outcome::Lost) return false;
-
-        // DisplaysOff: panel released (no signal -> it sleeps). Resume on the first new frame.
-        Log(L"virtual displays off, panel released");
-        while (!AnyVirtualSignal(shm.get()))
+        bool allDone = true, allFresh = true;
+        ULONGLONG t = GetTickCount64();
+        for (auto& b : beats)
         {
-            if (!Nap(200)) return true;
-            if (deadline && GetTickCount64() >= deadline) return true;
+            ULONGLONG v = *b;
+            if (v != ULLONG_MAX) allDone = false;
+            if (v != ULLONG_MAX && t > v && t - v > 3000) allFresh = false;
         }
-        Log(L"virtual displays back on");
+        if (allDone) break;
+        if (allFresh) Beat();
+        if (StopRequested()) g_abort = g_abort.load(); // workers see the stop themselves
+        Sleep(100);
     }
+    for (auto& w : workers) w.join();
+    for (auto r : results)
+        if (r == Outcome::Lost) return false;
+    return true;
 }
 
 static int CmdRun(DWORD testSeconds)
@@ -771,24 +949,23 @@ static int CmdRun(DWORD testSeconds)
 
     ULONGLONG deadline = testSeconds ? GetTickCount64() + testSeconds * 1000ULL : 0;
     bool watchdogArmed = false;
-    int scale = 0;
     int failures = 0;
     ULONGLONG firstFailure = 0;
 
     while (!StopRequested())
     {
-        auto panel = FindCombinedPanel();
-        if (!panel)
+        auto scan = ScanPanels();
+        if (!scan.stale.empty())
         {
-            // Not connected, or connected over DP as two real monitors: nothing to do.
-            if (!Nap(2000)) break;
+            Log(L"%zu panel(s) found off the desktop (stale state), restoring them first", scan.stale.size());
+            RevertTargets(Keys(scan.stale));
+            if (!Nap(1000)) break;
             continue;
         }
-        if (!panel->active)
+        if (scan.ready.empty())
         {
-            Log(L"panel found off the desktop (stale state), restoring it first");
-            RevertAll(panel->adapter, panel->targetId);
-            if (!Nap(1000)) break;
+            // Nothing selected is connected (or it shows up as separate DP monitors): nothing to do.
+            if (!Nap(2000)) break;
             continue;
         }
 
@@ -801,19 +978,40 @@ static int CmdRun(DWORD testSeconds)
         }
         probe.Close();
 
-        int s = GetScalePercentForTarget(panel->adapter, panel->targetId);
-        if (s) scale = s;
-        Log(L"session start: panel %ux%u@%.2f, scale %d%%", panel->width, panel->height, panel->refreshHz, scale);
+        // All split panels must share one GPU (the virtual monitors render on a single adapter),
+        // and together they may use at most SD_MAX_MONITORS virtual monitors.
+        std::vector<PanelSession> ps;
+        UINT used = 0;
+        LUID gpu = scan.ready[0].second.adapter;
+        for (auto& [cfg, t] : scan.ready)
+        {
+            if (t.adapter.LowPart != gpu.LowPart || t.adapter.HighPart != gpu.HighPart)
+            {
+                Log(L"skipping '%s': it is on a different GPU than '%s'", cfg.name.c_str(), scan.ready[0].first.name.c_str());
+                continue;
+            }
+            auto regions = RegionsFor(cfg, t.width, t.height);
+            if (used + regions.size() > SD_MAX_MONITORS)
+            {
+                Log(L"skipping '%s': more than %d split monitors in total", cfg.name.c_str(), SD_MAX_MONITORS);
+                continue;
+            }
+            used += (UINT)regions.size();
+            ps.push_back({ cfg, t, regions, 0, GetScalePercentForTarget(t.adapter, t.targetId) });
+        }
+        std::vector<PanelTarget> sessionTargets;
+        for (auto& p : ps) sessionTargets.push_back(p.target);
+
         if (!watchdogArmed)
         {
-            SpawnWatchdog(*panel, testSeconds ? testSeconds + 30 : 0);
+            SpawnWatchdog(sessionTargets, testSeconds ? testSeconds + 30 : 0);
             watchdogArmed = true;
         }
 
         bool stopped = false;
         try
         {
-            stopped = RunSession(*panel, scale, deadline);
+            stopped = RunSession(ps, deadline);
         }
         catch (winrt::hresult_error const& e)
         {
@@ -823,7 +1021,7 @@ static int CmdRun(DWORD testSeconds)
         {
             Log(L"error: %S", e.what());
         }
-        RevertAll(panel->adapter, panel->targetId);
+        RevertTargets(Keys(sessionTargets));
         if (stopped || StopRequested() || (deadline && GetTickCount64() >= deadline)) break;
 
         // Back off on repeated failures so a persistent problem cannot flicker the screen forever.
@@ -835,7 +1033,7 @@ static int CmdRun(DWORD testSeconds)
         }
         if (++failures >= 3)
         {
-            Log(L"3 failures within 2 minutes, giving up; panel stays a single display");
+            Log(L"3 failures within 2 minutes, giving up; the displays stay unsplit");
             break;
         }
         Log(L"session lost, retrying in 3s");
@@ -863,30 +1061,37 @@ int wmain(int argc, wchar_t** argv)
 
     if (cmd == L"configure")
     {
-        // Resolve the name to a device path when it matches exactly one connected display.
+        // Split only the named display; remembered by device path when the name is unambiguous.
+        auto sel = SelectedPanels();
+        if (sel.empty())
+        {
+            Log(L"configure: pass --panel NAME");
+            return 1;
+        }
         std::vector<PanelTarget> hits;
         for (auto& t : EnumTargets())
-            if (MatchesPanel(t)) hits.push_back(t);
-        if (hits.size() == 1) SelectPanel(hits[0]);
-        else SaveConfigValue(L"panel", PanelNamePrefix()), SaveConfigValue(L"panel_id", L"");
-        Log(L"configure: display to split = '%s' %s", PanelNamePrefix().c_str(), hits.size() == 1 ? PanelId().c_str() : L"(by name)");
+            if (Matches(sel[0], t)) hits.push_back(t);
+        PanelConfig c = hits.size() == 1 ? ConfigFor(hits[0]) : sel[0];
+        c.layout = sel[0].layout;
+        SavePanels({ c });
+        Log(L"configure: split '%s' %s", c.name.c_str(), c.id.empty() ? L"(by name)" : c.id.c_str());
         return 0;
     }
     if (cmd == L"autodetect")
     {
         // Keeps an existing selection; otherwise picks the only tall display, or the only display.
-        if (HasPanelSelection())
+        if (!LoadPanels().empty())
         {
-            Log(L"autodetect: keeping '%s'", PanelNamePrefix().c_str());
+            Log(L"autodetect: keeping the existing selection");
             return 0;
         }
         auto t = AutodetectPanel();
         if (!t)
         {
-            Log(L"autodetect: several displays, choose one in the settings window");
+            Log(L"autodetect: several displays, choose in the settings window");
             return 2;
         }
-        SelectPanel(*t);
+        SavePanels({ ConfigFor(*t) });
         Log(L"autodetect: selected '%s' (%s)", t->friendlyName.c_str(), t->monitorDevicePath.c_str());
         return 0;
     }
@@ -903,11 +1108,7 @@ int wmain(int argc, wchar_t** argv)
     }
     if (cmd == L"stop") return CmdStop();
     if (cmd == L"revert") return CmdRevert();
-    if (cmd == L"watchdog" && argc >= 7)
-    {
-        LUID l{ (DWORD)wcstoul(argv[3], nullptr, 10), (LONG)wcstol(argv[4], nullptr, 10) };
-        return CmdWatchdog(wcstoul(argv[2], nullptr, 10), l, wcstoul(argv[5], nullptr, 10), wcstoul(argv[6], nullptr, 10));
-    }
+    if (cmd == L"watchdog" && argc >= 4) return CmdWatchdog(argc, argv);
     Log(L"usage: splitdisplay [--panel NAME] run [--test SECONDS] | stop | revert | configure | autodetect | autostart on|off");
     return 1;
 }

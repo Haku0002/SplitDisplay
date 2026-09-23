@@ -1,7 +1,7 @@
 /*++
     SplitDisplay indirect display driver.
 
-    Derived from the Microsoft IddSampleDriver (MIT). Exposes up to eight virtual monitors that are
+    Derived from the Microsoft IddSampleDriver (MIT). Exposes up to sixteen virtual monitors that are
     plugged on demand through the shared-memory contract in protocol.h, and republishes every
     desktop frame into a ring of shared textures consumed by the SplitDisplay compositor.
 --*/
@@ -23,7 +23,7 @@ static SdShared* g_Shm = nullptr;
 static std::atomic<void*> g_Owner = nullptr;
 
 // Config captured when monitors were plugged; the mode callbacks answer from this snapshot.
-static SdConfig g_Cfg = { 2, 100, {}, { { 2560, 1440 }, { 2560, 1440 } } };
+static SdConfig g_Cfg = { 2, 0, {}, { { 2560, 1440, 60, 0 }, { 2560, 1440, 60, 0 } } };
 
 // Stable container ID per monitor slot: {9A3C7E41-2B6D-4F18-8E0C-5D7A1B2C3Exx}, xx = slot + 1.
 static GUID ContainerId(UINT index)
@@ -71,7 +71,7 @@ void SplitDisplay::DLog(const wchar_t* fmt, ...)
 // Builds a 128-byte EDID 1.4 block describing one region of the panel, named "Split <index+1>".
 static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
 {
-    const UINT w = cfg.size[index].width, h = cfg.size[index].height, hz = cfg.refreshHz;
+    const UINT w = cfg.mon[index].width, h = cfg.mon[index].height, hz = cfg.mon[index].refreshHz;
     const UINT hmm = (UINT)(w * kMmPerPixel + 0.5), vmm = (UINT)(h * kMmPerPixel + 0.5);
     ZeroMemory(e, sizeof(e));
     const BYTE header[8] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
@@ -171,10 +171,10 @@ struct ModeTriple
 static std::vector<ModeTriple> ModeList(UINT index)
 {
     if (index >= SD_MAX_MONITORS) index = 0;
-    const auto& s = g_Cfg.size[index];
+    const auto& s = g_Cfg.mon[index];
     std::vector<ModeTriple> m;
-    m.push_back({ s.width, s.height, g_Cfg.refreshHz });
-    if (g_Cfg.refreshHz != 60) m.push_back({ s.width, s.height, 60 });
+    m.push_back({ s.width, s.height, s.refreshHz });
+    if (s.refreshHz != 60) m.push_back({ s.width, s.height, 60 });
     return m;
 }
 
@@ -663,12 +663,15 @@ void IndirectDeviceContext::CommandLoop()
 void IndirectDeviceContext::PlugMonitors()
 {
     SdConfig cfg = g_Shm->config;
-    bool valid = cfg.count >= 1 && cfg.count <= SD_MAX_MONITORS && cfg.refreshHz >= 24 && cfg.refreshHz <= 500;
+    bool valid = cfg.count >= 1 && cfg.count <= SD_MAX_MONITORS;
     for (UINT i = 0; valid && i < cfg.count; i++)
-        valid = cfg.size[i].width >= 160 && cfg.size[i].height >= 160 && cfg.size[i].width <= 16384 && cfg.size[i].height <= 16384;
+    {
+        const auto& m = cfg.mon[i];
+        valid = m.width >= 160 && m.height >= 160 && m.width <= 16384 && m.height <= 16384 && m.refreshHz >= 24 && m.refreshHz <= 500;
+    }
     if (!valid)
     {
-        DLog(L"rejecting bad config: %u monitors @%u Hz", cfg.count, cfg.refreshHz);
+        DLog(L"rejecting bad config: %u monitors", cfg.count);
         g_Shm->desiredPlugged = 0;
         return;
     }
@@ -719,7 +722,7 @@ void IndirectDeviceContext::PlugMonitors()
 
         IDARG_OUT_MONITORARRIVAL ArrivalOut;
         Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
-        DLog(L"MonitorArrival(%u) %ux%u status=0x%08X", i, cfg.size[i].width, cfg.size[i].height, Status);
+        DLog(L"MonitorArrival(%u) %ux%u@%u status=0x%08X", i, cfg.mon[i].width, cfg.mon[i].height, cfg.mon[i].refreshHz, Status);
         if (NT_SUCCESS(Status))
         {
             m_Monitors[i] = MonitorCreateOut.MonitorObject;

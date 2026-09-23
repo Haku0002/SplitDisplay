@@ -14,8 +14,9 @@ Window-manager tools such as FancyZones and DisplayFusion's monitor splitting on
 SplitDisplay does not emulate anything. Windows sees genuine monitors: each has its own resolution, scaling and
 taskbar, and maximize, fullscreen, `Win+Arrow` and DXGI fullscreen all behave natively.
 
-You choose how to cut the panel: the default is two halves, and the layout editor splits it into up to 8 monitors of
-any size, with equal cuts and freely placed lines that can be nested inside one another.
+You choose how to cut each display: the default is two halves, and the layout editor splits a display into up to 8
+monitors of any size, with equal cuts and freely placed lines that can be nested inside one another. Several displays
+can be split at the same time, each with its own layout (up to 16 split monitors in total).
 
 All split monitors share the physical panel's refresh rate. A single cable carries one signal, so they cannot
 refresh independently.
@@ -109,11 +110,12 @@ key safe, or delete it from `CurrentUser\My` once the driver is installed.
 Start `splitdisplay.exe` without arguments (the installer opens it for you) to get the settings window:
 
 - **Status**: driver, display and split state.
-- **Displays**: a map of all connected displays at their desktop positions (name, resolution, connector). Click
-  the one to split and press *Split this display*. Other displays are left where they are.
+- **Displays**: a map of all connected displays at their desktop positions (name, resolution, connector). Click a
+  display to edit its layout; *Split this display* / *Don't split this display* adds it to or removes it from the
+  split. Displays that are not split are left where they are.
 - **Start / Stop split** and **Start automatically when I sign in**.
-- **Layout editor**: a live preview of the panel. Edits are a draft until you press *Apply layout*, which saves the
-  layout and restarts a running split.
+- **Layout editor**: a live preview of the display picked on the map. Edits are a draft until you press *Apply
+  layout*, which saves that display's layout (adding it to the split if needed) and restarts a running split.
   - *Presets*: top/bottom, left/right, 2 x 2, top + bottom halved, three rows, three columns.
   - *Equal split*: click a region, pick rows or columns and a count (2 to 8), press *Cut*. Every piece can be cut
     again.
@@ -130,7 +132,7 @@ the panel.
 | `splitdisplay run` | split the panel and keep it split, recovering from GPU resets, hot-plug and display power-off |
 | `splitdisplay run --test 30` | split for 30 seconds, then restore |
 | `splitdisplay stop` | stop a running instance (it restores the panel) |
-| `splitdisplay --panel "<name>" configure` | select the display to split by name |
+| `splitdisplay --panel "<name>" configure` | split only the named display |
 | `splitdisplay autodetect` | select a display automatically if none is selected |
 | `splitdisplay autostart on\|off` | create/enable or disable the logon task |
 | `splitdisplay revert` | restore the panel and unplug the virtual monitors |
@@ -140,9 +142,9 @@ the panel.
 
 Logs are written to `%ProgramData%\SplitDisplay\`.
 
-Settings live in `%ProgramData%\SplitDisplay\config.ini`: `panel_id` (the selected monitor's device path), `panel`
-(its name, used as a case-insensitive fallback) and `layout`. With nothing selected, the only taller-than-wide
-display (or the only display) is picked automatically. A layout is a cut tree in panel pixels, `L` for one monitor, `R(size:node,...)` for rows and
+Settings live in `%ProgramData%\SplitDisplay\config.ini`, one `[PanelN]` section per split display: `id` (the
+monitor's device path), `name` (used as a case-insensitive fallback) and `layout`. With nothing selected, the only
+taller-than-wide display (or the only display) is picked automatically. A layout is a cut tree in panel pixels, `L` for one monitor, `R(size:node,...)` for rows and
 `C(size:node,...)` for columns. For example, `R(1440:L,1440:C(1280:L,1280:L))` is a full-width top half and a bottom
 half split into two. When the panel resolution differs, sizes are applied proportionally.
 
@@ -167,7 +169,9 @@ Taking over your only display is risky, so there are several layers of protectio
 - Hardware-DRM video may be black on the virtual monitors.
 - Changing the layout re-plugs the virtual monitors, so the screen flickers for a second and Windows re-places
   windows.
-- GPU cost depends only on the panel's pixel count, not on the number of regions.
+- GPU cost depends only on the panels' pixel count, not on the number of regions.
+- All split displays must be connected to the same GPU (Windows renders an indirect display's monitors on one
+  adapter). Displays on another GPU are skipped, with a note in the log.
 
 ## License
 

@@ -103,8 +103,8 @@ bool SaveConfigValue(const wchar_t* key, const std::wstring& value)
 
 #pragma region Panel selection
 
-static std::wstring g_panelId;   // monitor device path
-static std::wstring g_panelName; // fallback: name prefix
+static std::vector<PanelConfig> g_override; // from --panel
+static bool g_hasOverride = false;
 
 static std::wstring Trim(std::wstring s)
 {
@@ -113,61 +113,87 @@ static std::wstring Trim(std::wstring s)
     return s;
 }
 
-static bool StartsWithNoCase(const std::wstring& s, const std::wstring& prefix)
+static std::wstring ReadIni(const wchar_t* section, const wchar_t* key)
 {
-    return !prefix.empty() && s.size() >= prefix.size() && _wcsnicmp(s.c_str(), prefix.c_str(), prefix.size()) == 0;
+    wchar_t buf[1024] = {};
+    GetPrivateProfileStringW(section, key, L"", buf, 1024, ConfigPath().c_str());
+    return buf;
 }
 
-std::wstring PanelId()
+std::vector<PanelConfig> LoadPanels()
 {
-    return g_panelId;
+    std::vector<PanelConfig> out;
+    int count = _wtoi(ReadIni(L"SplitDisplay", L"panels").c_str());
+    for (int i = 1; i <= count && i <= 16; i++)
+    {
+        std::wstring sec = L"Panel" + std::to_wstring(i);
+        PanelConfig c{ ReadIni(sec.c_str(), L"id"), Trim(ReadIni(sec.c_str(), L"name")), ReadIni(sec.c_str(), L"layout") };
+        if (!c.id.empty() || !c.name.empty()) out.push_back(c);
+    }
+    if (count == 0)
+    {
+        // v0.1: one panel in the [SplitDisplay] section.
+        PanelConfig c{ ReadIni(L"SplitDisplay", L"panel_id"), Trim(ReadIni(L"SplitDisplay", L"panel")), ReadIni(L"SplitDisplay", L"layout") };
+        if (!c.id.empty() || !c.name.empty()) out.push_back(c);
+    }
+    return out;
 }
 
-std::wstring PanelNamePrefix()
+void SavePanels(const std::vector<PanelConfig>& panels)
 {
-    return g_panelName;
+    SaveConfigValue(L"panels", std::to_wstring(panels.size()));
+    auto path = ConfigPath();
+    for (int i = 1; i <= 16; i++)
+    {
+        std::wstring sec = L"Panel" + std::to_wstring(i);
+        WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, path.c_str()); // drop the whole section
+        if (i > (int)panels.size()) continue;
+        const auto& c = panels[i - 1];
+        WritePrivateProfileStringW(sec.c_str(), L"id", (L"\"" + c.id + L"\"").c_str(), path.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"name", (L"\"" + c.name + L"\"").c_str(), path.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"layout", (L"\"" + c.layout + L"\"").c_str(), path.c_str());
+    }
+    // Retire the v0.1 keys once migrated.
+    for (const wchar_t* key : { L"panel_id", L"panel", L"layout" }) WritePrivateProfileStringW(L"SplitDisplay", key, nullptr, path.c_str());
 }
 
-bool HasPanelSelection()
-{
-    return !g_panelId.empty() || !g_panelName.empty();
-}
-
-void SetPanelNamePrefix(const std::wstring& name)
-{
-    g_panelName = Trim(name);
-}
-
-void SelectPanel(const PanelTarget& t)
-{
-    g_panelId = t.monitorDevicePath;
-    g_panelName = Trim(t.friendlyName);
-    SaveConfigValue(L"panel_id", g_panelId);
-    SaveConfigValue(L"panel", g_panelName);
-}
-
-bool MatchesPanel(const PanelTarget& t)
+bool Matches(const PanelConfig& c, const PanelTarget& t)
 {
     if (t.isVirtual) return false;
-    if (!g_panelId.empty()) return _wcsicmp(t.monitorDevicePath.c_str(), g_panelId.c_str()) == 0;
-    return StartsWithNoCase(Trim(t.friendlyName), g_panelName);
+    if (!c.id.empty()) return _wcsicmp(t.monitorDevicePath.c_str(), c.id.c_str()) == 0;
+    std::wstring n = Trim(t.friendlyName);
+    return !c.name.empty() && n.size() >= c.name.size() && _wcsnicmp(n.c_str(), c.name.c_str(), c.name.size()) == 0;
+}
+
+PanelConfig ConfigFor(const PanelTarget& t)
+{
+    return { t.monitorDevicePath, Trim(t.friendlyName), L"" };
+}
+
+std::vector<PanelConfig> SelectedPanels()
+{
+    return g_hasOverride ? g_override : LoadPanels();
 }
 
 void ParsePanelOption(int& argc, wchar_t** argv)
 {
-    g_panelId = LoadConfigValue(L"panel_id");
-    g_panelName = Trim(LoadConfigValue(L"panel"));
     for (int i = 1; i + 1 < argc; i++)
     {
         if (_wcsicmp(argv[i], L"--panel") != 0) continue;
-        // An explicit name overrides the stored selection.
-        g_panelName = Trim(argv[i + 1]);
-        g_panelId.clear();
+        g_override = { PanelConfig{ L"", Trim(argv[i + 1]), L"" } };
+        // Keep the layout configured for that display, if any.
+        for (auto& c : LoadPanels())
+        {
+            if (_wcsnicmp(c.name.c_str(), g_override[0].name.c_str(), g_override[0].name.size()) == 0) g_override[0].layout = c.layout;
+        }
+        g_hasOverride = true;
         for (int j = i; j + 2 <= argc; j++) argv[j] = argv[j + 2];
         argc -= 2;
         return;
     }
 }
+
+#pragma endregion
 
 std::wstring ConnectorName(DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY t)
 {
@@ -208,8 +234,10 @@ static bool QueryAll(UINT32 flags, std::vector<DISPLAYCONFIG_PATH_INFO>& paths, 
 
 static bool IsOurVirtualName(const std::wstring& name)
 {
-    // "Split 1" .. "Split 8" from SplitDisplayIdd
-    return name.size() == 7 && name.rfind(L"Split ", 0) == 0 && name[6] >= L'1' && name[6] <= L'8';
+    // "Split 1" .. "Split 16" from SplitDisplayIdd
+    if (name.rfind(L"Split ", 0) != 0 || name.size() < 7 || name.size() > 8) return false;
+    int n = _wtoi(name.c_str() + 6);
+    return n >= 1 && n <= 16 && std::to_wstring(n) == name.substr(6);
 }
 
 std::vector<PanelTarget> EnumTargets()
@@ -307,11 +335,11 @@ std::vector<PanelTarget> EnumTargets()
     return out;
 }
 
-std::optional<PanelTarget> FindPanel()
+std::optional<PanelTarget> FindTarget(const PanelConfig& c)
 {
     std::optional<PanelTarget> best;
     for (auto& t : EnumTargets())
-        if (MatchesPanel(t) && (!best || (t.active && !best->active))) best = t;
+        if (Matches(c, t) && (!best || (t.active && !best->active))) best = t;
     return best;
 }
 
