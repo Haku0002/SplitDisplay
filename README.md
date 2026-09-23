@@ -2,6 +2,9 @@
 
 Turn one physical display into several **real** Windows monitors.
 
+> Vibe-coded with [Claude](https://claude.com/claude-code): the driver, compositor, reverse engineering and docs were
+> written by Claude (Anthropic) under the direction of the maintainer, and tested on real hardware.
+
 SplitDisplay was built for foldable dual-panel portable monitors (such as the *Sculptor* 2 x 2560x1440 foldable).
 Over DisplayPort these panels use MST and Windows sees two monitors. Over HDMI they show up as a single tall
 2560x2880 monitor. Windows then maximizes and fullscreens across both panels, and the taskbar and snapping treat
