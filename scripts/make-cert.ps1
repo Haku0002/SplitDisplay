@@ -5,7 +5,7 @@ $subject = 'CN=SplitDisplay Local Driver Signing'
 $out = Join-Path $PSScriptRoot '..\out'
 New-Item -ItemType Directory -Force $out | Out-Null
 
-$cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq $subject | Select-Object -First 1
+$cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -like "$subject*" } | Select-Object -First 1
 if (-not $cert) {
     $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject `
         -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy NonExportable `

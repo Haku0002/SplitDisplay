@@ -147,7 +147,7 @@ std::vector<PanelTarget> EnumTargets()
 std::optional<PanelTarget> FindPanel()
 {
     for (auto& t : EnumTargets())
-        if (t.friendlyName.rfind(L"Sculptor", 0) == 0)
+        if (t.friendlyName.rfind(kPanelNamePrefix, 0) == 0)
             return t;
     return std::nullopt;
 }

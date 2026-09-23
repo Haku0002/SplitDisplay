@@ -6,7 +6,7 @@ $subject = 'CN=SplitDisplay Local Driver Signing'
 $signtool = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
 $inf2cat = Join-Path $root 'third_party\wdk\c\bin\10.0.26100.0\x86\Inf2Cat.exe'
 
-$cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object Subject -eq $subject | Select-Object -First 1
+$cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -like "$subject*" } | Select-Object -First 1
 if (-not $cert) { throw 'signing cert missing - run make-cert.ps1' }
 
 Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue

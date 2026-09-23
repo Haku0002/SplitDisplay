@@ -92,7 +92,7 @@ static std::optional<PanelTarget> FindCombinedPanel()
 {
     for (auto& t : EnumTargets())
     {
-        if (t.friendlyName.rfind(L"Sculptor", 0) != 0) continue;
+        if (t.friendlyName.rfind(kPanelNamePrefix, 0) != 0) continue;
         if (!t.active)
         {
             // Off the desktop: only ours if it is still removed via the override (e.g. left behind by a crash).
@@ -151,13 +151,13 @@ static int CmdRevert()
     bool any = false;
     for (auto& t : EnumTargets())
     {
-        if (t.friendlyName.rfind(L"Sculptor", 0) != 0) continue;
+        if (t.friendlyName.rfind(kPanelNamePrefix, 0) != 0) continue;
         any = true;
         RevertAll(t.adapter, t.targetId);
     }
     if (!any)
     {
-        Log(L"revert: Sculptor not found");
+        Log(L"revert: panel '%s' not found", kPanelNamePrefix);
         UnplugVirtual();
         return 1;
     }
@@ -653,7 +653,7 @@ static bool RunSession(const PanelTarget& panel, int scale, ULONGLONG deadline)
     LONG r = SetSpecialization(panel.adapter, panel.targetId, true);
     Log(L"panel removed from desktop -> %ld", r);
     if (r != ERROR_SUCCESS) throw std::runtime_error("could not remove panel from desktop");
-    for (int i = 0; i < 40 && IsTargetActive(L"Sculptor"); i++)
+    for (int i = 0; i < 40 && IsTargetActive(kPanelNamePrefix); i++)
         if (!Nap(250)) return true;
     for (int i = 0; i < 10 && !ArrangeVirtualMonitors(); i++)
         if (!Nap(300)) return true;
