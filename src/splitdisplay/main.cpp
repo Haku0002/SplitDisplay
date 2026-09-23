@@ -46,7 +46,8 @@ namespace wdd = winrt::Windows::Devices::Display;
 namespace wgd = winrt::Windows::Graphics::DirectX;
 
 static std::atomic_bool g_stop = false;
-static std::atomic_bool g_abort = false; // a panel worker lost its panel; end the session
+static std::atomic_bool g_abort = false;   // end the session (a panel was lost, or a restart is needed)
+static std::atomic_bool g_restart = false; // end the session and start a new one right away
 static HANDLE g_stopEvent = nullptr;
 static volatile LONG64* g_heartbeat = nullptr;
 // Panel workers report here; the main thread only beats while every worker is alive.
@@ -129,6 +130,8 @@ struct PanelSession
     std::vector<RECT> regions; // on the panel
     UINT first = 0;            // index of its first virtual monitor
     int scale = 0;
+    int refresh = 0;           // Hz for the panel and all of its split monitors
+    std::vector<int> rates;    // rates the panel supports (offered on the split monitors)
 };
 
 static void WriteRuntime(const std::vector<PanelSession>& ps)
@@ -203,7 +206,7 @@ static PanelScan ScanPanels()
         if (active.size() != 1 || !active[0].width || !active[0].height) continue;
         if (c.id.empty())
         {
-            c = { active[0].monitorDevicePath, c.name, c.layout };
+            c.id = active[0].monitorDevicePath;
             upgraded = true;
         }
         bool dup = false;
@@ -545,7 +548,7 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
     for (auto&& m : path.FindModes(wdc::DisplayModeQueryOptions::OnlyPreferredResolution))
     {
         auto v = m.PresentationRate().VerticalSyncRate;
-        double diff = std::abs((double)v.Numerator / v.Denominator - panel.refreshHz);
+        double diff = std::abs((double)v.Numerator / v.Denominator - p.refresh);
         if (diff < bestDiff)
         {
             bestDiff = diff;
@@ -845,13 +848,19 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
         std::wstring desc;
         for (auto& r : p.regions)
         {
-            cfg.mon[cfg.count++] = { (UINT32)(r.right - r.left), (UINT32)(r.bottom - r.top), (UINT32)std::lround(p.target.refreshHz), 0 };
+            SdMonitorConfig m{ (UINT32)(r.right - r.left), (UINT32)(r.bottom - r.top), (UINT32)p.refresh, 0, {} };
+            for (int hz : p.rates)
+                if (m.rateCount < SD_MAX_RATES) m.rates[m.rateCount++] = (UINT32)hz;
+            cfg.mon[cfg.count++] = m;
             desktop.push_back({ p.target.position.x + r.left, p.target.position.y + r.top, p.target.position.x + r.right, p.target.position.y + r.bottom });
             desc += L" " + std::to_wstring(r.right - r.left) + L"x" + std::to_wstring(r.bottom - r.top) + L"@" + std::to_wstring(r.left) + L"," +
                     std::to_wstring(r.top);
         }
-        Log(L"panel '%s' %ux%u@%.2f at (%ld,%ld), scale %d%%, monitors %u..%u:%s", p.cfg.name.c_str(), p.target.width, p.target.height,
-            p.target.refreshHz, p.target.position.x, p.target.position.y, p.scale, p.first + 1, cfg.count, desc.c_str());
+        std::wstring rates;
+        for (int hz : p.rates) rates += (rates.empty() ? L"" : L"/") + std::to_wstring(hz);
+        Log(L"panel '%s' %ux%u@%d Hz (supports %s) at (%ld,%ld), scale %d%%, monitors %u..%u:%s", p.cfg.name.c_str(), p.target.width,
+            p.target.height, p.refresh, rates.empty() ? L"?" : rates.c_str(), p.target.position.x, p.target.position.y, p.scale, p.first + 1,
+            cfg.count, desc.c_str());
     }
 
     // Counters survive from earlier sessions, so require fresh frames after this plug.
@@ -872,10 +881,12 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     Log(L"%u virtual monitors live", cfg.count);
     for (auto& p : ps)
     {
-        if (!p.scale) continue;
         std::vector<std::wstring> names;
         for (UINT i = 0; i < p.regions.size(); i++) names.push_back(VirtualName(p.first + i));
-        SetScalePercent(names, p.scale);
+        if (p.scale) SetScalePercent(names, p.scale);
+        // Windows restores the rate it last saw on each monitor; make them all the panel's rate, so a
+        // later difference can only be a user change (which then applies to the whole panel).
+        ForceRefresh(names, p.refresh);
     }
     Beat();
 
@@ -909,8 +920,45 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
         });
     }
     // Beat only while every worker is alive, so a hung panel thread trips the watchdog.
+    // Every 2 s, glue each panel's monitors back together if Windows moved them apart.
+    ULONGLONG nextAlign = GetTickCount64() + 2000;
+    int corrections = 0;
+    ULONGLONG correctionWindow = 0;
     for (;;)
     {
+        if (GetTickCount64() >= nextAlign)
+        {
+            nextAlign = GetTickCount64() + 2000;
+            if (GetTickCount64() - correctionWindow > 60000)
+            {
+                correctionWindow = GetTickCount64();
+                corrections = 0;
+            }
+            // If Windows keeps undoing it, stop fighting for this minute.
+            for (auto& p : ps)
+                if (corrections < 5 && KeepGroupAligned(p.first, p.regions)) corrections++;
+
+            // A split monitor's refresh rate was changed (e.g. in Settings): the whole panel follows.
+            for (auto& p : ps)
+            {
+                if (g_restart) break;
+                for (UINT i = 0; i < p.regions.size(); i++)
+                {
+                    int hz = CurrentRefreshOf(VirtualName(p.first + i));
+                    if (!hz || std::abs(hz - p.refresh) <= 1) continue;
+                    Log(L"'%s' split monitor %u switched to %d Hz: switching the whole display from %d Hz", p.cfg.name.c_str(), p.first + i + 1, hz,
+                        p.refresh);
+                    auto panels = LoadPanels();
+                    for (auto& c : panels)
+                        if (Matches(c, p.target)) c.refresh = hz;
+                    SavePanels(panels);
+                    g_restart = true;
+                    g_abort = true;
+                    break;
+                }
+            }
+        }
+
         bool allDone = true, allFresh = true;
         ULONGLONG t = GetTickCount64();
         for (auto& b : beats)
@@ -925,6 +973,7 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
         Sleep(100);
     }
     for (auto& w : workers) w.join();
+    if (g_restart) return false; // caller reverts and starts over without counting a failure
     for (auto r : results)
         if (r == Outcome::Lost) return false;
     return true;
@@ -997,7 +1046,9 @@ static int CmdRun(DWORD testSeconds)
                 continue;
             }
             used += (UINT)regions.size();
-            ps.push_back({ cfg, t, regions, 0, GetScalePercentForTarget(t.adapter, t.targetId) });
+            auto rates = SupportedRefreshRates(t);
+            int want = cfg.refresh ? cfg.refresh : (int)std::lround(t.refreshHz);
+            ps.push_back({ cfg, t, regions, 0, GetScalePercentForTarget(t.adapter, t.targetId), ClosestRate(rates, want), rates });
         }
         std::vector<PanelTarget> sessionTargets;
         for (auto& p : ps) sessionTargets.push_back(p.target);
@@ -1023,6 +1074,12 @@ static int CmdRun(DWORD testSeconds)
         }
         RevertTargets(Keys(sessionTargets));
         if (stopped || StopRequested() || (deadline && GetTickCount64() >= deadline)) break;
+        if (g_restart)
+        {
+            g_restart = false;
+            Log(L"restarting the split with the new settings");
+            continue;
+        }
 
         // Back off on repeated failures so a persistent problem cannot flicker the screen forever.
         ULONGLONG t = GetTickCount64();

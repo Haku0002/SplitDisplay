@@ -23,6 +23,17 @@ struct PlacedDisplay
 // at its saved position. Returns true once the arrangement is in effect.
 bool ArrangeMonitors(const std::vector<RECT>& desktop, const std::vector<PlacedDisplay>& others);
 
+// Keeps one panel's split monitors ("Split first+1" ...) touching exactly as on the panel, anchored
+// at the first one. Windows re-lays out the desktop after e.g. a refresh-rate change in Settings,
+// which can leave gaps the cursor cannot cross. Returns true if a correction was applied.
+bool KeepGroupAligned(UINT first, const std::vector<RECT>& regions);
+
+// Sets every named active monitor to `hz` (and saves it for Windows to restore next time).
+void ForceRefresh(const std::vector<std::wstring>& names, int hz);
+
+// Current refresh rate (Hz, rounded) of the active monitor with exactly this name, or 0.
+int CurrentRefreshOf(const std::wstring& name);
+
 // Returns true if the target with this name is part of the desktop.
 bool IsTargetActive(const wchar_t* namePrefix);
 

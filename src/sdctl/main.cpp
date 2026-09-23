@@ -122,7 +122,7 @@ static int Plug(int argc, wchar_t** argv)
     // Default: two halves of the panel. "plug W H HZ" plugs two monitors of W x H.
     SdConfig cfg{};
     cfg.count = 2;
-    SdMonitorConfig m{ 2560, 1440, 100, 0 };
+    SdMonitorConfig m{ 2560, 1440, 100, 0, {} };
     auto panels = SelectedPanels();
     if (auto p = panels.empty() ? AutodetectPanel() : FindTarget(panels[0]))
     {
@@ -130,7 +130,7 @@ static int Plug(int argc, wchar_t** argv)
         if (p->width && p->height) m.width = p->width, m.height = p->height / 2;
         if (p->refreshHz > 1) m.refreshHz = (UINT32)std::lround(p->refreshHz);
     }
-    if (argc >= 5) m = { (UINT32)_wtoi(argv[2]), (UINT32)_wtoi(argv[3]), (UINT32)_wtoi(argv[4]), 0 };
+    if (argc >= 5) m = { (UINT32)_wtoi(argv[2]), (UINT32)_wtoi(argv[3]), (UINT32)_wtoi(argv[4]), 0, {} };
     cfg.mon[0] = cfg.mon[1] = m;
     v->config = cfg;
     MemoryBarrier();

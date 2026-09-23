@@ -18,8 +18,9 @@ You choose how to cut each display: the default is two halves, and the layout ed
 monitors of any size, with equal cuts and freely placed lines that can be nested inside one another. Several displays
 can be split at the same time, each with its own layout (up to 16 split monitors in total).
 
-All split monitors share the physical panel's refresh rate. A single cable carries one signal, so they cannot
-refresh independently.
+All split monitors of a display share its refresh rate: a single cable carries one signal. Changing the refresh rate
+of any split monitor (e.g. in Windows Settings) switches the whole display and all of its split monitors to that rate;
+only rates the display supports are offered.
 
 ## How it works
 

@@ -14,20 +14,23 @@
 
 #include <Windows.h>
 
-#define SD_SHM_NAME L"Global\\SplitDisplay.Shm.v3"
-#define SD_CMD_EVENT_NAME L"Global\\SplitDisplay.Cmd.v3"
+#define SD_SHM_NAME L"Global\\SplitDisplay.Shm.v4"
+#define SD_CMD_EVENT_NAME L"Global\\SplitDisplay.Cmd.v4"
 
-constexpr UINT32 SD_MAGIC = 0x33445053; // 'SPD3'
-constexpr UINT32 SD_VERSION = 3;
+constexpr UINT32 SD_MAGIC = 0x34445053; // 'SPD4'
+constexpr UINT32 SD_VERSION = 4;
 constexpr int SD_MAX_MONITORS = 16;
 constexpr int SD_BUFFERS = 3;
+
+constexpr int SD_MAX_RATES = 8;
 
 struct SdMonitorConfig
 {
     UINT32 width;
     UINT32 height;
-    UINT32 refreshHz; // the refresh rate of the physical panel this monitor is part of
-    UINT32 reserved;
+    UINT32 refreshHz;           // current rate of the physical panel this monitor is part of (preferred mode)
+    UINT32 rateCount;           // other rates the panel supports, offered as alternatives; changing
+    UINT32 rates[SD_MAX_RATES]; // one of them makes SplitDisplay switch the whole panel to it
 };
 
 struct SdConfig

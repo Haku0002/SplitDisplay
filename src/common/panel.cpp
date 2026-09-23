@@ -8,6 +8,9 @@
 #include <winrt/Windows.Devices.Display.h>
 #include <winrt/Windows.Devices.Display.Core.h>
 
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
 #include <cwctype>
 
 // Settings > Display > Advanced display > "Remove display from desktop" does not use the
@@ -127,7 +130,8 @@ std::vector<PanelConfig> LoadPanels()
     for (int i = 1; i <= count && i <= 16; i++)
     {
         std::wstring sec = L"Panel" + std::to_wstring(i);
-        PanelConfig c{ ReadIni(sec.c_str(), L"id"), Trim(ReadIni(sec.c_str(), L"name")), ReadIni(sec.c_str(), L"layout") };
+        PanelConfig c{ ReadIni(sec.c_str(), L"id"), Trim(ReadIni(sec.c_str(), L"name")), ReadIni(sec.c_str(), L"layout"),
+            _wtoi(ReadIni(sec.c_str(), L"refresh").c_str()) };
         if (!c.id.empty() || !c.name.empty()) out.push_back(c);
     }
     if (count == 0)
@@ -152,6 +156,7 @@ void SavePanels(const std::vector<PanelConfig>& panels)
         WritePrivateProfileStringW(sec.c_str(), L"id", (L"\"" + c.id + L"\"").c_str(), path.c_str());
         WritePrivateProfileStringW(sec.c_str(), L"name", (L"\"" + c.name + L"\"").c_str(), path.c_str());
         WritePrivateProfileStringW(sec.c_str(), L"layout", (L"\"" + c.layout + L"\"").c_str(), path.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"refresh", std::to_wstring(c.refresh).c_str(), path.c_str());
     }
     // Retire the v0.1 keys once migrated.
     for (const wchar_t* key : { L"panel_id", L"panel", L"layout" }) WritePrivateProfileStringW(L"SplitDisplay", key, nullptr, path.c_str());
@@ -167,7 +172,7 @@ bool Matches(const PanelConfig& c, const PanelTarget& t)
 
 PanelConfig ConfigFor(const PanelTarget& t)
 {
-    return { t.monitorDevicePath, Trim(t.friendlyName), L"" };
+    return { t.monitorDevicePath, Trim(t.friendlyName), L"", 0 };
 }
 
 std::vector<PanelConfig> SelectedPanels()
@@ -180,11 +185,15 @@ void ParsePanelOption(int& argc, wchar_t** argv)
     for (int i = 1; i + 1 < argc; i++)
     {
         if (_wcsicmp(argv[i], L"--panel") != 0) continue;
-        g_override = { PanelConfig{ L"", Trim(argv[i + 1]), L"" } };
+        g_override = { PanelConfig{ L"", Trim(argv[i + 1]), L"", 0 } };
         // Keep the layout configured for that display, if any.
         for (auto& c : LoadPanels())
         {
-            if (_wcsnicmp(c.name.c_str(), g_override[0].name.c_str(), g_override[0].name.size()) == 0) g_override[0].layout = c.layout;
+            if (_wcsnicmp(c.name.c_str(), g_override[0].name.c_str(), g_override[0].name.size()) == 0)
+            {
+                g_override[0].layout = c.layout;
+                g_override[0].refresh = c.refresh;
+            }
         }
         g_hasOverride = true;
         for (int j = i; j + 2 <= argc; j++) argv[j] = argv[j + 2];
@@ -285,6 +294,13 @@ std::vector<PanelTarget> EnumTargets()
             t.width = sm.width;
             t.height = sm.height;
             t.position = { sm.position.x, sm.position.y };
+
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+            src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = sizeof(src);
+            src.header.adapterId = p.sourceInfo.adapterId;
+            src.header.id = p.sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS) t.gdiName = src.viewGdiDeviceName;
             t.primary = sm.position.x == 0 && sm.position.y == 0;
         }
         if (p.targetInfo.refreshRate.Denominator)
@@ -333,6 +349,37 @@ std::vector<PanelTarget> EnumTargets()
     {
     }
     return out;
+}
+
+std::vector<int> SupportedRefreshRates(const PanelTarget& t)
+{
+    std::vector<int> rates;
+    if (t.gdiName.empty() || !t.width) return rates;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    for (DWORD i = 0; EnumDisplaySettingsW(t.gdiName.c_str(), i, &dm); i++)
+    {
+        if (dm.dmPelsWidth != t.width || dm.dmPelsHeight != t.height || dm.dmDisplayFrequency <= 1) continue;
+        int hz = (int)dm.dmDisplayFrequency;
+        if (std::find(rates.begin(), rates.end(), hz) == rates.end()) rates.push_back(hz);
+    }
+    std::sort(rates.rbegin(), rates.rend());
+    return rates;
+}
+
+int ClosestRate(const std::vector<int>& rates, int want)
+{
+    int best = want;
+    int bestDiff = INT_MAX;
+    for (int r : rates)
+    {
+        if (std::abs(r - want) < bestDiff)
+        {
+            bestDiff = std::abs(r - want);
+            best = r;
+        }
+    }
+    return best;
 }
 
 std::optional<PanelTarget> FindTarget(const PanelConfig& c)

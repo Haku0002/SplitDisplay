@@ -23,7 +23,7 @@ static SdShared* g_Shm = nullptr;
 static std::atomic<void*> g_Owner = nullptr;
 
 // Config captured when monitors were plugged; the mode callbacks answer from this snapshot.
-static SdConfig g_Cfg = { 2, 0, {}, { { 2560, 1440, 60, 0 }, { 2560, 1440, 60, 0 } } };
+static SdConfig g_Cfg = { 2, 0, {}, { { 2560, 1440, 60, 0, {} }, { 2560, 1440, 60, 0, {} } } };
 
 // Stable container ID per monitor slot: {9A3C7E41-2B6D-4F18-8E0C-5D7A1B2C3Exx}, xx = slot + 1.
 static GUID ContainerId(UINT index)
@@ -167,14 +167,16 @@ struct ModeTriple
     DWORD w, h, hz;
 };
 
-// Modes for monitor slot `index`: its region size at the panel rate (preferred) and at 60 Hz.
+// Modes of monitor slot `index`: its region size at the panel's current rate (preferred), plus the
+// other rates the panel supports. Picking another rate in Settings makes SplitDisplay switch the
+// whole panel, so all split monitors of a display always share one rate.
 static std::vector<ModeTriple> ModeList(UINT index)
 {
     if (index >= SD_MAX_MONITORS) index = 0;
     const auto& s = g_Cfg.mon[index];
-    std::vector<ModeTriple> m;
-    m.push_back({ s.width, s.height, s.refreshHz });
-    if (s.refreshHz != 60) m.push_back({ s.width, s.height, 60 });
+    std::vector<ModeTriple> m{ { s.width, s.height, s.refreshHz } };
+    for (UINT i = 0; i < s.rateCount && i < SD_MAX_RATES; i++)
+        if (s.rates[i] != s.refreshHz && s.rates[i] >= 24 && s.rates[i] <= 500) m.push_back({ s.width, s.height, s.rates[i] });
     return m;
 }
 

@@ -23,7 +23,15 @@ struct PanelTarget
     double refreshHz = 0;
     DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY connector = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
     bool isVirtual = false;         // one of our own "Split N" monitors
+    std::wstring gdiName;           // \\.\DISPLAYn of an active target (for mode queries)
 };
+
+// Refresh rates (Hz, highest first) the display supports at its current resolution. Needs an
+// active target; empty otherwise.
+std::vector<int> SupportedRefreshRates(const PanelTarget& t);
+
+// The supported rate closest to `want` (or `want` itself if the list is empty).
+int ClosestRate(const std::vector<int>& rates, int want);
 
 // All targets with a connected monitor (active or not).
 std::vector<PanelTarget> EnumTargets();
@@ -35,6 +43,7 @@ struct PanelConfig
     std::wstring id;     // monitor device path (preferred key)
     std::wstring name;   // EDID name; case-insensitive prefix match when id is empty
     std::wstring layout; // SerializeLayout() text; empty = default halves
+    int refresh = 0;     // Hz for the whole display (all of its split monitors); 0 = keep Windows' setting
 };
 
 std::vector<PanelConfig> LoadPanels();

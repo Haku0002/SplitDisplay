@@ -175,6 +175,85 @@ bool ArrangeMonitors(const std::vector<RECT>& regions, const std::vector<PlacedD
     return false; // verify on the next call
 }
 
+bool KeepGroupAligned(UINT first, const std::vector<RECT>& regions)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (regions.empty() || !QueryActive(paths, modes)) return false;
+
+    std::vector<DISPLAYCONFIG_SOURCE_MODE*> slot(regions.size(), nullptr);
+    for (auto& p : paths)
+    {
+        if (p.sourceInfo.modeInfoIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || p.sourceInfo.modeInfoIdx >= modes.size()) continue;
+        auto& mi = modes[p.sourceInfo.modeInfoIdx];
+        if (mi.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) continue;
+        auto n = TargetName(p);
+        for (size_t i = 0; i < regions.size(); i++)
+            if (n == L"Split " + std::to_wstring(first + i + 1)) slot[i] = &mi.sourceMode;
+    }
+    for (auto* s : slot)
+        if (!s) return false; // e.g. a monitor switched off with Win+P: nothing to glue
+
+    // The group's first monitor is the anchor, so the whole group can still be moved around.
+    LONG ox = slot[0]->position.x - regions[0].left, oy = slot[0]->position.y - regions[0].top;
+    bool aligned = true;
+    for (size_t i = 0; i < regions.size(); i++)
+        if (slot[i]->position.x != ox + regions[i].left || slot[i]->position.y != oy + regions[i].top) aligned = false;
+    if (aligned) return false;
+
+    std::wstring was;
+    for (size_t i = 0; i < regions.size(); i++)
+    {
+        was += L" (" + std::to_wstring(slot[i]->position.x) + L"," + std::to_wstring(slot[i]->position.y) + L")";
+        slot[i]->position = { ox + regions[i].left, oy + regions[i].top };
+    }
+    LONG r = SetDisplayConfig((UINT32)paths.size(), paths.data(), (UINT32)modes.size(), modes.data(),
+        SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    Log(L"split monitors %u..%zu drifted apart (was%s), re-aligned: %ld", first + 1, first + regions.size(), was.c_str(), r);
+    return true;
+}
+
+static int RoundHz(const DISPLAYCONFIG_RATIONAL& r)
+{
+    return r.Denominator ? (int)((r.Numerator + r.Denominator / 2) / r.Denominator) : 0;
+}
+
+void ForceRefresh(const std::vector<std::wstring>& names, int hz)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (hz <= 0 || !QueryActive(paths, modes)) return;
+    for (auto& p : paths)
+    {
+        auto n = TargetName(p);
+        if (std::find(names.begin(), names.end(), n) == names.end() || RoundHz(p.targetInfo.refreshRate) == hz) continue;
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+        src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src.header.size = sizeof(src);
+        src.header.adapterId = p.sourceInfo.adapterId;
+        src.header.id = p.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src.header) != ERROR_SUCCESS) continue;
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        dm.dmFields = DM_DISPLAYFREQUENCY;
+        dm.dmDisplayFrequency = (DWORD)hz;
+        LONG r = ChangeDisplaySettingsExW(src.viewGdiDeviceName, &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+        Log(L"refresh '%s' %d -> %d Hz: %ld", n.c_str(), RoundHz(p.targetInfo.refreshRate), hz, r);
+    }
+}
+
+int CurrentRefreshOf(const std::wstring& name)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActive(paths, modes)) return 0;
+    for (auto& p : paths)
+    {
+        if (TargetName(p) == name) return RoundHz(p.targetInfo.refreshRate);
+    }
+    return 0;
+}
+
 bool IsTargetActive(const wchar_t* namePrefix)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
