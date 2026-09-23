@@ -70,6 +70,7 @@ foreach ($store in 'Root', 'TrustedPublisher') {
 
 Step 'Installing SplitDisplay'
 New-Item -ItemType Directory -Force $dest | Out-Null
+Get-ChildItem $dest -Filter 'splitdisplay.old*.exe' -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
 foreach ($f in 'splitdisplay.exe', 'sdctl.exe', 'uninstall.ps1', 'Uninstall.cmd', 'README.txt') {
     if (Test-Path (Join-Path $here $f)) { Copy-Item (Join-Path $here $f) $dest -Force }
 }
