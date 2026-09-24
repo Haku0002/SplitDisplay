@@ -278,7 +278,7 @@ std::vector<MapItem> BuildMap()
     }
     auto isSplit = [&](const PanelTarget& t) {
         for (auto& id : split)
-            if (_wcsicmp(t.monitorDevicePath.c_str(), id.c_str()) == 0) return true;
+            if (!id.empty() && _wcsicmp(t.monitorDevicePath.c_str(), id.c_str()) == 0) return true;
         return false;
     };
     for (auto& t : targets)

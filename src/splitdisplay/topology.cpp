@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,11 @@ static bool QueryActive(std::vector<DISPLAYCONFIG_PATH_INFO>& paths, std::vector
         return true;
     }
     return false;
+}
+
+static bool IsTarget(const DISPLAYCONFIG_PATH_INFO& p, LUID adapter, UINT32 targetId)
+{
+    return p.targetInfo.id == targetId && p.targetInfo.adapterId.LowPart == adapter.LowPart && p.targetInfo.adapterId.HighPart == adapter.HighPart;
 }
 
 static std::wstring TargetName(const DISPLAYCONFIG_PATH_INFO& p)
@@ -218,15 +224,15 @@ static int RoundHz(const DISPLAYCONFIG_RATIONAL& r)
     return r.Denominator ? (int)((r.Numerator + r.Denominator / 2) / r.Denominator) : 0;
 }
 
-void ForceRefresh(const std::vector<std::wstring>& names, int hz)
+static void ForceRefreshWhere(const std::function<bool(const DISPLAYCONFIG_PATH_INFO&)>& wanted, int hz)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     if (hz <= 0 || !QueryActive(paths, modes)) return;
     for (auto& p : paths)
     {
+        if (!wanted(p) || RoundHz(p.targetInfo.refreshRate) == hz) continue;
         auto n = TargetName(p);
-        if (std::find(names.begin(), names.end(), n) == names.end() || RoundHz(p.targetInfo.refreshRate) == hz) continue;
         DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
         src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         src.header.size = sizeof(src);
@@ -242,6 +248,43 @@ void ForceRefresh(const std::vector<std::wstring>& names, int hz)
     }
 }
 
+void ForceRefresh(const std::vector<std::wstring>& names, int hz)
+{
+    ForceRefreshWhere([&](const DISPLAYCONFIG_PATH_INFO& p) { return std::find(names.begin(), names.end(), TargetName(p)) != names.end(); }, hz);
+}
+
+void ForceRefreshTarget(LUID adapter, UINT32 targetId, int hz)
+{
+    ForceRefreshWhere([&](const DISPLAYCONFIG_PATH_INFO& p) { return IsTarget(p, adapter, targetId); }, hz);
+}
+
+int CurrentRefreshOfTarget(LUID adapter, UINT32 targetId)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActive(paths, modes)) return 0;
+    for (auto& p : paths)
+        if (IsTarget(p, adapter, targetId)) return RoundHz(p.targetInfo.refreshRate);
+    return 0;
+}
+
+bool DesktopRectOf(const std::wstring& name, RECT& out)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActive(paths, modes)) return false;
+    for (auto& p : paths)
+    {
+        if (TargetName(p) != name || p.sourceInfo.modeInfoIdx >= modes.size()) continue;
+        auto& mi = modes[p.sourceInfo.modeInfoIdx];
+        if (mi.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) continue;
+        auto& sm = mi.sourceMode;
+        out = { sm.position.x, sm.position.y, sm.position.x + (LONG)sm.width, sm.position.y + (LONG)sm.height };
+        return true;
+    }
+    return false;
+}
+
 int CurrentRefreshOf(const std::wstring& name)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
@@ -254,7 +297,7 @@ int CurrentRefreshOf(const std::wstring& name)
     return 0;
 }
 
-bool ActivateMonitors(const std::vector<std::wstring>& names)
+static bool ActivateWhere(const std::function<bool(const DISPLAYCONFIG_PATH_INFO&)>& wanted, const wchar_t* what)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> all;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
@@ -289,7 +332,7 @@ bool ActivateMonitors(const std::vector<std::wstring>& names)
     for (auto& p : all)
     {
         if ((p.flags & DISPLAYCONFIG_PATH_ACTIVE) || !p.targetInfo.targetAvailable) continue;
-        if (std::find(names.begin(), names.end(), TargetName(p)) == names.end()) continue;
+        if (!wanted(p)) continue;
         bool busy = false;
         for (auto& q : paths) busy |= sameSource(p, q) || sameTarget(p, q);
         if (busy) continue;
@@ -303,8 +346,19 @@ bool ActivateMonitors(const std::vector<std::wstring>& names)
     if (!added) return false;
     LONG r = SetDisplayConfig((UINT32)paths.size(), paths.data(), (UINT32)modes.size(), modes.data(),
         SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
-    Log(L"Windows left %d split monitor(s) off the desktop; activating them: %ld", added, r);
+    Log(L"Windows left %d %s off the desktop; activating: %ld", added, what, r);
     return r == ERROR_SUCCESS;
+}
+
+bool ActivateMonitors(const std::vector<std::wstring>& names)
+{
+    return ActivateWhere([&](const DISPLAYCONFIG_PATH_INFO& p) { return std::find(names.begin(), names.end(), TargetName(p)) != names.end(); },
+        L"split monitor(s)");
+}
+
+bool ActivateTarget(LUID adapter, UINT32 targetId)
+{
+    return ActivateWhere([&](const DISPLAYCONFIG_PATH_INFO& p) { return IsTarget(p, adapter, targetId); }, L"panel(s)");
 }
 
 bool IsTargetActive(const wchar_t* namePrefix)

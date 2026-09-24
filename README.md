@@ -85,7 +85,8 @@ There SplitDisplay switches to **window mode** automatically:
 - A topmost, non-activating window exactly covering the panel (not in the taskbar or `Alt+Tab`) shows the split
   monitors through a flip-model swap chain on the panel's GPU. Windows scans it out directly (independent flip), so
   the DWM does not composite it once more. Each split monitor frame is presented as soon as the driver signals it,
-  into an empty present queue, and reaches the panel at its next vblank, as in exclusive mode.
+  with sync interval 0 and no tearing: a newer frame replaces one still waiting, so every vblank shows the newest
+  frame and nothing queues up, whatever the timing between the split monitors and the panel.
 - A guard keeps the cursor off the parked panel (a low-level mouse hook plus a position check) and moves application
   windows that end up there back to the panel's first split monitor.
 

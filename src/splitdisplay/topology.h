@@ -34,10 +34,20 @@ void ForceRefresh(const std::vector<std::wstring>& names, int hz);
 // Current refresh rate (Hz, rounded) of the active monitor with exactly this name, or 0.
 int CurrentRefreshOf(const std::wstring& name);
 
+// The same for one target (a physical panel: its name need not be unique, or may be empty).
+void ForceRefreshTarget(LUID adapter, UINT32 targetId, int hz);
+int CurrentRefreshOfTarget(LUID adapter, UINT32 targetId);
+
+// Desktop rect of the active monitor with exactly this name.
+bool DesktopRectOf(const std::wstring& name, RECT& out);
+
 // Adds the named (connected but inactive) monitors to the desktop, leaving every other display as
 // it is. Windows restores a saved topology for a known set of monitors, which can keep freshly
 // plugged split monitors switched off. Returns true if a change was applied.
 bool ActivateMonitors(const std::vector<std::wstring>& names);
+
+// The same for one target (a physical panel).
+bool ActivateTarget(LUID adapter, UINT32 targetId);
 
 // Returns true if the target with this name is part of the desktop.
 bool IsTargetActive(const wchar_t* namePrefix);
@@ -45,5 +55,5 @@ bool IsTargetActive(const wchar_t* namePrefix);
 // Forces an extend topology across connected displays (used as a last-resort recovery).
 void ForceExtendTopology();
 
-// GDI device name (\.\DISPLAYn) of the source driving this target while it is on the desktop, else "".
+// GDI device name (\\.\DISPLAYn) of the source driving this target while it is on the desktop, else "".
 std::wstring GdiNameOfTarget(LUID adapter, UINT32 targetId);
