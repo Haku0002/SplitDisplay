@@ -37,7 +37,7 @@ target_link_libraries(sdctl PRIVATE sdcommon setupapi newdev)
 add_executable(splitdisplay
     src/splitdisplay/main.cpp src/splitdisplay/topology.cpp src/splitdisplay/gui.cpp src/splitdisplay/autostart.cpp
     src/splitdisplay/splitdisplay.manifest)
-target_link_libraries(splitdisplay PRIVATE sdcommon comctl32 shcore taskschd secur32 comsuppw oleaut32 shell32)
+target_link_libraries(splitdisplay PRIVATE sdcommon comctl32 shcore taskschd secur32 comsuppw oleaut32 shell32 dwmapi slc)
 target_compile_definitions(splitdisplay PRIVATE SPLITDISPLAY_VERSION="${PROJECT_VERSION}")
 # No console window when started at logon; everything goes to splitdisplay.log.
 target_link_options(splitdisplay PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /MANIFESTUAC:NO)

@@ -265,22 +265,35 @@ std::vector<MapItem> BuildMap()
 {
     std::vector<MapItem> items;
     auto targets = EnumTargets();
-    for (auto& t : targets)
-    {
-        if (!t.active || !t.width || t.isVirtual) continue;
-        items.push_back({ t, { t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height }, 0, 0 });
-    }
     auto path = RuntimePath();
     int n = GetPrivateProfileIntW(L"Runtime", L"panels", 0, path.c_str());
+    // Split displays: in window mode they stay on the desktop (parked in a corner), so they are
+    // only drawn where their split monitors are, like in exclusive mode.
+    std::vector<std::wstring> split;
+    for (int i = 1; i <= n; i++)
+    {
+        wchar_t id[1024] = {};
+        GetPrivateProfileStringW((L"Panel" + std::to_wstring(i)).c_str(), L"id", L"", id, 1024, path.c_str());
+        split.push_back(id);
+    }
+    auto isSplit = [&](const PanelTarget& t) {
+        for (auto& id : split)
+            if (_wcsicmp(t.monitorDevicePath.c_str(), id.c_str()) == 0) return true;
+        return false;
+    };
+    for (auto& t : targets)
+    {
+        if (!t.active || !t.width || t.isVirtual || isSplit(t)) continue;
+        items.push_back({ t, { t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height }, 0, 0 });
+    }
     for (int i = 1; i <= n; i++)
     {
         auto sec = L"Panel" + std::to_wstring(i);
-        wchar_t id[1024] = {};
-        GetPrivateProfileStringW(sec.c_str(), L"id", L"", id, 1024, path.c_str());
+        const auto& id = split[i - 1];
         auto get = [&](const wchar_t* k) { return GetPrivateProfileIntW(sec.c_str(), k, 0, path.c_str()); };
         for (auto& t : targets)
         {
-            if (t.active || t.isVirtual || _wcsicmp(t.monitorDevicePath.c_str(), id) != 0) continue;
+            if (t.isVirtual || _wcsicmp(t.monitorDevicePath.c_str(), id.c_str()) != 0) continue;
             int first = (int)get(L"first"), count = (int)get(L"count");
             RECT area{};
             bool any = false;

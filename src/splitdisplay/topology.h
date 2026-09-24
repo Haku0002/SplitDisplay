@@ -44,3 +44,6 @@ bool IsTargetActive(const wchar_t* namePrefix);
 
 // Forces an extend topology across connected displays (used as a last-resort recovery).
 void ForceExtendTopology();
+
+// GDI device name (\.\DISPLAYn) of the source driving this target while it is on the desktop, else "".
+std::wstring GdiNameOfTarget(LUID adapter, UINT32 targetId);

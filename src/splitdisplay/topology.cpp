@@ -322,3 +322,22 @@ void ForceExtendTopology()
     LONG r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
     Log(L"force extend topology: %ld", r);
 }
+
+std::wstring GdiNameOfTarget(LUID adapter, UINT32 targetId)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActive(paths, modes)) return L"";
+    for (auto& p : paths)
+    {
+        if (p.targetInfo.id != targetId || p.targetInfo.adapterId.LowPart != adapter.LowPart || p.targetInfo.adapterId.HighPart != adapter.HighPart)
+            continue;
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+        src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src.header.size = sizeof(src);
+        src.header.adapterId = p.sourceInfo.adapterId;
+        src.header.id = p.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS) return src.viewGdiDeviceName;
+    }
+    return L"";
+}

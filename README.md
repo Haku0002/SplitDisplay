@@ -5,6 +5,10 @@ Turn one physical display into several **real** Windows monitors.
 > Vibe-coded with [Claude](https://claude.com/claude-code): the driver, compositor, reverse engineering and docs were
 > written by Claude (Anthropic) under the direction of the maintainer, and tested on real hardware.
 
+> **Supported Windows editions: currently only Windows 11 Pro for Workstations (and Enterprise).** These editions
+> let SplitDisplay own the display directly. On Home and Pro it falls back to an experimental
+> [window mode](#window-mode-windows-home-and-pro-experimental).
+
 SplitDisplay was built for foldable dual-panel portable monitors (such as the *Sculptor* 2 x 2560x1440 foldable).
 Over DisplayPort these panels use MST and Windows sees two monitors. Over HDMI they show up as a single tall
 2560x2880 monitor. Windows then maximizes and fullscreens across both panels, and the taskbar and snapping treat
@@ -67,6 +71,31 @@ and the second half's hash is the high 32 bits. The call requires elevation. Win
 remaining desktop display. Disabling an override that is not set returns `ERROR_GEN_FAILURE`. See
 `src/common/panel.cpp`.
 
+### Window mode (Windows Home and Pro, experimental)
+
+Owning a display removed from the desktop is licensed only on some Windows editions (e.g. Enterprise and Pro for
+Workstations): the license value `Display-Specialized-Displays-Enabled` must be 1. On Home and Pro the panel can still
+be removed, but acquiring it fails with `TargetAccessDenied` (`0xD0000022`), and the Settings toggle is hidden. The
+EDID extension for head-mounted and specialized displays does not help either on these editions.
+
+There SplitDisplay switches to **window mode** automatically:
+
+- The panel stays an ordinary desktop monitor. It is parked diagonally off the bottom-right corner of all other
+  displays, so it touches the rest of the desktop at a single corner only. The split monitors take its place.
+- A topmost, non-activating window exactly covering the panel (not in the taskbar or `Alt+Tab`) shows the split
+  monitors through a flip-model swap chain on the panel's GPU. Windows scans it out directly (independent flip), so
+  the DWM does not composite it once more. Each split monitor frame is presented as soon as the driver signals it,
+  into an empty present queue, and reaches the panel at its next vblank, as in exclusive mode.
+- A guard keeps the cursor off the parked panel (a low-level mouse hook plus a position check) and moves application
+  windows that end up there back to the panel's first split monitor.
+
+Window mode is experimental. Because Windows scans the window out like a fullscreen game, GPU vendor game filters
+apply to it: with NVIDIA App's RTX Dynamic Vibrance (or RTX HDR) on, the split monitors look washed out and
+oversaturated. Turn the filter off for `splitdisplay.exe` in NVIDIA App (Graphics > Program settings).
+
+To choose the mode yourself, set `mode=exclusive` or `mode=window` in the `[SplitDisplay]` section of
+`%ProgramData%\SplitDisplay\config.ini` (default `auto`). The log says which mode each session uses.
+
 ## Download
 
 Prebuilt zips are on the [Releases](https://github.com/brkDOTstl/SplitDisplay/releases) page. Unzip and double-click
@@ -75,8 +104,9 @@ your machine and deletes its private key right after. Nothing needs to be built,
 
 ## Requirements
 
-- Windows 11 with a GPU driver that supports display specialization: the Settings toggle
-  "Remove display from desktop" must be available for the panel. Nothing is vendor specific. Developed and tested on
+- Windows 11. Exclusive mode needs an edition licensed for specialized displays and a GPU driver that supports
+  them: the Settings toggle "Remove display from desktop" must be available for the panel. Other editions use
+  [window mode](#window-mode-windows-home-and-pro-experimental). Nothing is vendor specific. Developed and tested on
   an NVIDIA RTX 4060; AMD and Intel are untested. The virtual monitors must render on the GPU the panel is attached
   to. The driver requests this, and the log warns if Windows picks another GPU.
 - Visual Studio 2022/2026 with the C++ workload and the Windows 11 SDK (10.0.26100), plus CMake.

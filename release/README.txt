@@ -29,8 +29,13 @@ Uninstall
   the driver, the certificate and the logon task, and restores the display.
 
 Requirements
-  Windows 11, x64. The GPU driver must support "Remove display from desktop"
-  (Settings > System > Display > Advanced display). Developed and tested on an
-  NVIDIA RTX 4060. AMD and Intel should work but are untested.
+  Windows 11 x64, currently only Pro for Workstations (and Enterprise): there,
+  with a GPU driver that supports "Remove display from desktop" (Settings >
+  System > Display > Advanced display), SplitDisplay owns the display directly.
+  On Home and Pro it falls back to an experimental window mode: the display
+  stays on the desktop, parked in a corner, and a window on it shows the split
+  monitors. NVIDIA App's RTX Dynamic Vibrance treats that window like a game
+  and washes out its colors: turn it off for splitdisplay.exe in NVIDIA App.
+  Developed and tested on an NVIDIA RTX 4060. AMD and Intel should work but are untested.
 
 Source, issues and details: https://github.com/brkDOTstl/SplitDisplay

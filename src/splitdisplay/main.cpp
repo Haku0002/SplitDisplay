@@ -12,11 +12,18 @@
 //
 // Any command accepts --panel "<monitor name prefix>" to work on that display only (not saved).
 //
+// Exclusive mode owns each panel through DisplayManager; window mode (Windows editions without
+// display specialization, or mode=window in config.ini) shows the split monitors in a window on it.
+//
 // Emergency exit while running: Ctrl+Alt+Shift+F12.
 
 #include <Windows.h>
 #include <d3d11_4.h>
+#include <dwmapi.h>
 #include <dxgi1_6.h>
+#include <slpublic.h>
+#include <winternl.h> // NTSTATUS for d3dkmthk.h
+#include <d3dkmthk.h>
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -26,7 +33,9 @@
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <Windows.Devices.Display.Core.Interop.h>
 
+#include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -48,6 +57,7 @@ namespace wgd = winrt::Windows::Graphics::DirectX;
 static std::atomic_bool g_stop = false;
 static std::atomic_bool g_abort = false;   // end the session (a panel was lost, or a restart is needed)
 static std::atomic_bool g_restart = false; // end the session and start a new one right away
+static bool g_windowMode = false;          // this session composites into a window (see "Window mode")
 static HANDLE g_stopEvent = nullptr;
 static volatile LONG64* g_heartbeat = nullptr;
 // Panel workers report here; the main thread only beats while every worker is alive.
@@ -112,6 +122,24 @@ static std::wstring VirtualName(size_t index)
 static bool SameTarget(const PanelTarget& a, const PanelTarget& b)
 {
     return a.adapter.LowPart == b.adapter.LowPart && a.adapter.HighPart == b.adapter.HighPart && a.targetId == b.targetId;
+}
+
+// Only Windows editions licensed for specialized displays (e.g. Enterprise, Pro for Workstations)
+// let a DisplayManager client own a display removed from the desktop. On the others (e.g. Home,
+// Pro) the panel can still be removed, but acquiring it fails with access denied.
+static bool SpecializedDisplaysLicensed()
+{
+    DWORD enabled = 0;
+    return SUCCEEDED(SLGetWindowsInformationDWORD(L"Display-Specialized-Displays-Enabled", &enabled)) && enabled != 0;
+}
+
+// config.ini [SplitDisplay] mode = auto (default) | exclusive | window
+static bool ChooseWindowMode()
+{
+    auto mode = LoadConfigValue(L"mode");
+    if (_wcsicmp(mode.c_str(), L"window") == 0) return true;
+    if (_wcsicmp(mode.c_str(), L"exclusive") == 0) return false;
+    return !SpecializedDisplaysLicensed();
 }
 
 #pragma region Runtime state (read by the settings window)
@@ -253,6 +281,8 @@ static void RevertTargets(const std::vector<std::pair<LUID, UINT32>>& targets)
 {
     for (auto& [luid, id] : targets)
     {
+        auto spec = GetSpecialization(luid, id);
+        if (spec.ok && !spec.enabled) continue; // never removed (window mode) or already back
         for (int i = 0; i < 10; i++)
         {
             LONG r = SetSpecialization(luid, id, false);
@@ -518,6 +548,46 @@ static bool AnyVirtualSignal(SdShared* s, const PanelSession& p)
     return false;
 }
 
+static bool FramesChanged(SdShared* s, const std::vector<FrameSource>& src)
+{
+    for (auto& f : src)
+        if (f.gen != s->mon[f.index].handleGeneration || s->mon[f.index].frameSeq != f.lastSeq) return true;
+    return false;
+}
+
+// Copies the newest frame of every split monitor into its region of `dst` (black where a monitor has
+// no frame). The copies hold ring reservations until the caller's fence says they are done.
+static void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HANDLE driverProc, std::vector<FrameSource>& src,
+                        const std::vector<RECT>& regions, ID3D11Texture2D* dst, ID3D11RenderTargetView* rtv, UINT width, UINT height)
+{
+    const float black[4] = { 0, 0, 0, 1 };
+    for (size_t k = 0; k < src.size(); k++)
+    {
+        auto& f = src[k];
+        auto& m = s->mon[f.index];
+        if (f.gen != m.handleGeneration) f.Refresh(dev, s, driverProc);
+
+        // Region on the panel, clipped to the target size.
+        RECT rc = regions[k];
+        rc.right = std::min<LONG>(rc.right, (LONG)width);
+        rc.bottom = std::min<LONG>(rc.bottom, (LONG)height);
+        if (rc.right <= rc.left || rc.bottom <= rc.top) continue;
+        D3D11_RECT area{ rc.left, rc.top, rc.right, rc.bottom };
+        LONG64 seq = m.frameSeq;
+        UINT64 fv = 0;
+        int idx = f.gen >= 0 ? f.Acquire(s, fv) : -1;
+        f.lastSeq = seq;
+        if (idx < 0)
+        {
+            ctx->ClearView(rtv, black, &area, 1);
+            continue;
+        }
+        ctx->Wait(f.fence.get(), fv);
+        D3D11_BOX box{ 0, 0, 0, std::min<UINT>(f.width, (UINT)(rc.right - rc.left)), std::min<UINT>(f.height, (UINT)(rc.bottom - rc.top)), 1 };
+        ctx->CopySubresourceRegion(dst, 0, (UINT)rc.left, (UINT)rc.top, 0, f.tex[idx].get(), 0, &box);
+    }
+}
+
 // Drives one panel until the session ends. Runs on its own thread.
 static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadline)
 {
@@ -636,7 +706,6 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
             Log(L"warning: virtual monitor %d renders on GPU %08X:%08X but the panel is on %08X:%08X; cross-GPU copy is not supported, it will stay black",
                 src[i].index, a.HighPart, a.LowPart, panel.adapter.HighPart, panel.adapter.LowPart);
     }
-    const float black[4] = { 0, 0, 0, 1 };
 
     LARGE_INTEGER freq, t0, now{};
     QueryPerformanceFrequency(&freq);
@@ -703,42 +772,11 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
             darkSince = 0;
         }
 
-        bool changed = !presented;
-        for (auto& s : src)
-        {
-            auto& m = shm->mon[s.index];
-            if (s.gen != m.handleGeneration || m.frameSeq != s.lastSeq) changed = true;
-        }
-
-        if (changed)
+        if (!presented || FramesChanged(shm.get(), src))
         {
             int back = (int)(presents & 1);
-            for (size_t k = 0; k < src.size(); k++)
-            {
-                auto& s = src[k];
-                auto& m = shm->mon[s.index];
-                if (s.gen != m.handleGeneration) s.Refresh(dev.get(), shm.get(), driverProc);
-
-                // Region on the panel, clipped to the scanout size.
-                RECT rc = p.regions[k];
-                rc.right = std::min<LONG>(rc.right, res.Width);
-                rc.bottom = std::min<LONG>(rc.bottom, res.Height);
-                if (rc.right <= rc.left || rc.bottom <= rc.top) continue;
-                D3D11_RECT area{ rc.left, rc.top, rc.right, rc.bottom };
-                LONG64 seq = m.frameSeq;
-                UINT64 fv = 0;
-                int idx = s.gen >= 0 ? s.Acquire(shm.get(), fv) : -1;
-                if (idx < 0)
-                {
-                    ctx->ClearView(primRtv[back].get(), black, &area, 1);
-                    s.lastSeq = seq;
-                    continue;
-                }
-                s.lastSeq = seq;
-                ctx->Wait(s.fence.get(), fv);
-                D3D11_BOX box{ 0, 0, 0, std::min<UINT>(s.width, (UINT)(rc.right - rc.left)), std::min<UINT>(s.height, (UINT)(rc.bottom - rc.top)), 1 };
-                ctx->CopySubresourceRegion(primTex[back].get(), 0, (UINT)rc.left, (UINT)rc.top, 0, s.tex[idx].get(), 0, &box);
-            }
+            DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc, src, p.regions, primTex[back].get(), primRtv[back].get(), (UINT)res.Width,
+                (UINT)res.Height);
             ctx->Signal(fence.get(), ++fenceValue);
             ctx->Flush();
             pendingFence = fenceValue;
@@ -782,12 +820,528 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
     return outcome;
 }
 
+#pragma region Window mode
+
+// Without display specialization (see SpecializedDisplaysLicensed) a panel cannot be taken off the
+// desktop and owned. Window mode leaves every panel on the desktop instead, parked diagonally off
+// the bottom-right corner of all other displays so only one corner touches them, and shows its
+// split monitors in a topmost window covering it. A guard thread keeps the cursor and application
+// windows off the parked panels. Costs one DWM composition step compared to exclusive mode.
+
+static constexpr wchar_t kCompositorClass[] = L"SplitDisplayCompositor";
+
+struct ParkedPanel
+{
+    LUID adapter;
+    UINT32 targetId;
+    RECT home;   // desktop rect of the panel's first split monitor: stray windows are moved there
+    RECT rect{}; // where the panel is on the desktop now (refreshed by the guard)
+};
+
+// Owned by the guard thread; the mouse hook runs on that thread too, so no locking is needed.
+static std::vector<ParkedPanel> g_parked;
+static std::vector<RECT> g_openMonitors; // every monitor the cursor may use
+static std::atomic_bool g_guardQuit = false;
+
+static bool MonitorRectByName(const std::wstring& gdiName, RECT& out)
+{
+    struct Ctx
+    {
+        const std::wstring* name;
+        RECT* out;
+        bool found;
+    } c{ &gdiName, &out, false };
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL {
+        auto* c = (Ctx*)lp;
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(m, &mi) && _wcsicmp(mi.szDevice, c->name->c_str()) == 0)
+        {
+            *c->out = mi.rcMonitor;
+            c->found = true;
+            return FALSE;
+        }
+        return TRUE;
+    }, (LPARAM)&c);
+    return c.found;
+}
+
+static bool PanelRect(LUID adapter, UINT32 targetId, RECT& out)
+{
+    auto gdi = GdiNameOfTarget(adapter, targetId);
+    return !gdi.empty() && MonitorRectByName(gdi, out);
+}
+
+static void RefreshGuardRects()
+{
+    for (auto& p : g_parked)
+        if (!PanelRect(p.adapter, p.targetId, p.rect)) p.rect = {};
+    g_openMonitors.clear();
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM) -> BOOL {
+        MONITORINFO mi{ sizeof(mi) };
+        if (!GetMonitorInfoW(m, &mi)) return TRUE;
+        for (auto& p : g_parked)
+            if (EqualRect(&p.rect, &mi.rcMonitor)) return TRUE;
+        g_openMonitors.push_back(mi.rcMonitor);
+        return TRUE;
+    }, 0);
+}
+
+static const ParkedPanel* ParkedAt(POINT pt)
+{
+    for (auto& p : g_parked)
+        if (PtInRect(&p.rect, pt)) return &p;
+    return nullptr;
+}
+
+static POINT NearestOpenPoint(POINT pt)
+{
+    POINT best = pt;
+    LONGLONG bestDist = LLONG_MAX;
+    for (auto& r : g_openMonitors)
+    {
+        POINT c{ std::clamp(pt.x, r.left, r.right - 1), std::clamp(pt.y, r.top, r.bottom - 1) };
+        LONGLONG d = (LONGLONG)(c.x - pt.x) * (c.x - pt.x) + (LONGLONG)(c.y - pt.y) * (c.y - pt.y);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            best = c;
+        }
+    }
+    return best;
+}
+
+static LRESULT CALLBACK GuardMouseProc(int code, WPARAM wp, LPARAM lp)
+{
+    if (code == HC_ACTION && wp == WM_MOUSEMOVE && !g_openMonitors.empty())
+    {
+        POINT pt = ((MSLLHOOKSTRUCT*)lp)->pt;
+        if (ParkedAt(pt))
+        {
+            // Swallow the move and put the cursor at the nearest point of an open monitor.
+            POINT to = NearestOpenPoint(pt);
+            SetCursorPos(to.x, to.y);
+            return 1;
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+// Moves application windows that ended up on a parked panel (hidden behind its compositor window)
+// to the panel's first split monitor. Async calls only: a hung application must not stall the
+// thread that also runs the mouse hook.
+static BOOL CALLBACK SweepWindow(HWND hwnd, LPARAM)
+{
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    for (auto* shell : { L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", kCompositorClass })
+        if (wcscmp(cls, shell) == 0) return TRUE;
+
+    RECT r;
+    if (!GetWindowRect(hwnd, &r)) return TRUE;
+    auto* p = ParkedAt({ (r.left + r.right) / 2, (r.top + r.bottom) / 2 });
+    if (!p) return TRUE;
+
+    bool maximized = IsZoomed(hwnd);
+    if (maximized)
+    {
+        ShowWindowAsync(hwnd, SW_RESTORE);
+        r = p->rect; // restored size is unknown here; fit whatever it is into the home monitor below
+    }
+    LONG hw = p->home.right - p->home.left, hh = p->home.bottom - p->home.top;
+    LONG w = std::min(r.right - r.left, hw), h = std::min(r.bottom - r.top, hh);
+    SetWindowPos(hwnd, nullptr, p->home.left + (hw - w) / 2, p->home.top + (hh - h) / 2, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    if (maximized) ShowWindowAsync(hwnd, SW_MAXIMIZE);
+    wchar_t title[128] = {};
+    GetWindowTextW(hwnd, title, 128);
+    Log(L"moved window '%s' (%s) off a parked panel", title, cls);
+    return TRUE;
+}
+
+static void GuardThread()
+{
+    HHOOK hook = SetWindowsHookExW(WH_MOUSE_LL, GuardMouseProc, GetModuleHandleW(nullptr), 0);
+    if (!hook) Log(L"warning: mouse guard not installed (%lu); the cursor can reach the parked panel", GetLastError());
+    ULONGLONG nextSweep = 0;
+    while (!g_guardQuit)
+    {
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        if (GetTickCount64() >= nextSweep)
+        {
+            nextSweep = GetTickCount64() + 500;
+            RefreshGuardRects();
+            EnumWindows(SweepWindow, 0);
+        }
+        // The hook only sees mouse input; programs can still place the cursor with SetCursorPos.
+        POINT cur;
+        if (!g_openMonitors.empty() && GetCursorPos(&cur) && ParkedAt(cur))
+        {
+            POINT to = NearestOpenPoint(cur);
+            SetCursorPos(to.x, to.y);
+        }
+    }
+    if (hook) UnhookWindowsHookEx(hook);
+}
+
+struct GuardRun
+{
+    std::thread thread;
+
+    void Start()
+    {
+        g_guardQuit = false;
+        thread = std::thread(GuardThread);
+    }
+
+    void Stop()
+    {
+        if (!thread.joinable()) return;
+        g_guardQuit = true;
+        thread.join();
+    }
+
+    ~GuardRun() { Stop(); }
+};
+
+// Where the panel's scanout is right now: 0..99 = percent of the active area, 100 = vertical blank.
+// Used by test runs to show when split monitor frames arrive relative to the panel's refresh.
+struct ScanlineProbe
+{
+    D3DKMT_GETSCANLINE query{};
+    UINT height = 0;
+
+    bool Open(const std::wstring& gdiName, UINT activeHeight)
+    {
+        D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME o{};
+        wcsncpy_s(o.DeviceName, gdiName.c_str(), _TRUNCATE);
+        if (D3DKMTOpenAdapterFromGdiDisplayName(&o) != 0) return false;
+        query.hAdapter = o.hAdapter;
+        query.VidPnSourceId = o.VidPnSourceId;
+        height = activeHeight;
+        return true;
+    }
+
+    int Percent()
+    {
+        if (!height || D3DKMTGetScanLine(&query) != 0) return -1;
+        return query.InVerticalBlank ? 100 : (int)std::min<UINT>(99, query.ScanLine * 100 / height);
+    }
+};
+
+static LRESULT CALLBACK CompositorWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Window-mode counterpart of Composite: shows one panel's split monitors in a topmost window
+// covering the (parked) panel, presenting through a flip-model swap chain on the panel's GPU.
+static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG deadline)
+{
+    const PanelTarget& panel = p.target;
+    RECT rc{};
+    if (!PanelRect(panel.adapter, panel.targetId, rc))
+    {
+        Log(L"panel %u is not on the desktop", panel.targetId);
+        return Outcome::Lost;
+    }
+
+    winrt::com_ptr<IDXGIFactory6> factory;
+    factory.capture(&CreateDXGIFactory2, 0);
+    winrt::com_ptr<IDXGIAdapter4> adapter;
+    adapter.capture(factory, &IDXGIFactory6::EnumAdapterByLuid, panel.adapter);
+    winrt::com_ptr<ID3D11Device> d0;
+    winrt::com_ptr<ID3D11DeviceContext> c0;
+    winrt::check_hresult(D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, d0.put(), nullptr, c0.put()));
+    auto dev = d0.as<ID3D11Device5>();
+    auto ctx = c0.as<ID3D11DeviceContext4>();
+    // Our copies are tiny and sit on the path of every frame: let them jump the GPU queue.
+    dev.as<IDXGIDevice>()->SetGPUThreadPriority(7);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    winrt::com_ptr<ID3D11Fence> fence;
+    fence.capture(dev, &ID3D11Device5::CreateFence, 0, D3D11_FENCE_FLAG_NONE);
+    UINT64 fenceValue = 0;
+    HANDLE fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    WNDCLASSEXW wc{ sizeof(wc) };
+    wc.lpfnWndProc = CompositorWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = kCompositorClass;
+    RegisterClassExW(&wc); // fails harmlessly if another panel thread registered it
+    // Exactly covering the panel, so Windows scans the swap chain out directly (independent flip)
+    // instead of compositing it once more. Filters of the GPU vendor's app (e.g. NVIDIA RTX Dynamic
+    // Vibrance) then treat SplitDisplay like a game; exclude splitdisplay.exe there.
+    UINT width = (UINT)(rc.right - rc.left), height = (UINT)(rc.bottom - rc.top);
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCompositorClass, L"SplitDisplay", WS_POPUP, rc.left, rc.top,
+        (int)width, (int)height, nullptr, nullptr, wc.hInstance, nullptr);
+    if (!hwnd) throw std::runtime_error("could not create the compositor window");
+
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width = width;
+    sd.Height = height;
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    winrt::com_ptr<IDXGISwapChain1> swap;
+    winrt::check_hresult(factory->CreateSwapChainForHwnd(dev.get(), hwnd, &sd, nullptr, nullptr, swap.put()));
+    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+    // One frame in flight: we wait until the next present can go out, then copy the newest frames,
+    // instead of queueing frames that are already stale when they reach the screen.
+    auto swap2 = swap.as<IDXGISwapChain2>();
+    swap2->SetMaximumFrameLatency(1);
+    HANDLE canPresent = swap2->GetFrameLatencyWaitableObject();
+    // With a D3D11 flip-model swap chain, buffer 0 is always the current back buffer.
+    winrt::com_ptr<ID3D11Texture2D> back;
+    winrt::com_ptr<ID3D11RenderTargetView> backRtv;
+    auto bindBackBuffer = [&] {
+        back = nullptr;
+        backRtv = nullptr;
+        back.capture(swap, &IDXGISwapChain1::GetBuffer, 0);
+        winrt::check_hresult(dev->CreateRenderTargetView(back.get(), nullptr, backRtv.put()));
+    };
+    bindBackBuffer();
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    Log(L"panel %u: window mode, compositor window at (%ld,%ld) %ux%u", panel.targetId, rc.left, rc.top, width, height);
+
+    EnableDebugPrivilege();
+    HANDLE driverProc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, shm->driverPid);
+    if (!driverProc)
+    {
+        Log(L"cannot open driver host process %lu: %lu", shm->driverPid, GetLastError());
+        DestroyWindow(hwnd);
+        CloseHandle(canPresent);
+        CloseHandle(fenceEvent);
+        return Outcome::Lost;
+    }
+    std::vector<FrameSource> src(p.regions.size());
+    std::vector<HANDLE> frameEvents(src.size());
+    for (int i = 0; i < (int)src.size(); i++)
+    {
+        src[i].index = (int)p.first + i;
+        frameEvents[i] = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+
+    LARGE_INTEGER freq, t0, now{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    UINT64 presents = 0, stalls = 0;
+    UINT64 pendingFence = 0;
+    bool presented = false;
+    ULONGLONG nextCheck = 0, nextStats = 0;
+    std::vector<LONG64> statsSeq(src.size());
+    std::vector<LONGLONG> presentQpc(64); // test runs: when each present was issued
+    ScanlineProbe scan;
+    UINT64 arrivalAt[11] = {}; // test runs: panel scanout position when frames arrive, in 10% steps + vblank
+    double presentMs = 0;  // test runs: time spent copying + presenting
+    UINT64 lateFlushes = 0; // test runs: frames presented only after waiting a refresh for the queue
+    LONGLONG busySince = 0;
+    const LONGLONG refreshTicks = freq.QuadPart / std::max(1, p.refresh);
+    if (deadline) scan.Open(GdiNameOfTarget(panel.adapter, panel.targetId), height);
+    UINT64 statsPresents = 0;
+    Outcome outcome = Outcome::Stop;
+
+    while (!ShouldExit())
+    {
+        Beat();
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+
+        // Follow the panel if the desktop layout moved it, and stay above other topmost windows
+        // (e.g. a secondary taskbar on the panel).
+        if (GetTickCount64() >= nextCheck)
+        {
+            nextCheck = GetTickCount64() + 500;
+            RECT cur{};
+            if (!PanelRect(panel.adapter, panel.targetId, cur))
+            {
+                Log(L"panel %u left the desktop", panel.targetId);
+                outcome = Outcome::Lost;
+                break;
+            }
+            if (!EqualRect(&cur, &rc))
+            {
+                rc = cur;
+                width = (UINT)(rc.right - rc.left);
+                height = (UINT)(rc.bottom - rc.top);
+                SetWindowPos(hwnd, HWND_TOPMOST, rc.left, rc.top, (int)width, (int)height, SWP_NOACTIVATE);
+                back = nullptr;
+                backRtv = nullptr;
+                winrt::check_hresult(swap->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT));
+                bindBackBuffer();
+                presented = false;
+                Log(L"panel %u moved to (%ld,%ld) %ux%u", panel.targetId, rc.left, rc.top, width, height);
+            }
+            else
+            {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+
+        if (pendingFence && fence->GetCompletedValue() < pendingFence)
+        {
+            stalls++;
+            fence->SetEventOnCompletion(pendingFence, fenceEvent);
+            WaitForSingleObject(fenceEvent, 100);
+        }
+        for (auto& s : src) s.Release(shm.get());
+        pendingFence = 0;
+
+        // Windows turned the split monitors off; it blanks the panel itself, as it is a desktop monitor.
+        if (!AnyVirtualSignal(shm.get(), p))
+        {
+            presented = false;
+            if (!Nap(100)) break;
+            if (deadline && GetTickCount64() >= deadline) break;
+            continue;
+        }
+
+        // Present as soon as a split monitor frame arrives, but only into an empty present queue. If the
+        // previous present is still waiting for its vblank, a new one would queue behind it and every
+        // later frame would then reach the screen one refresh late (a self-sustaining extra frame of
+        // latency). So a frame that finds the queue busy is skipped; the next one, a refresh later, finds
+        // it empty. If no next frame comes within a refresh, the pending one is presented anyway.
+        bool changed = !presented || FramesChanged(shm.get(), src);
+        bool ready = false;
+        LARGE_INTEGER tArrive;
+        QueryPerformanceCounter(&tArrive);
+        if (changed)
+        {
+            ready = WaitForSingleObject(canPresent, 0) == WAIT_OBJECT_0;
+            if (ready)
+            {
+                busySince = 0;
+            }
+            else if (!busySince)
+            {
+                busySince = tArrive.QuadPart;
+            }
+            else if (tArrive.QuadPart - busySince > refreshTicks)
+            {
+                WaitForSingleObject(canPresent, 100);
+                ready = true;
+                busySince = 0;
+                if (deadline) lateFlushes++;
+            }
+        }
+
+        if (ready)
+        {
+            if (deadline)
+            {
+                int at = scan.Percent();
+                if (at >= 0) arrivalAt[at / 10]++;
+            }
+            DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc, src, p.regions, back.get(), backRtv.get(), width, height);
+            ctx->Signal(fence.get(), ++fenceValue);
+            pendingFence = fenceValue;
+            LARGE_INTEGER presentAt;
+            QueryPerformanceCounter(&presentAt);
+            HRESULT hr = swap->Present(1, 0);
+            LARGE_INTEGER tDone;
+            QueryPerformanceCounter(&tDone);
+            presentMs += (tDone.QuadPart - tArrive.QuadPart) * 1000.0 / freq.QuadPart;
+            UINT presentId = 0;
+            if (deadline && SUCCEEDED(swap->GetLastPresentCount(&presentId))) presentQpc[presentId % presentQpc.size()] = presentAt.QuadPart;
+            if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+            {
+                Log(L"panel %u: GPU device lost (0x%08X)", panel.targetId, (UINT)hr);
+                outcome = Outcome::Lost;
+                break;
+            }
+            presents++;
+            presented = true;
+        }
+        else
+        {
+            // Sleep until a split monitor finishes its next frame: the driver signals the monitor's
+            // fence once per frame, so a new frame is picked up right away instead of at the next vblank.
+            // With a frame pending on a busy queue, look again every millisecond.
+            HANDLE wake[SD_MAX_MONITORS];
+            DWORD n = 0;
+            for (size_t k = 0; k < src.size(); k++)
+                if (src[k].fence && SUCCEEDED(src[k].fence->SetEventOnCompletion(src[k].fence->GetCompletedValue() + 1, frameEvents[k])))
+                    wake[n++] = frameEvents[k];
+            if (n) WaitForMultipleObjects(n, wake, FALSE, changed ? 1 : 20);
+            else Sleep(changed ? 1 : 2);
+        }
+
+        // Test runs report the frame rates every 10 s: split monitor frames in, presents out.
+        if (deadline && GetTickCount64() >= nextStats)
+        {
+            LONG64 busiest = 0;
+            for (size_t k = 0; k < src.size(); k++)
+            {
+                LONG64 seq = shm->mon[src[k].index].frameSeq;
+                busiest = std::max(busiest, seq - statsSeq[k]);
+                statsSeq[k] = seq;
+            }
+            // Present -> start of scanout of the last present the display reports.
+            double toScreenMs = -1;
+            DXGI_FRAME_STATISTICS fs{};
+            if (SUCCEEDED(swap->GetFrameStatistics(&fs)) && fs.SyncQPCTime.QuadPart && presentQpc[fs.PresentCount % presentQpc.size()])
+                toScreenMs = (fs.SyncQPCTime.QuadPart - presentQpc[fs.PresentCount % presentQpc.size()]) * 1000.0 / freq.QuadPart;
+            if (nextStats)
+            {
+                wchar_t hist[160] = {};
+                for (int b = 0; b < 11; b++)
+                    swprintf_s(hist + wcslen(hist), 160 - wcslen(hist), L" %llu", arrivalAt[b]);
+                UINT64 n = std::max<UINT64>(1, presents - statsPresents);
+                Log(L"panel %u: busiest split monitor %.1f frames/s, %.1f presents/s, present->scanout %.1f ms, late flushes %llu, copy+present %.2f ms, presents at scanout 0-10%%..90-100%%,vblank:%s",
+                    panel.targetId, busiest / 10.0, (presents - statsPresents) / 10.0, toScreenMs, lateFlushes, presentMs / n, hist);
+            }
+            memset(arrivalAt, 0, sizeof(arrivalAt));
+            presentMs = 0;
+            lateFlushes = 0;
+            statsPresents = presents;
+            nextStats = GetTickCount64() + 10000;
+        }
+
+        if (deadline && GetTickCount64() >= deadline) break;
+    }
+
+    if (pendingFence)
+    {
+        fence->SetEventOnCompletion(pendingFence, fenceEvent);
+        WaitForSingleObject(fenceEvent, 250);
+    }
+    for (auto& s : src)
+    {
+        s.Release(shm.get());
+        s.Drop();
+    }
+    QueryPerformanceCounter(&now);
+    double total = (double)(now.QuadPart - t0.QuadPart) / freq.QuadPart;
+    Log(L"panel %u composited %.1fs in window mode: %llu presents (%.2f/s), %llu copy stalls", panel.targetId, total, presents,
+        presents / std::max(total, 0.001), stalls);
+
+    CloseHandle(driverProc);
+    CloseHandle(fenceEvent);
+    for (auto e : frameEvents) CloseHandle(e);
+    CloseHandle(canPresent);
+    DestroyWindow(hwnd);
+    return outcome;
+}
+
+#pragma endregion
+
 // One panel's thread: composite, sit out display power-off, repeat.
 static Outcome PanelWorker(SharedView& shm, const PanelSession& p, ULONGLONG deadline)
 {
     try
     {
         winrt::init_apartment();
+        if (g_windowMode) return CompositeWindow(shm, p, deadline);
         for (;;)
         {
             Outcome o = Composite(shm, p, deadline);
@@ -832,11 +1386,16 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
 
     // Where every other display sits now, so they can be put back after the desktop changes.
     std::vector<PlacedDisplay> others;
+    std::vector<RECT> otherRects;
     for (auto& t : EnumTargets())
     {
         bool mine = false;
         for (auto& p : ps) mine |= SameTarget(p.target, t);
-        if (t.active && !t.isVirtual && !mine) others.push_back({ t.monitorDevicePath, t.position });
+        if (t.active && !t.isVirtual && !mine)
+        {
+            others.push_back({ t.monitorDevicePath, t.position });
+            otherRects.push_back({ t.position.x, t.position.y, t.position.x + (LONG)t.width, t.position.y + (LONG)t.height });
+        }
     }
 
     SdConfig cfg{};
@@ -898,19 +1457,62 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     }
     Beat();
 
-    for (auto& p : ps)
+    if (g_windowMode)
     {
-        LONG r = SetSpecialization(p.target.adapter, p.target.targetId, true);
-        Log(L"panel '%s' removed from desktop -> %ld", p.cfg.name.c_str(), r);
-        if (r != ERROR_SUCCESS) throw std::runtime_error("could not remove a panel from the desktop");
+        // Windows restores the layout it saved for this set of monitors, which can switch a panel off
+        // (e.g. one saved by an exclusive-mode session). Window mode needs the panels on the desktop.
+        for (auto& p : ps)
+        {
+            // Right after the split monitors appear, Windows may still refuse (ERROR_GEN_FAILURE): retry.
+            for (int i = 0; i < 20 && !TargetActive(p.target.adapter, p.target.targetId); i++)
+            {
+                if (i % 4 == 0) ActivateMonitors({ p.target.friendlyName });
+                if (!Nap(250)) return true;
+            }
+            if (!TargetActive(p.target.adapter, p.target.targetId)) throw std::runtime_error("could not put a panel back on the desktop");
+        }
+
+        // The panels stay on the desktop: park them one after another off the bottom-right corner of
+        // everything else, so each touches the rest of the desktop at a single corner only.
+        RECT box = desktop[0];
+        for (auto& r : desktop) UnionRect(&box, &box, &r);
+        for (auto& r : otherRects) UnionRect(&box, &box, &r);
+        POINT park{ box.right, box.bottom };
+        for (auto& p : ps)
+        {
+            others.push_back({ p.target.monitorDevicePath, park });
+            Log(L"panel '%s' parked at (%ld,%ld)", p.cfg.name.c_str(), park.x, park.y);
+            park.x += (LONG)p.target.width;
+            park.y += (LONG)p.target.height;
+        }
     }
-    for (auto& p : ps)
-        for (int i = 0; i < 40 && TargetActive(p.target.adapter, p.target.targetId); i++)
-            if (!Nap(250)) return true;
+    else
+    {
+        for (auto& p : ps)
+        {
+            LONG r = SetSpecialization(p.target.adapter, p.target.targetId, true);
+            Log(L"panel '%s' removed from desktop -> %ld", p.cfg.name.c_str(), r);
+            if (r != ERROR_SUCCESS) throw std::runtime_error("could not remove a panel from the desktop");
+        }
+        for (auto& p : ps)
+            for (int i = 0; i < 40 && TargetActive(p.target.adapter, p.target.targetId); i++)
+                if (!Nap(250)) return true;
+    }
     // The split monitors take each panel's place in the desktop; everything else stays put.
     for (int i = 0; i < 10 && !ArrangeMonitors(desktop, others); i++)
         if (!Nap(300)) return true;
+    // Moving a panel can make Windows fall back to 60 Hz; it must run at the rate of its split monitors.
+    if (g_windowMode)
+        for (auto& p : ps) ForceRefresh({ p.target.friendlyName }, p.refresh);
     WriteRuntime(ps);
+
+    GuardRun guard;
+    if (g_windowMode)
+    {
+        g_parked.clear();
+        for (auto& p : ps) g_parked.push_back({ p.target.adapter, p.target.targetId, desktop[p.first] });
+        guard.Start();
+    }
 
     // One thread per panel, each paced by its own panel's vblank.
     g_abort = false;
@@ -945,6 +1547,15 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
             // If Windows keeps undoing it, stop fighting for this minute.
             for (auto& p : ps)
                 if (corrections < 5 && KeepGroupAligned(p.first, p.regions)) corrections++;
+            for (auto& p : ps)
+            {
+                if (!g_windowMode || corrections >= 5) break;
+                int hz = CurrentRefreshOf(p.target.friendlyName);
+                if (!hz || std::abs(hz - p.refresh) <= 1) continue;
+                Log(L"parked panel '%s' runs at %d Hz, switching it back to %d Hz", p.cfg.name.c_str(), hz, p.refresh);
+                ForceRefresh({ p.target.friendlyName }, p.refresh);
+                corrections++;
+            }
 
             // A split monitor's refresh rate was changed (e.g. in Settings): the whole panel follows.
             for (auto& p : ps)
@@ -981,6 +1592,7 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
         Sleep(100);
     }
     for (auto& w : workers) w.join();
+    guard.Stop();
     if (g_restart) return false; // caller reverts and starts over without counting a failure
     for (auto r : results)
         if (r == Outcome::Lost) return false;
@@ -1067,6 +1679,10 @@ static int CmdRun(DWORD testSeconds)
             watchdogArmed = true;
         }
 
+        g_windowMode = ChooseWindowMode();
+        Log(L"mode: %s", g_windowMode ? (SpecializedDisplaysLicensed() ? L"window (config.ini)" : L"window (this Windows edition cannot own a display)")
+                                      : L"exclusive");
+
         bool stopped = false;
         try
         {
@@ -1081,6 +1697,7 @@ static int CmdRun(DWORD testSeconds)
             Log(L"error: %S", e.what());
         }
         RevertTargets(Keys(sessionTargets));
+        g_abort = false; // a lost panel ended that session only; otherwise Nap() below would end the run
         if (stopped || StopRequested() || (deadline && GetTickCount64() >= deadline)) break;
         if (g_restart)
         {
