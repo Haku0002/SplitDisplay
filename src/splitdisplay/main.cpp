@@ -22,6 +22,7 @@
 #include <dwmapi.h>
 #include <dxgi1_6.h>
 #include <slpublic.h>
+#include <WtsApi32.h>
 #include <winternl.h> // NTSTATUS for d3dkmthk.h
 #include <d3dkmthk.h>
 
@@ -133,6 +134,23 @@ static bool SpecializedDisplaysLicensed()
 {
     DWORD enabled = 0;
     return SUCCEEDED(SLGetWindowsInformationDWORD(L"Display-Specialized-Displays-Enabled", &enabled)) && enabled != 0;
+}
+
+// True while this session is locked: the lock screen and the sign-in screen after it run on the
+// Winlogon desktop, which only SYSTEM may draw on. A window-mode compositor cannot put anything
+// there, so its panel would stay black until the user signs in.
+static bool SessionLocked()
+{
+    WTSINFOEXW* info = nullptr;
+    DWORD bytes = 0;
+    bool locked = false;
+    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx, (LPWSTR*)&info, &bytes) && info)
+    {
+        // SessionFlags is WTS_SESSIONSTATE_LOCK (0) or WTS_SESSIONSTATE_UNLOCK (1), not a bit mask.
+        if (info->Level == 1) locked = info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
+        WTSFreeMemory(info);
+    }
+    return locked;
 }
 
 // config.ini [SplitDisplay] mode = auto (default) | exclusive | window
@@ -1630,10 +1648,25 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     // Beat only while every worker is alive, so a hung panel thread trips the watchdog.
     // Every 2 s, glue each panel's monitors back together if Windows moved them apart.
     ULONGLONG nextAlign = GetTickCount64() + 2000;
+    ULONGLONG nextLock = 0;
     int corrections = 0;
     ULONGLONG correctionWindow = 0;
     for (;;)
     {
+        // The session was locked (Win+L, or the sign-in screen that follows an automatic logon).
+        // A window-mode panel would go black there, so end the session and give the panel back
+        // whole; the next one starts once the user has signed in again.
+        if (g_windowMode && !g_restart && GetTickCount64() >= nextLock)
+        {
+            nextLock = GetTickCount64() + 500;
+            if (SessionLocked())
+            {
+                Log(L"session locked: giving the panels back until it is unlocked");
+                g_restart = true;
+                g_abort = true;
+            }
+        }
+
         if (GetTickCount64() >= nextAlign)
         {
             nextAlign = GetTickCount64() + 2000;
@@ -1778,6 +1811,21 @@ static int CmdRun(DWORD testSeconds)
         }
 
         g_windowMode = ChooseWindowMode();
+
+        // Nothing of a window-mode split reaches the panel while the session is locked, so leave the
+        // displays whole until the user has signed in: the lock and sign-in screens then show on them
+        // as ordinary monitors. Exclusive mode scans the panel out itself, whatever desktop is up.
+        if (g_windowMode && SessionLocked())
+        {
+            Log(L"session locked: leaving the displays whole until it is unlocked");
+            while (SessionLocked())
+                if (!Nap(200)) break;
+            if (ShouldExit()) break;
+            Log(L"session unlocked");
+            if (!Nap(1500)) break; // let Windows finish restoring the desktop first
+            continue;
+        }
+
         Log(L"mode: %s", g_windowMode ? (SpecializedDisplaysLicensed() ? L"window (config.ini)" : L"window (this Windows edition cannot own a display)")
                                       : L"exclusive");
 
@@ -1801,7 +1849,7 @@ static int CmdRun(DWORD testSeconds)
         if (g_restart)
         {
             g_restart = false;
-            Log(L"restarting the split with the new settings");
+            Log(L"restarting the split");
             continue;
         }
 
