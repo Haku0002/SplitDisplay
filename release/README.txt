@@ -36,6 +36,10 @@ Requirements
   stays on the desktop, parked in a corner, and a window on it shows the split
   monitors. NVIDIA App's RTX Dynamic Vibrance treats that window like a game
   and washes out its colors: turn it off for splitdisplay.exe in NVIDIA App.
+  In window mode the split also steps aside whenever Windows shows another
+  desktop -- the lock and sign-in screens, Ctrl+Alt+Del, and prompts that
+  programs raise on a desktop of their own -- so those stay visible on the
+  display; your windows are put back where they were a moment afterwards.
   Developed and tested on an NVIDIA RTX 4060. AMD and Intel should work but are untested.
 
 Source, issues and details: https://github.com/brkDOTstl/SplitDisplay
