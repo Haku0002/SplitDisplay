@@ -153,6 +153,30 @@ static bool SessionLocked()
     return locked;
 }
 
+// True while Windows shows the desktop this process runs on. Ctrl+Alt+Del, a UAC prompt on the secure
+// desktop and confirmation dialogs that programs raise on a desktop of their own all switch away from
+// it; a secure desktop cannot even be opened from here (access denied).
+static bool OnInputDesktop()
+{
+    HDESK in = OpenInputDesktop(0, FALSE, GENERIC_READ);
+    if (!in) return false;
+    wchar_t shown[64] = {}, mine[64] = {};
+    DWORD len = 0;
+    bool same = GetUserObjectInformationW(in, UOI_NAME, shown, sizeof(shown), &len) &&
+                GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, mine, sizeof(mine), &len) && _wcsicmp(shown, mine) == 0;
+    CloseDesktop(in);
+    return same;
+}
+
+// Why a window-mode compositor cannot reach its panels right now, or nullptr if it can. Its window
+// only shows on its own desktop, and not even there while the lock screen is up.
+static const wchar_t* HiddenReason()
+{
+    if (SessionLocked()) return L"session locked";
+    if (!OnInputDesktop()) return L"another desktop is up (Ctrl+Alt+Del or a secure prompt)";
+    return nullptr;
+}
+
 // config.ini [SplitDisplay] mode = auto (default) | exclusive | window
 static bool ChooseWindowMode()
 {
@@ -1113,6 +1137,115 @@ static void GuardThread()
     if (hook) UnhookWindowsHookEx(hook);
 }
 
+// A session that ends because the desktop went away (lock screen, Ctrl+Alt+Del, a prompt on its own
+// desktop) unplugs the split monitors, and Windows piles every window onto the one display left
+// behind. Their placement is taken first and applied again once the split is back, so an
+// interruption costs a flicker instead of the arrangement the user had set up.
+struct SavedWindow
+{
+    HWND hwnd;
+    RECT rect;      // where to put it back, in screen coordinates
+    bool maximized; // then maximize it there again
+};
+static std::vector<SavedWindow> g_savedWindows;
+
+static bool ArrangeableWindow(HWND hwnd)
+{
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return false;
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    for (auto* shell : { L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", kCompositorClass })
+        if (wcscmp(cls, shell) == 0) return false;
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return false;
+    return true;
+}
+
+// Everything is kept in screen coordinates. WINDOWPLACEMENT's rectangle is relative to the primary
+// monitor's work area instead, and that work area is not back yet when the windows are put back
+// (the taskbar is still being rebuilt), which would shift every window by the taskbar's size.
+static void SaveWindowLayout()
+{
+    g_savedWindows.clear();
+    RECT work{};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) work = {};
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        if (!ArrangeableWindow(hwnd)) return TRUE;
+        RECT rc;
+        if (!GetWindowRect(hwnd, &rc)) return TRUE;
+        WINDOWPLACEMENT wp{ sizeof(wp) };
+        bool maximized = GetWindowPlacement(hwnd, &wp) && wp.showCmd == SW_SHOWMAXIMIZED;
+        if (maximized)
+        {
+            // Its screen rectangle is the whole monitor; the restored one says where to maximize it.
+            const RECT& work = *(const RECT*)lp;
+            rc = wp.rcNormalPosition;
+            OffsetRect(&rc, work.left, work.top);
+        }
+        g_savedWindows.push_back({ hwnd, rc, maximized });
+        return TRUE;
+    }, (LPARAM)&work);
+    Log(L"noted where %zu windows sit", g_savedWindows.size());
+}
+
+// Runs on its own thread, so a slow application cannot hold up the split that has just come back.
+// A maximized window is placed while restored first, so it maximizes on the right monitor.
+static void RestoreWindowLayout()
+{
+    if (g_savedWindows.empty()) return;
+    auto saved = std::move(g_savedWindows);
+    g_savedWindows.clear();
+    HWND front = GetForegroundWindow();
+    std::thread([saved = std::move(saved), front] {
+        Sleep(150); // let Windows settle the split monitors it has just placed
+        auto alive = [](HWND hwnd) { return IsWindow(hwnd) && IsWindowVisible(hwnd); };
+        // Restored first, so the move below decides which monitor each one ends up on.
+        for (auto& w : saved)
+            if (alive(w.hwnd) && IsZoomed(w.hwnd)) ShowWindowAsync(w.hwnd, SW_RESTORE);
+        Sleep(80);
+
+        // Asked asynchronously and checked afterwards: an application still laying itself out after
+        // the monitor change can take a moment to accept a move, or undo it once, and a synchronous
+        // call would make every other window wait for the slowest one. Each window leaves the rounds
+        // as soon as it is in place, so the pass ends with the last window that moves.
+        struct Pending
+        {
+            const SavedWindow* w;
+            int tries;
+        };
+        std::vector<Pending> pending;
+        for (auto& w : saved) pending.push_back({ &w, 0 });
+
+        int moved = 0, zoomed = 0;
+        while (!pending.empty())
+        {
+            for (auto& p : pending)
+                if (alive(p.w->hwnd))
+                    SetWindowPos(p.w->hwnd, nullptr, p.w->rect.left, p.w->rect.top, p.w->rect.right - p.w->rect.left,
+                        p.w->rect.bottom - p.w->rect.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+            Sleep(120);
+            for (auto it = pending.begin(); it != pending.end();)
+            {
+                RECT now;
+                bool gone = !alive(it->w->hwnd);
+                bool there = !gone && GetWindowRect(it->w->hwnd, &now) && EqualRect(&now, &it->w->rect);
+                if (there) moved++;
+                // One that will not take the move (a system window, or one that places itself) is
+                // given up on rather than holding the pass up.
+                if (gone || there || ++it->tries >= 4) it = pending.erase(it);
+                else ++it;
+            }
+        }
+        Sleep(120);
+        // ShowWindow, not a posted SW_MAXIMIZE: some applications ignore that one.
+        for (auto& w : saved)
+            if (w.maximized && alive(w.hwnd) && ShowWindow(w.hwnd, SW_MAXIMIZE) >= 0) zoomed++;
+        if (front && IsWindow(front)) SetForegroundWindow(front);
+        Log(L"put %d windows back where they were (%d maximized)", moved, zoomed);
+    }).detach();
+}
+
 struct GuardRun
 {
     std::thread thread;
@@ -1629,6 +1762,8 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
         for (auto& p : ps) g_parked.push_back({ PanelLocator{ p.target.adapter, p.target.targetId }, VirtualName(p.first), desktop[p.first] });
         guard.Start();
     }
+    // The split is back: undo the pile-up Windows made of the windows while it was gone.
+    RestoreWindowLayout();
 
     // One thread per panel, each paced by its own panel's vblank.
     g_abort = false;
@@ -1648,20 +1783,26 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     // Beat only while every worker is alive, so a hung panel thread trips the watchdog.
     // Every 2 s, glue each panel's monitors back together if Windows moved them apart.
     ULONGLONG nextAlign = GetTickCount64() + 2000;
-    ULONGLONG nextLock = 0;
+    ULONGLONG nextVisible = 0;
+    int hiddenPolls = 0;
     int corrections = 0;
     ULONGLONG correctionWindow = 0;
     for (;;)
     {
-        // The session was locked (Win+L, or the sign-in screen that follows an automatic logon).
-        // A window-mode panel would go black there, so end the session and give the panel back
-        // whole; the next one starts once the user has signed in again.
-        if (g_windowMode && !g_restart && GetTickCount64() >= nextLock)
+        // The session was locked, or Windows switched to another desktop (Ctrl+Alt+Del, a secure
+        // prompt). A window-mode panel would stay black meanwhile, so end the session and give the
+        // panels back whole; the next one starts once the desktop is back. Two polls in a row, so a
+        // single failed query cannot tear the split down.
+        if (g_windowMode && !g_restart && GetTickCount64() >= nextVisible)
         {
-            nextLock = GetTickCount64() + 500;
-            if (SessionLocked())
+            nextVisible = GetTickCount64() + 150;
+            const wchar_t* why = HiddenReason();
+            hiddenPolls = why ? hiddenPolls + 1 : 0;
+            // Held briefly, so a prompt that is dismissed right away costs nothing.
+            if (hiddenPolls >= 4)
             {
-                Log(L"session locked: giving the panels back until it is unlocked");
+                Log(L"%s: giving the panels back meanwhile", why);
+                SaveWindowLayout();
                 g_restart = true;
                 g_abort = true;
             }
@@ -1812,17 +1953,18 @@ static int CmdRun(DWORD testSeconds)
 
         g_windowMode = ChooseWindowMode();
 
-        // Nothing of a window-mode split reaches the panel while the session is locked, so leave the
-        // displays whole until the user has signed in: the lock and sign-in screens then show on them
-        // as ordinary monitors. Exclusive mode scans the panel out itself, whatever desktop is up.
-        if (g_windowMode && SessionLocked())
+        // Nothing of a window-mode split reaches the panel while the session is locked or another
+        // desktop is up, so leave the displays whole until the desktop is back: the lock screen, the
+        // sign-in screen and secure prompts then show on them as on ordinary monitors. Exclusive mode
+        // scans the panel out itself, whatever desktop is up.
+        if (const wchar_t* why = g_windowMode ? HiddenReason() : nullptr)
         {
-            Log(L"session locked: leaving the displays whole until it is unlocked");
-            while (SessionLocked())
-                if (!Nap(200)) break;
-            if (ShouldExit()) break;
-            Log(L"session unlocked");
-            if (!Nap(1500)) break; // let Windows finish restoring the desktop first
+            Log(L"%s: leaving the displays whole meanwhile", why);
+            while (HiddenReason() && !(deadline && GetTickCount64() >= deadline))
+                if (!Nap(100)) break;
+            if (ShouldExit() || (deadline && GetTickCount64() >= deadline)) break;
+            Log(L"desktop back");
+            if (!Nap(150)) break; // the panel rescan below gives Windows the rest of its moment
             continue;
         }
 
