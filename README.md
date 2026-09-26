@@ -89,6 +89,11 @@ There SplitDisplay switches to **window mode** automatically:
   frame and nothing queues up, whatever the timing between the split monitors and the panel.
 - A guard keeps the cursor off the parked panel (a low-level mouse hook plus a position check) and moves application
   windows that end up there back to the panel's first split monitor.
+- While the session is locked, the split is undone and every display is handed back whole; it returns a second after
+  unlocking. The lock screen and the sign-in screen after it run on the Windows secure desktop, which only SYSTEM may
+  draw on, so the compositor window shows nothing while they are up and the parked panel would stay black. This also
+  covers the sign-in screen at boot on machines that sign in automatically and lock right away (ARSO): the panel would
+  otherwise be black from power-on until the password is typed.
 
 Window mode is experimental. Because Windows scans the window out like a fullscreen game, GPU vendor game filters
 apply to it: with NVIDIA App's RTX Dynamic Vibrance (or RTX HDR) on, the split monitors look washed out and
@@ -196,8 +201,9 @@ Taking over your only display is risky, so there are several layers of protectio
 ## Limitations and ideas
 
 - About one frame of extra latency. No VRR/G-Sync or HDR yet.
-- The login screen before sign-in shows the panel as a single display. The split starts at logon. Running the
-  compositor as a service in the console session would fix this.
+- The sign-in and lock screens are never split: the compositor starts at logon, and in window mode it steps aside
+  while the session is locked, so the displays are whole there. Running it as a service in the console session, with
+  an agent on the secure desktop, would split those screens too — the split monitors already receive them.
 - Hardware-DRM video may be black on the virtual monitors.
 - Changing the layout re-plugs the virtual monitors, so the screen flickers for a second and Windows re-places
   windows.
