@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cwctype>
 
@@ -95,13 +96,46 @@ std::wstring LoadConfigValue(const wchar_t* key)
     return buf;
 }
 
+// Writes to an INI file through a temp copy + atomic replace. config.ini is read by other
+// processes (the running compositor, the settings window) all the time; rewriting it in
+// place section by section let a reader observe a half-written file (new panel count,
+// panels not yet written). Falls back to in-place writes if the copy fails.
+struct AtomicIni
+{
+    std::wstring path;
+    std::wstring temp;
+    bool staged = false;
+
+    explicit AtomicIni(std::wstring target) : path(std::move(target))
+    {
+        temp = path + L".tmp" + std::to_wstring(GetCurrentProcessId());
+        staged = CopyFileW(path.c_str(), temp.c_str(), FALSE) != FALSE || GetLastError() == ERROR_FILE_NOT_FOUND;
+    }
+    ~AtomicIni()
+    {
+        if (staged) DeleteFileW(temp.c_str());
+    }
+    const wchar_t* File() const { return staged ? temp.c_str() : path.c_str(); }
+    bool Commit()
+    {
+        if (!staged) return true; // wrote in place already
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, temp.c_str()); // flush the profile cache
+        bool ok = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES
+            ? ReplaceFileW(path.c_str(), temp.c_str(), nullptr, REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr) != FALSE
+            : MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+        if (ok) staged = false;
+        return ok;
+    }
+};
+
 bool SaveConfigValue(const wchar_t* key, const std::wstring& value)
 {
     wchar_t dir[MAX_PATH];
     ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay", dir, MAX_PATH);
     CreateDirectoryW(dir, nullptr);
+    AtomicIni ini(ConfigPath());
     // Quoted so leading/trailing spaces (EDID names) survive.
-    return WritePrivateProfileStringW(L"SplitDisplay", key, (L"\"" + value + L"\"").c_str(), ConfigPath().c_str()) != FALSE;
+    return WritePrivateProfileStringW(L"SplitDisplay", key, (L"\"" + value + L"\"").c_str(), ini.File()) != FALSE && ini.Commit();
 }
 
 #pragma region Panel selection
@@ -130,14 +164,32 @@ std::vector<PanelConfig> LoadPanels()
     for (int i = 1; i <= count && i <= 16; i++)
     {
         std::wstring sec = L"Panel" + std::to_wstring(i);
-        PanelConfig c{ ReadIni(sec.c_str(), L"id"), Trim(ReadIni(sec.c_str(), L"name")), ReadIni(sec.c_str(), L"layout"),
-            _wtoi(ReadIni(sec.c_str(), L"refresh").c_str()) };
+        PanelConfig c;
+        c.id = ReadIni(sec.c_str(), L"id");
+        c.name = Trim(ReadIni(sec.c_str(), L"name"));
+        c.layout = ReadIni(sec.c_str(), L"layout");
+        // refresh_mhz (v0.4+) supersedes the whole-Hz refresh key.
+        c.refreshMilliHz = _wtoi(ReadIni(sec.c_str(), L"refresh_mhz").c_str());
+        if (!c.refreshMilliHz) c.refreshMilliHz = _wtoi(ReadIni(sec.c_str(), L"refresh").c_str()) * 1000;
+        {
+            std::wstring s = ReadIni(sec.c_str(), L"scales");
+            for (size_t at = 0; at < s.size();)
+            {
+                size_t comma = s.find(L',', at);
+                c.scales.push_back(_wtoi(s.substr(at, comma == std::wstring::npos ? comma : comma - at).c_str()));
+                if (comma == std::wstring::npos) break;
+                at = comma + 1;
+            }
+        }
         if (!c.id.empty() || !c.name.empty()) out.push_back(c);
     }
     if (count == 0)
     {
         // v0.1: one panel in the [SplitDisplay] section.
-        PanelConfig c{ ReadIni(L"SplitDisplay", L"panel_id"), Trim(ReadIni(L"SplitDisplay", L"panel")), ReadIni(L"SplitDisplay", L"layout") };
+        PanelConfig c;
+        c.id = ReadIni(L"SplitDisplay", L"panel_id");
+        c.name = Trim(ReadIni(L"SplitDisplay", L"panel"));
+        c.layout = ReadIni(L"SplitDisplay", L"layout");
         if (!c.id.empty() || !c.name.empty()) out.push_back(c);
     }
     return out;
@@ -145,21 +197,33 @@ std::vector<PanelConfig> LoadPanels()
 
 void SavePanels(const std::vector<PanelConfig>& panels)
 {
-    SaveConfigValue(L"panels", std::to_wstring(panels.size()));
-    auto path = ConfigPath();
+    wchar_t dir[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay", dir, MAX_PATH);
+    CreateDirectoryW(dir, nullptr);
+    AtomicIni ini(ConfigPath());
+    const wchar_t* path = ini.File();
     for (int i = 1; i <= 16; i++)
     {
         std::wstring sec = L"Panel" + std::to_wstring(i);
-        WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, path.c_str()); // drop the whole section
+        WritePrivateProfileStringW(sec.c_str(), nullptr, nullptr, path); // drop the whole section
         if (i > (int)panels.size()) continue;
         const auto& c = panels[i - 1];
-        WritePrivateProfileStringW(sec.c_str(), L"id", (L"\"" + c.id + L"\"").c_str(), path.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"name", (L"\"" + c.name + L"\"").c_str(), path.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"layout", (L"\"" + c.layout + L"\"").c_str(), path.c_str());
-        WritePrivateProfileStringW(sec.c_str(), L"refresh", std::to_wstring(c.refresh).c_str(), path.c_str());
+        WritePrivateProfileStringW(sec.c_str(), L"id", (L"\"" + c.id + L"\"").c_str(), path);
+        WritePrivateProfileStringW(sec.c_str(), L"name", (L"\"" + c.name + L"\"").c_str(), path);
+        WritePrivateProfileStringW(sec.c_str(), L"layout", (L"\"" + c.layout + L"\"").c_str(), path);
+        WritePrivateProfileStringW(sec.c_str(), L"refresh_mhz", std::to_wstring(c.refreshMilliHz).c_str(), path);
+        // Kept in whole Hz so an older build still finds a sane rate after a downgrade.
+        WritePrivateProfileStringW(sec.c_str(), L"refresh", std::to_wstring((c.refreshMilliHz + 500) / 1000).c_str(), path);
+        std::wstring scales;
+        for (int s : c.scales) scales += (scales.empty() ? L"" : L",") + std::to_wstring(s);
+        WritePrivateProfileStringW(sec.c_str(), L"scales", scales.c_str(), path);
     }
+    // The count goes last: even on the in-place fallback path a concurrent reader sees the
+    // old count with complete old sections, never the new count with missing ones.
+    WritePrivateProfileStringW(L"SplitDisplay", L"panels", (L"\"" + std::to_wstring(panels.size()) + L"\"").c_str(), path);
     // Retire the v0.1 keys once migrated.
-    for (const wchar_t* key : { L"panel_id", L"panel", L"layout" }) WritePrivateProfileStringW(L"SplitDisplay", key, nullptr, path.c_str());
+    for (const wchar_t* key : { L"panel_id", L"panel", L"layout" }) WritePrivateProfileStringW(L"SplitDisplay", key, nullptr, path);
+    ini.Commit();
 }
 
 bool Matches(const PanelConfig& c, const PanelTarget& t)
@@ -172,7 +236,10 @@ bool Matches(const PanelConfig& c, const PanelTarget& t)
 
 PanelConfig ConfigFor(const PanelTarget& t)
 {
-    return { t.monitorDevicePath, Trim(t.friendlyName), L"", 0 };
+    PanelConfig c;
+    c.id = t.monitorDevicePath;
+    c.name = Trim(t.friendlyName);
+    return c;
 }
 
 std::vector<PanelConfig> SelectedPanels()
@@ -185,14 +252,17 @@ void ParsePanelOption(int& argc, wchar_t** argv)
     for (int i = 1; i + 1 < argc; i++)
     {
         if (_wcsicmp(argv[i], L"--panel") != 0) continue;
-        g_override = { PanelConfig{ L"", Trim(argv[i + 1]), L"", 0 } };
+        PanelConfig named;
+        named.name = Trim(argv[i + 1]);
+        g_override = { named };
         // Keep the layout configured for that display, if any.
         for (auto& c : LoadPanels())
         {
             if (_wcsnicmp(c.name.c_str(), g_override[0].name.c_str(), g_override[0].name.size()) == 0)
             {
                 g_override[0].layout = c.layout;
-                g_override[0].refresh = c.refresh;
+                g_override[0].refreshMilliHz = c.refreshMilliHz;
+                g_override[0].scales = c.scales;
             }
         }
         g_hasOverride = true;
@@ -319,12 +389,25 @@ std::vector<PanelTarget> EnumTargets()
         {
             if (!dt.IsConnected()) continue;
             auto id = dt.Adapter().Id();
-            bool known = false;
-            for (auto& e : out)
-                if (e.adapter.LowPart == id.LowPart && e.adapter.HighPart == id.HighPart && e.targetId == dt.AdapterRelativeId()) known = true;
-            if (known) continue;
             auto monitor = dt.TryGetMonitor();
             if (!monitor) continue;
+            UINT32 wmm = 0, hmm = 0;
+            if (auto phys = monitor.PhysicalSizeInInches())
+            {
+                auto v = phys.Value();
+                wmm = (UINT32)(v.Width * 25.4 + 0.5);
+                hmm = (UINT32)(v.Height * 25.4 + 0.5);
+            }
+            bool known = false;
+            for (auto& e : out)
+                if (e.adapter.LowPart == id.LowPart && e.adapter.HighPart == id.HighPart && e.targetId == dt.AdapterRelativeId())
+                {
+                    known = true;
+                    // CCD has no physical size; DisplayCore's monitor object is the only source.
+                    e.widthMm = wmm;
+                    e.heightMm = hmm;
+                }
+            if (known) continue;
             PanelTarget t;
             t.adapter = { id.LowPart, id.HighPart };
             t.targetId = dt.AdapterRelativeId();
@@ -333,6 +416,8 @@ std::vector<PanelTarget> EnumTargets()
             auto native = monitor.NativeResolutionInRawPixels();
             t.width = (UINT32)native.Width;
             t.height = (UINT32)native.Height;
+            t.widthMm = wmm;
+            t.heightMm = hmm;
             switch (monitor.PhysicalConnector())
             {
             case winrt::Windows::Devices::Display::DisplayMonitorPhysicalConnectorKind::Hdmi: t.connector = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI; break;
@@ -351,7 +436,7 @@ std::vector<PanelTarget> EnumTargets()
     return out;
 }
 
-std::vector<int> SupportedRefreshRates(const PanelTarget& t)
+std::vector<int> SupportedRefreshRatesMilli(const PanelTarget& t)
 {
     std::vector<int> rates;
     if (t.gdiName.empty() || !t.width) return rates;
@@ -360,10 +445,26 @@ std::vector<int> SupportedRefreshRates(const PanelTarget& t)
     for (DWORD i = 0; EnumDisplaySettingsW(t.gdiName.c_str(), i, &dm); i++)
     {
         if (dm.dmPelsWidth != t.width || dm.dmPelsHeight != t.height || dm.dmDisplayFrequency <= 1) continue;
-        int hz = (int)dm.dmDisplayFrequency;
-        if (std::find(rates.begin(), rates.end(), hz) == rates.end()) rates.push_back(hz);
+        int milli = (int)dm.dmDisplayFrequency * 1000;
+        if (std::find(rates.begin(), rates.end(), milli) == rates.end()) rates.push_back(milli);
+    }
+    // The current mode's exact rate is known from CCD as a rational; DEVMODE would round
+    // 59.94 to 59 or 60, and pacing the virtual monitors at either drifts against the panel.
+    int currentMilli = (int)std::lround(t.refreshHz * 1000);
+    if (currentMilli > 1000)
+    {
+        int closest = ClosestRate(rates, currentMilli);
+        if (std::abs(closest - currentMilli) < 1000)
+        {
+            std::replace(rates.begin(), rates.end(), closest, currentMilli);
+        }
+        else if (std::find(rates.begin(), rates.end(), currentMilli) == rates.end())
+        {
+            rates.push_back(currentMilli);
+        }
     }
     std::sort(rates.rbegin(), rates.rend());
+    rates.erase(std::unique(rates.begin(), rates.end()), rates.end());
     return rates;
 }
 

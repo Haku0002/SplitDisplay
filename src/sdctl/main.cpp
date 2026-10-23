@@ -122,21 +122,24 @@ static int Plug(int argc, wchar_t** argv)
     // Default: two halves of the panel. "plug W H HZ" plugs two monitors of W x H.
     SdConfig cfg{};
     cfg.count = 2;
-    SdMonitorConfig m{ 2560, 1440, 100, 0, {} };
+    SdMonitorConfig m{ 2560, 1440, 100000, 0, {}, 0, 0 };
     auto panels = SelectedPanels();
     if (auto p = panels.empty() ? AutodetectPanel() : FindTarget(panels[0]))
     {
         cfg.renderAdapter = p->adapter;
         if (p->width && p->height) m.width = p->width, m.height = p->height / 2;
-        if (p->refreshHz > 1) m.refreshHz = (UINT32)std::lround(p->refreshHz);
+        if (p->refreshHz > 1) m.refreshMilliHz = (UINT32)std::lround(p->refreshHz * 1000);
+        if (p->widthMm) m.widthMm = p->widthMm;
+        if (p->heightMm) m.heightMm = p->heightMm / 2;
     }
-    if (argc >= 5) m = { (UINT32)_wtoi(argv[2]), (UINT32)_wtoi(argv[3]), (UINT32)_wtoi(argv[4]), 0, {} };
+    if (argc >= 5) m = { (UINT32)_wtoi(argv[2]), (UINT32)_wtoi(argv[3]), (UINT32)_wtoi(argv[4]) * 1000, 0, {}, 0, 0 };
     cfg.mon[0] = cfg.mon[1] = m;
-    v->config = cfg;
-    MemoryBarrier();
+    SdWriteConfig(v.get(), cfg);
+    InterlockedIncrement(&v->modesGeneration);
     InterlockedExchange(&v->desiredPlugged, 1);
     v.Kick();
-    Log(L"plug requested: 2 x %ux%u@%u on adapter %08X:%08X", m.width, m.height, m.refreshHz, cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
+    Log(L"plug requested: 2 x %ux%u@%u.%03u on adapter %08X:%08X", m.width, m.height, m.refreshMilliHz / 1000, m.refreshMilliHz % 1000,
+        cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
 
     for (int i = 0; i < 50; i++)
     {
@@ -157,8 +160,13 @@ static int Unplug()
     if (!OpenShm(v)) return 1;
     InterlockedExchange(&v->desiredPlugged, 0);
     v.Kick();
-    for (int i = 0; i < 50 && (v->mon[0].plugged || v->mon[1].plugged); i++) Sleep(100);
-    Log(L"unplugged (plugged=%ld,%ld)", v->mon[0].plugged, v->mon[1].plugged);
+    auto anyPlugged = [&] {
+        for (auto& m : v->mon)
+            if (m.plugged) return true;
+        return false;
+    };
+    for (int i = 0; i < 50 && anyPlugged(); i++) Sleep(100);
+    Log(L"unplugged (any still plugged=%d)", anyPlugged() ? 1 : 0);
     return 0;
 }
 
@@ -167,10 +175,12 @@ static int Status()
     SharedView v;
     if (!OpenShm(v)) return 1;
     auto* s = v.get();
-    Log(L"driver pid %lu, heartbeat %lld ms ago, desiredPlugged=%ld, %u monitors on adapter %08X:%08X", s->driverPid,
-        (LONG64)GetTickCount64() - s->driverHeartbeat, s->desiredPlugged, s->config.count,
-        s->config.renderAdapter.HighPart, s->config.renderAdapter.LowPart);
-    for (UINT i = 0; i < s->config.count && i < SD_MAX_MONITORS; i++)
+    SdConfig cfg;
+    SdReadConfig(s, cfg);
+    Log(L"driver pid %lu epoch %08X, heartbeat %lld ms ago, desiredPlugged=%ld, %u monitors on adapter %08X:%08X", s->driverPid, s->driverEpoch,
+        (LONG64)GetTickCount64() - s->driverHeartbeat, s->desiredPlugged, cfg.count,
+        cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
+    for (UINT i = 0; i < cfg.count && i < SD_MAX_MONITORS; i++)
     {
         auto& m = s->mon[i];
         Log(L"  mon%u plugged=%ld gen=%ld latest=%ld frames=%lld %ux%u fmt=%u adapter %08X:%08X", i, m.plugged, m.handleGeneration, m.latest,

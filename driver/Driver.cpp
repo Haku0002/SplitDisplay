@@ -8,8 +8,10 @@
 
 #include "Driver.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <numeric>
 
 using namespace Microsoft::WRL;
 using namespace SplitDisplay;
@@ -23,7 +25,21 @@ static SdShared* g_Shm = nullptr;
 static std::atomic<void*> g_Owner = nullptr;
 
 // Config captured when monitors were plugged; the mode callbacks answer from this snapshot.
-static SdConfig g_Cfg = { 2, 0, {}, { { 2560, 1440, 60, 0, {} }, { 2560, 1440, 60, 0, {} } } };
+// Guarded by a lock: callbacks run on OS threads while the command thread replaces it.
+static std::mutex g_CfgLock;
+static SdConfig g_Cfg = { 2, 0, {}, { { 2560, 1440, 60000, 0, {}, 0, 0 }, { 2560, 1440, 60000, 0, {}, 0, 0 } } };
+
+static SdConfig CfgSnapshot()
+{
+    std::lock_guard lk(g_CfgLock);
+    return g_Cfg;
+}
+
+static void SetCfgSnapshot(const SdConfig& cfg)
+{
+    std::lock_guard lk(g_CfgLock);
+    g_Cfg = cfg;
+}
 
 // Stable container ID per monitor slot: {9A3C7E41-2B6D-4F18-8E0C-5D7A1B2C3Exx}, xx = slot + 1.
 static GUID ContainerId(UINT index)
@@ -53,7 +69,25 @@ void SplitDisplay::DLog(const wchar_t* fmt, ...)
 
     static std::mutex lock;
     std::lock_guard lk(lock);
-    HANDLE f = CreateFileW(L"C:\\ProgramData\\SplitDisplay\\idd.log", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
+    // Same place the user-mode log uses (%ProgramData% may not be on C:), rotated once per
+    // driver load so years of plug/unplug cycles cannot grow it without bound.
+    wchar_t dir[MAX_PATH] = L"C:\\ProgramData";
+    if (!GetEnvironmentVariableW(L"ProgramData", dir, MAX_PATH)) wcscpy_s(dir, L"C:\\ProgramData");
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%s\\SplitDisplay\\idd.log", dir);
+    static bool rotated = false;
+    if (!rotated)
+    {
+        rotated = true;
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad) && fad.nFileSizeLow > 5 * 1024 * 1024 && !fad.nFileSizeHigh)
+        {
+            wchar_t old[MAX_PATH];
+            swprintf_s(old, L"%s.old", path);
+            MoveFileExW(path, old, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+    HANDLE f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
     if (f != INVALID_HANDLE_VALUE)
     {
         char utf8[2400];
@@ -71,8 +105,11 @@ void SplitDisplay::DLog(const wchar_t* fmt, ...)
 // Builds a 128-byte EDID 1.4 block describing one region of the panel, named "Split <index+1>".
 static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
 {
-    const UINT w = cfg.mon[index].width, h = cfg.mon[index].height, hz = cfg.mon[index].refreshHz;
-    const UINT hmm = (UINT)(w * kMmPerPixel + 0.5), vmm = (UINT)(h * kMmPerPixel + 0.5);
+    const UINT w = cfg.mon[index].width, h = cfg.mon[index].height, milliHz = cfg.mon[index].refreshMilliHz;
+    // Real region size on the physical panel when the compositor knows it; the panel pitch is
+    // only a fallback guess. EDID image-size bytes top out at 255 cm, detailed sizes at 4095 mm.
+    const UINT hmm = std::min<UINT>(cfg.mon[index].widthMm ? cfg.mon[index].widthMm : (UINT)(w * kMmPerPixel + 0.5), 4095);
+    const UINT vmm = std::min<UINT>(cfg.mon[index].heightMm ? cfg.mon[index].heightMm : (UINT)(h * kMmPerPixel + 0.5), 4095);
     ZeroMemory(e, sizeof(e));
     const BYTE header[8] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
     memcpy(e, header, 8);
@@ -100,7 +137,8 @@ static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
     // Detailed timing descriptor: reduced-blanking style numbers, only the active area really matters.
     UINT hblank = 160, hfront = 48, hsync = 32;
     UINT vblank = 60, vfront = 3, vsync = 5;
-    UINT64 pclk10k = ((UINT64)(w + hblank) * (h + vblank) * hz + 5000) / 10000;
+    UINT64 pclk10k = ((UINT64)(w + hblank) * (h + vblank) * milliHz / 1000 + 5000) / 10000;
+    if (pclk10k > 65535) pclk10k = 65535; // the detailed-timing pixel clock is 16-bit (655.35 MHz)
     BYTE* d = e + 54;
     d[0] = (BYTE)(pclk10k & 0xFF);
     d[1] = (BYTE)(pclk10k >> 8);
@@ -135,7 +173,8 @@ static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
     r[6] = 240;  // max V Hz
     r[7] = 15;   // min H kHz
     r[8] = 255;  // max H kHz
-    r[9] = 80;   // max pixel clock / 10 MHz
+    UINT64 pclkHz = (UINT64)(w + hblank) * (h + vblank) * milliHz / 1000;
+    r[9] = (BYTE)std::clamp<UINT64>((pclkHz + 9999999) / 10000000, 1, 255); // max pixel clock / 10 MHz
     r[10] = 0x00;
     r[11] = 0x0A;
     for (int i = 12; i < 18; i++) r[i] = 0x20;
@@ -148,35 +187,63 @@ static void BuildEdid(UINT index, const SdConfig& cfg, BYTE (&e)[128])
     e[127] = (BYTE)(0x100 - sum);
 }
 
-static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD VSync, bool bMonitorMode)
+static void FillSignalInfo(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, DWORD Width, DWORD Height, DWORD MilliHz, bool bMonitorMode)
 {
     Mode.totalSize.cx = Mode.activeSize.cx = Width;
     Mode.totalSize.cy = Mode.activeSize.cy = Height;
     Mode.AdditionalSignalInfo.vSyncFreqDivider = bMonitorMode ? 0 : 1;
     Mode.AdditionalSignalInfo.videoStandard = 255;
-    Mode.vSyncFreq.Numerator = VSync;
-    Mode.vSyncFreq.Denominator = 1;
-    Mode.hSyncFreq.Numerator = VSync * Height;
-    Mode.hSyncFreq.Denominator = 1;
+    // Fractional rates (59.94, 119.88, ...) survive as rationals, so the virtual monitors are
+    // paced at exactly the panel rate instead of drifting against it and dropping a frame
+    // whenever the phases cross.
+    auto rational = [](UINT64 num, UINT64 den) {
+        UINT64 g = std::gcd(num, den);
+        DISPLAYCONFIG_RATIONAL r = { (UINT32)std::min<UINT64>(num / g, 0xFFFFFFFFull), (UINT32)(den / g) };
+        return r;
+    };
+    Mode.vSyncFreq = rational(MilliHz, 1000);
+    Mode.hSyncFreq = rational((UINT64)MilliHz * Height, 1000);
     Mode.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    Mode.pixelRate = ((UINT64)VSync) * ((UINT64)Width) * ((UINT64)Height);
+    Mode.pixelRate = (UINT64)MilliHz * Width * Height / 1000;
 }
 
 struct ModeTriple
 {
-    DWORD w, h, hz;
+    DWORD w, h, milliHz;
 };
 
-// Modes of monitor slot `index`: its region size at the panel's current rate (preferred), plus the
-// other rates the panel supports. Picking another rate in Settings makes SplitDisplay switch the
-// whole panel, so all split monitors of a display always share one rate.
-static std::vector<ModeTriple> ModeList(UINT index)
+// Modes of monitor slot `index`: its region size at the panel's current rate (preferred, always
+// first), plus the other rates the panel supports. Picking another rate in Settings makes
+// SplitDisplay switch the whole panel, so all split monitors of a display always share one rate.
+// With scaled modes, 3/4 and 1/2 resolutions are offered too (for fullscreen games and legacy
+// apps); the compositor stretches those to the region. The EDID parse callback passes
+// includeScaled=false because the EDID itself only describes the native timing.
+static std::vector<ModeTriple> ModeList(UINT index, bool includeScaled)
 {
     if (index >= SD_MAX_MONITORS) index = 0;
-    const auto& s = g_Cfg.mon[index];
-    std::vector<ModeTriple> m{ { s.width, s.height, s.refreshHz } };
+    const SdConfig cfg = CfgSnapshot();
+    const auto& s = cfg.mon[index];
+
+    std::vector<DWORD> rates{ s.refreshMilliHz };
     for (UINT i = 0; i < s.rateCount && i < SD_MAX_RATES; i++)
-        if (s.rates[i] != s.refreshHz && s.rates[i] >= 24 && s.rates[i] <= 500) m.push_back({ s.width, s.height, s.rates[i] });
+    {
+        DWORD r = s.ratesMilliHz[i];
+        bool dup = false;
+        for (DWORD q : rates) dup |= (r > q ? r - q : q - r) < 100;
+        if (!dup && r >= 24000 && r <= 500000) rates.push_back(r);
+    }
+    std::vector<std::pair<DWORD, DWORD>> sizes{ { s.width, s.height } };
+    if (includeScaled)
+    {
+        for (auto [num, den] : { std::pair<DWORD, DWORD>{ 3, 4 }, { 1, 2 } })
+        {
+            DWORD sw = s.width * num / den & ~1u, sh = s.height * num / den & ~1u;
+            if (sw >= 640 && sh >= 360 && (sw != s.width || sh != s.height)) sizes.push_back({ sw, sh });
+        }
+    }
+    std::vector<ModeTriple> m;
+    for (auto [w, h] : sizes)
+        for (DWORD r : rates) m.push_back({ w, h, r });
     return m;
 }
 
@@ -310,7 +377,13 @@ HRESULT Direct3DDevice::Init()
     if (FAILED(hr)) return hr;
     hr = dev.As(&Device);
     if (FAILED(hr)) return hr;
-    return ctx.As(&DeviceContext);
+    hr = ctx.As(&DeviceContext);
+    if (FAILED(hr)) return hr;
+    // These copies are the first hop of every frame; let them jump the GPU queue ahead of
+    // whatever the desktop is rendering, like the compositor already does for its hop.
+    ComPtr<IDXGIDevice> dxgi;
+    if (SUCCEEDED(dev.As(&dxgi))) dxgi->SetGPUThreadPriority(7);
+    return S_OK;
 }
 
 #pragma endregion
@@ -333,7 +406,13 @@ void FrameRing::Release()
         auto& m = g_Shm->mon[m_Index];
         InterlockedIncrement(&m.handleGeneration); // odd: handles invalid
         InterlockedExchange(&m.latest, -1);
-        for (int i = 0; i < SD_BUFFERS; i++) m.texHandle[i] = 0;
+        for (int i = 0; i < SD_BUFFERS; i++)
+        {
+            m.texHandle[i] = 0;
+            m.slotSeq[i] = 0;
+            m.presentQpc[i] = 0;
+        }
+        for (auto& j : m.journal) j.seq = j.seqEnd = 0;
         m.fenceHandle = 0;
         MemoryBarrier();
         InterlockedIncrement(&m.handleGeneration); // even again, but with no buffers
@@ -390,6 +469,11 @@ HRESULT FrameRing::Recreate(const D3D11_TEXTURE2D_DESC& Src)
     }
 
     m_FenceValue = 0;
+    for (int i = 0; i < SD_BUFFERS; i++)
+    {
+        m_Accum[i].clear();
+        m_AccumFull[i] = true; // a fresh texture holds nothing yet
+    }
     m_Width = d.Width;
     m_Height = d.Height;
     m_Format = d.Format;
@@ -412,7 +496,7 @@ HRESULT FrameRing::Recreate(const D3D11_TEXTURE2D_DESC& Src)
     return S_OK;
 }
 
-void FrameRing::Publish(ID3D11Texture2D* Source)
+void FrameRing::Publish(ID3D11Texture2D* Source, IDDCX_SWAPCHAIN SwapChain, const IDDCX_METADATA& Meta)
 {
     if (!g_Shm) return;
     D3D11_TEXTURE2D_DESC sd;
@@ -422,18 +506,123 @@ void FrameRing::Publish(ID3D11Texture2D* Source)
         if (FAILED(Recreate(sd))) return;
     }
 
+    // What changed in this frame? A single all-zero dirty rect means "nothing": the OS
+    // re-presents static desktops so encoders can re-encode; copying those would republish
+    // the identical frame and burn both copy hops for no reason. Move regions are gone in
+    // IddCx 1.7+ (always zero here); a nonzero count on an older OS falls back to a full copy.
+    std::vector<RECT> frameDirty;
+    bool full = Meta.HwProtectedSurface || Meta.MoveRegionCount != 0 || Meta.DirtyRectCount == 0;
+    if (!full && Meta.DirtyRectCount <= 4096)
+    {
+        std::vector<RECT> rects(Meta.DirtyRectCount);
+        IDARG_IN_GETDIRTYRECTS in = { Meta.DirtyRectCount, rects.data() };
+        IDARG_OUT_GETDIRTYRECTS out = {};
+        if (SUCCEEDED(IddCxSwapChainGetDirtyRects(SwapChain, &in, &out)))
+        {
+            UINT n = std::min(out.DirtyRectOutCount, Meta.DirtyRectCount);
+            if (n == 1 && rects[0].left == 0 && rects[0].top == 0 && rects[0].right == 0 && rects[0].bottom == 0) return; // no image update
+            for (UINT i = 0; i < n; i++)
+            {
+                RECT r = { std::clamp<LONG>(rects[i].left, 0, (LONG)sd.Width), std::clamp<LONG>(rects[i].top, 0, (LONG)sd.Height),
+                    std::clamp<LONG>(rects[i].right, 0, (LONG)sd.Width), std::clamp<LONG>(rects[i].bottom, 0, (LONG)sd.Height) };
+                if (r.right > r.left && r.bottom > r.top) frameDirty.push_back(r);
+            }
+            if (frameDirty.empty()) full = true; // OS said something changed but listed nothing usable
+        }
+        else
+        {
+            full = true;
+        }
+    }
+    else if (Meta.DirtyRectCount > 4096)
+    {
+        full = true;
+    }
+
+    // Every slot still missing this frame's changes accumulates them: slot w is only correct
+    // once it has received all changes since the frame it currently holds.
+    for (int i = 0; i < SD_BUFFERS; i++)
+    {
+        if (full) m_AccumFull[i] = true;
+        else if (!m_AccumFull[i])
+        {
+            m_Accum[i].insert(m_Accum[i].end(), frameDirty.begin(), frameDirty.end());
+            if (m_Accum[i].size() > 256) m_AccumFull[i] = true; // a full copy beats hundreds of small ones
+        }
+    }
+
     auto& m = g_Shm->mon[m_Index];
     int w = SdPickWriteSlot(m.latest, m.readerIndex);
     if (w < 0) return; // shared state out of range (torn down or corrupted): drop the frame
 
-    m_Device->DeviceContext->CopyResource(m_Tex[w].Get(), Source);
-    m_Device->DeviceContext->Signal(m_Fence.Get(), ++m_FenceValue);
-    m_Device->DeviceContext->Flush();
+    auto* ctx = m_Device->DeviceContext.Get();
+    bool copyFull = m_AccumFull[w];
+    if (!copyFull)
+    {
+        UINT64 area = 0;
+        for (auto& r : m_Accum[w]) area += (UINT64)(r.right - r.left) * (r.bottom - r.top);
+        copyFull = area >= (UINT64)sd.Width * sd.Height * 3 / 4;
+    }
+    if (copyFull)
+    {
+        ctx->CopyResource(m_Tex[w].Get(), Source);
+    }
+    else
+    {
+        for (auto& r : m_Accum[w])
+        {
+            D3D11_BOX box{ (UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1 };
+            ctx->CopySubresourceRegion(m_Tex[w].Get(), 0, (UINT)r.left, (UINT)r.top, 0, Source, 0, &box);
+        }
+    }
+    m_Accum[w].clear();
+    m_AccumFull[w] = false;
+    ctx->Signal(m_Fence.Get(), ++m_FenceValue);
+    ctx->Flush();
+
+    // Journal first (what changed in this frame only), published state afterwards: a consumer
+    // that sees the new latest must also find the matching journal entry.
+    UINT64 seq = ++m_Seq;
+    SdDirtyFrame& j = m.journal[seq % SD_DIRTY_JOURNAL];
+    j.seqEnd = 0;
+    MemoryBarrier();
+    if (full)
+    {
+        j.full = 1;
+        j.count = 0;
+    }
+    else if ((int)frameDirty.size() > SD_MAX_DIRTY)
+    {
+        // Too many rects to store: their bounding box is a correct superset.
+        SdRect bb = { (INT32)sd.Width, (INT32)sd.Height, 0, 0 };
+        for (auto& r : frameDirty)
+        {
+            bb.left = std::min(bb.left, (INT32)r.left);
+            bb.top = std::min(bb.top, (INT32)r.top);
+            bb.right = std::max(bb.right, (INT32)r.right);
+            bb.bottom = std::max(bb.bottom, (INT32)r.bottom);
+        }
+        j.full = 0;
+        j.count = 1;
+        j.rects[0] = bb;
+    }
+    else
+    {
+        j.full = 0;
+        j.count = (UINT32)frameDirty.size();
+        for (UINT32 i = 0; i < j.count; i++)
+            j.rects[i] = { frameDirty[i].left, frameDirty[i].top, frameDirty[i].right, frameDirty[i].bottom };
+    }
+    j.seq = seq;
+    MemoryBarrier();
+    j.seqEnd = seq;
 
     m.fenceValue[w] = m_FenceValue;
+    m.presentQpc[w] = Meta.PresentDisplayQPCTime;
+    m.slotSeq[w] = seq;
     MemoryBarrier();
     InterlockedExchange(&m.latest, w);
-    InterlockedIncrement64(&m.frameSeq);
+    InterlockedExchange64(&m.frameSeq, (LONG64)seq);
 }
 
 #pragma endregion
@@ -496,7 +685,9 @@ void SwapChainProcessor::RunCore()
         if (hr == E_PENDING)
         {
             HANDLE WaitHandles[] = { m_hAvailableBufferEvent, m_hTerminateEvent.Get() };
-            DWORD WaitResult = WaitForMultipleObjects(ARRAYSIZE(WaitHandles), WaitHandles, FALSE, 16);
+            // The terminate event is in the wait set, so the timeout is only a safety net for a
+            // missed surface event; 100 ms costs nothing next to the old 16 ms idle wakeups.
+            DWORD WaitResult = WaitForMultipleObjects(ARRAYSIZE(WaitHandles), WaitHandles, FALSE, 100);
             if (WaitResult == WAIT_OBJECT_0 || WaitResult == WAIT_TIMEOUT) continue;
             break;
         }
@@ -507,7 +698,7 @@ void SwapChainProcessor::RunCore()
             ComPtr<ID3D11Texture2D> tex;
             if (SUCCEEDED(AcquiredBuffer.As(&tex)))
             {
-                ring.Publish(tex.Get());
+                ring.Publish(tex.Get(), m_hSwapChain, Buffer.MetaData);
                 if (++frames == 1) DLog(L"mon%u: first frame", m_Index);
             }
             AcquiredBuffer.Reset();
@@ -541,14 +732,25 @@ IndirectDeviceContext::~IndirectDeviceContext()
     }
     if (m_StopEvent) CloseHandle(m_StopEvent);
     if (m_CmdEvent) CloseHandle(m_CmdEvent);
-    if (g_Shm)
+    // Only the instance that claimed the shared state may tear it down: a duplicate device
+    // node coming and going must not pull the mapping out from under the owning instance.
+    if (m_Owner)
     {
-        UnmapViewOfFile(g_Shm);
-        g_Shm = nullptr;
+        if (g_Shm)
+        {
+            UnmapViewOfFile(g_Shm);
+            g_Shm = nullptr;
+        }
+        if (m_Section) CloseHandle(m_Section);
+        ReleaseOwnership();
     }
-    if (m_Section) CloseHandle(m_Section);
+}
+
+void IndirectDeviceContext::ReleaseOwnership()
+{
     void* self = this;
     g_Owner.compare_exchange_strong(self, nullptr);
+    m_Owner = false;
 }
 
 void IndirectDeviceContext::InitAdapter()
@@ -556,6 +758,9 @@ void IndirectDeviceContext::InitAdapter()
     IDDCX_ADAPTER_CAPS AdapterCaps = {};
     AdapterCaps.Size = sizeof(AdapterCaps);
     AdapterCaps.MaxMonitorsSupported = SD_MAX_MONITORS;
+    // Zero on purpose: the OS must not re-present a static desktop to us (Publish skips
+    // no-update frames anyway, but there is no reason to be woken for them at all).
+    AdapterCaps.StaticDesktopReencodeFrameCount = 0;
     AdapterCaps.EndPointDiagnostics.Size = sizeof(AdapterCaps.EndPointDiagnostics);
     AdapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
     AdapterCaps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
@@ -597,12 +802,23 @@ void IndirectDeviceContext::FinishInit()
         DLog(L"another SplitDisplay adapter already owns the shared memory; this one stays idle");
         return;
     }
+    m_Owner = true;
+    // From here on, every failure path must ReleaseOwnership(): a leaked claim would leave
+    // the driver permanently idle until the host process restarts.
+    auto fail = [this] {
+        if (m_CmdEvent) CloseHandle(m_CmdEvent);
+        if (m_Section) CloseHandle(m_Section);
+        m_CmdEvent = m_Section = nullptr;
+        ReleaseOwnership();
+    };
 
-    // SYSTEM, Administrators, LocalService, NetworkService.
+    // SYSTEM, Administrators, LocalService. LocalService is the UMDF host account: after a
+    // host restart it must be able to re-open the section a still-running compositor kept alive.
     SECURITY_ATTRIBUTES sa = { sizeof(sa) };
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;NS)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
     {
         DLog(L"SDDL failed %lu", GetLastError());
+        fail();
         return;
     }
     m_Section = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(SdShared), SD_SHM_NAME);
@@ -612,19 +828,31 @@ void IndirectDeviceContext::FinishInit()
     if (!m_Section || !m_CmdEvent)
     {
         DLog(L"shared objects failed: section=%p event=%p err=%lu", m_Section, m_CmdEvent, GetLastError());
+        fail();
         return;
     }
 
     g_Shm = (SdShared*)MapViewOfFile(m_Section, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SdShared));
-    if (!g_Shm) return;
-    if (sectionErr != ERROR_ALREADY_EXISTS || g_Shm->magic != SD_MAGIC)
+    if (!g_Shm)
+    {
+        fail();
+        return;
+    }
+    if (sectionErr != ERROR_ALREADY_EXISTS || g_Shm->magic != SD_MAGIC || g_Shm->version != SD_VERSION)
     {
         ZeroMemory(g_Shm, sizeof(SdShared));
-        g_Shm->config = g_Cfg;
+        SdWriteConfig(g_Shm, CfgSnapshot());
+    }
+    else
+    {
+        SdConfig kept;
+        if (SdReadConfig(g_Shm, kept)) SetCfgSnapshot(kept); // a surviving section keeps the plug config
     }
     g_Shm->magic = SD_MAGIC;
     g_Shm->version = SD_VERSION;
     g_Shm->driverPid = GetCurrentProcessId();
+    g_Shm->driverEpoch = (UINT32)(GetTickCount64() ^ ((ULONGLONG)GetCurrentProcessId() << 8) ^ 0x5D17u) | 1;
+    m_LastModesGeneration = g_Shm->modesGeneration;
     for (auto& m : g_Shm->mon)
     {
         m.plugged = 0;
@@ -649,10 +877,24 @@ void IndirectDeviceContext::CommandLoop()
     HANDLE waits[] = { m_StopEvent, m_CmdEvent };
     for (;;)
     {
-        g_Shm->driverHeartbeat = (LONG64)GetTickCount64();
+        InterlockedExchange64(&g_Shm->driverHeartbeat, (LONG64)GetTickCount64());
         bool want = g_Shm->desiredPlugged != 0;
-        if (want && !m_Plugged) PlugMonitors();
-        else if (!want && m_Plugged) UnplugMonitors();
+        if (want)
+        {
+            SdConfig cfg;
+            if (SdReadConfig(g_Shm, cfg))
+            {
+                if (!m_Plugged) ReconcileMonitors(cfg);
+                else if (g_Shm->modesGeneration != m_LastModesGeneration)
+                {
+                    // Same monitors, new mode lists (e.g. the panel switched refresh rate).
+                    m_LastModesGeneration = g_Shm->modesGeneration;
+                    ReconcileMonitors(cfg); // replugs only slots whose size actually changed
+                    UpdateModes(cfg);
+                }
+            }
+        }
+        else if (m_Plugged) UnplugMonitors();
 
         DWORD r = WaitForMultipleObjects(2, waits, FALSE, 1000);
         if (r == WAIT_OBJECT_0) break;
@@ -660,92 +902,136 @@ void IndirectDeviceContext::CommandLoop()
     if (m_Plugged) UnplugMonitors();
 }
 
-void IndirectDeviceContext::PlugMonitors()
+void IndirectDeviceContext::UpdateModes(const SdConfig& cfg)
 {
-    SdConfig cfg = g_Shm->config;
+    SetCfgSnapshot(cfg);
+    for (UINT i = 0; i < SD_MAX_MONITORS; i++)
+    {
+        if (!m_Monitors[i]) continue;
+        // The mode callbacks answer from this snapshot; the OS re-reads the target modes
+        // from the buffer below. Current slot sizes stay as plugged (reconcile handles those).
+        m_Current[i].refreshMilliHz = cfg.mon[i].refreshMilliHz;
+        auto modes = ModeList(i, true);
+        std::vector<IDDCX_TARGET_MODE> targetModes(modes.size());
+        for (size_t k = 0; k < modes.size(); k++)
+        {
+            targetModes[k] = {};
+            targetModes[k].Size = sizeof(IDDCX_TARGET_MODE);
+            FillSignalInfo(targetModes[k].TargetVideoSignalInfo.targetVideoSignalInfo, modes[k].w, modes[k].h, modes[k].milliHz, false);
+        }
+        IDARG_IN_UPDATEMODES in = { IDDCX_UPDATE_REASON_OTHER, (UINT)targetModes.size(), targetModes.data() };
+        NTSTATUS Status = IddCxMonitorUpdateModes(m_Monitors[i], &in);
+        DLog(L"UpdateModes(%u) -> 0x%08X", i, Status);
+    }
+}
+
+void IndirectDeviceContext::ReconcileMonitors(const SdConfig& cfg)
+{
     bool valid = cfg.count >= 1 && cfg.count <= SD_MAX_MONITORS;
     for (UINT i = 0; valid && i < cfg.count; i++)
     {
         const auto& m = cfg.mon[i];
-        valid = m.width >= 160 && m.height >= 160 && m.width <= 16384 && m.height <= 16384 && m.refreshHz >= 24 && m.refreshHz <= 500;
+        valid = m.width >= 160 && m.height >= 160 && m.width <= 16384 && m.height <= 16384 && m.refreshMilliHz >= 24000 && m.refreshMilliHz <= 500000;
     }
     if (!valid)
     {
         DLog(L"rejecting bad config: %u monitors", cfg.count);
-        g_Shm->desiredPlugged = 0;
+        InterlockedExchange(&g_Shm->desiredPlugged, 0);
+        UnplugMonitors();
         return;
     }
-    g_Cfg = cfg;
+    SetCfgSnapshot(cfg);
 
-    if (cfg.renderAdapter.LowPart || cfg.renderAdapter.HighPart)
+    if ((cfg.renderAdapter.LowPart || cfg.renderAdapter.HighPart) &&
+        (cfg.renderAdapter.LowPart != m_RenderAdapter.LowPart || cfg.renderAdapter.HighPart != m_RenderAdapter.HighPart))
     {
         IDARG_IN_ADAPTERSETRENDERADAPTER ra = {};
         ra.PreferredRenderAdapter = cfg.renderAdapter;
         IddCxAdapterSetRenderAdapter(m_Adapter, &ra);
+        m_RenderAdapter = cfg.renderAdapter;
         DLog(L"preferred render adapter %08X:%08X", cfg.renderAdapter.HighPart, cfg.renderAdapter.LowPart);
     }
 
-    for (UINT i = 0; i < cfg.count; i++)
+    // Only slots whose size changed (or appeared/disappeared) are re-plugged; a slot that
+    // merely changed refresh rate keeps its monitor and is handled by UpdateModes.
+    for (UINT i = 0; i < SD_MAX_MONITORS; i++)
     {
-        BYTE edid[128];
-        BuildEdid(i, cfg, edid);
-
-        WDF_OBJECT_ATTRIBUTES Attr;
-        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
-        Attr.EvtCleanupCallback = [](WDFOBJECT Object) {
-            auto* p = WdfObjectGet_IndirectMonitorContextWrapper(Object);
-            if (p) p->Cleanup();
-        };
-
-        IDDCX_MONITOR_INFO MonitorInfo = {};
-        MonitorInfo.Size = sizeof(MonitorInfo);
-        MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-        MonitorInfo.ConnectorIndex = i;
-        MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
-        MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-        MonitorInfo.MonitorDescription.DataSize = sizeof(edid);
-        MonitorInfo.MonitorDescription.pData = edid;
-        MonitorInfo.MonitorContainerId = ContainerId(i);
-
-        IDARG_IN_MONITORCREATE MonitorCreate = {};
-        MonitorCreate.ObjectAttributes = &Attr;
-        MonitorCreate.pMonitorInfo = &MonitorInfo;
-
-        IDARG_OUT_MONITORCREATE MonitorCreateOut;
-        NTSTATUS Status = IddCxMonitorCreate(m_Adapter, &MonitorCreate, &MonitorCreateOut);
-        if (!NT_SUCCESS(Status))
-        {
-            DLog(L"MonitorCreate(%u) failed 0x%08X", i, Status);
-            continue;
-        }
-        WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject)->pContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject, i);
-
-        IDARG_OUT_MONITORARRIVAL ArrivalOut;
-        Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
-        DLog(L"MonitorArrival(%u) %ux%u@%u status=0x%08X", i, cfg.mon[i].width, cfg.mon[i].height, cfg.mon[i].refreshHz, Status);
-        if (NT_SUCCESS(Status))
-        {
-            m_Monitors[i] = MonitorCreateOut.MonitorObject;
-            g_Shm->mon[i].plugged = 1;
-        }
-        else
-        {
-            WdfObjectDelete(MonitorCreateOut.MonitorObject);
-        }
+        bool want = i < cfg.count;
+        bool have = m_Monitors[i] != nullptr;
+        bool resized = have && want && (m_Current[i].width != cfg.mon[i].width || m_Current[i].height != cfg.mon[i].height);
+        if (have && (!want || resized)) DepartSlot(i);
+        if (want && !m_Monitors[i]) CreateSlot(i, cfg);
     }
-    m_Plugged = true;
+    m_Plugged = false;
+    for (auto* mon : m_Monitors) m_Plugged |= mon != nullptr;
+}
+
+bool IndirectDeviceContext::CreateSlot(UINT i, const SdConfig& cfg)
+{
+    BYTE edid[128];
+    BuildEdid(i, cfg, edid);
+
+    WDF_OBJECT_ATTRIBUTES Attr;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
+    Attr.EvtCleanupCallback = [](WDFOBJECT Object) {
+        auto* p = WdfObjectGet_IndirectMonitorContextWrapper(Object);
+        if (p) p->Cleanup();
+    };
+
+    IDDCX_MONITOR_INFO MonitorInfo = {};
+    MonitorInfo.Size = sizeof(MonitorInfo);
+    MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+    MonitorInfo.ConnectorIndex = i;
+    MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
+    MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
+    MonitorInfo.MonitorDescription.DataSize = sizeof(edid);
+    MonitorInfo.MonitorDescription.pData = edid;
+    MonitorInfo.MonitorContainerId = ContainerId(i);
+
+    IDARG_IN_MONITORCREATE MonitorCreate = {};
+    MonitorCreate.ObjectAttributes = &Attr;
+    MonitorCreate.pMonitorInfo = &MonitorInfo;
+
+    IDARG_OUT_MONITORCREATE MonitorCreateOut;
+    NTSTATUS Status = IddCxMonitorCreate(m_Adapter, &MonitorCreate, &MonitorCreateOut);
+    if (!NT_SUCCESS(Status))
+    {
+        DLog(L"MonitorCreate(%u) failed 0x%08X", i, Status);
+        return false;
+    }
+    WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject)->pContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject, i);
+
+    IDARG_OUT_MONITORARRIVAL ArrivalOut;
+    Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+    DLog(L"MonitorArrival(%u) %ux%u@%u.%03u status=0x%08X", i, cfg.mon[i].width, cfg.mon[i].height, cfg.mon[i].refreshMilliHz / 1000,
+        cfg.mon[i].refreshMilliHz % 1000, Status);
+    if (!NT_SUCCESS(Status))
+    {
+        WdfObjectDelete(MonitorCreateOut.MonitorObject);
+        return false;
+    }
+    m_Monitors[i] = MonitorCreateOut.MonitorObject;
+    m_Current[i] = cfg.mon[i];
+    InterlockedExchange(&g_Shm->mon[i].plugged, 1);
+    return true;
+}
+
+void IndirectDeviceContext::DepartSlot(UINT i)
+{
+    if (!m_Monitors[i]) return;
+    IDDCX_MONITOR mon = m_Monitors[i];
+    m_Monitors[i] = nullptr;
+    NTSTATUS Status = IddCxMonitorDeparture(mon);
+    DLog(L"MonitorDeparture(%u) status=0x%08X", i, Status);
+    InterlockedExchange(&g_Shm->mon[i].plugged, 0);
+    // Destroying the object runs the context cleanup (stops the frame thread, frees the
+    // ring). The old code only departed, leaking one monitor object and context per replug.
+    WdfObjectDelete((WDFOBJECT)mon);
 }
 
 void IndirectDeviceContext::UnplugMonitors()
 {
-    for (UINT i = 0; i < SD_MAX_MONITORS; i++)
-    {
-        if (!m_Monitors[i]) continue;
-        NTSTATUS Status = IddCxMonitorDeparture(m_Monitors[i]);
-        DLog(L"MonitorDeparture(%u) status=0x%08X", i, Status);
-        m_Monitors[i] = nullptr;
-        g_Shm->mon[i].plugged = 0;
-    }
+    for (UINT i = 0; i < SD_MAX_MONITORS; i++) DepartSlot(i);
     m_Plugged = false;
 }
 
@@ -809,7 +1095,7 @@ NTSTATUS SdParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInAr
     UINT index = 0;
     if (pInArgs->MonitorDescription.DataSize >= 11 && pInArgs->MonitorDescription.pData)
         index = ((const BYTE*)pInArgs->MonitorDescription.pData)[10] - 1u; // product code = slot + 1
-    auto modes = ModeList(index);
+    auto modes = ModeList(index, false);
     pOutArgs->MonitorModeBufferOutputCount = (UINT)modes.size();
     if (pInArgs->MonitorModeBufferInputCount < modes.size())
         return pInArgs->MonitorModeBufferInputCount > 0 ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
@@ -822,7 +1108,7 @@ NTSTATUS SdParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInAr
         m = {};
         m.Size = sizeof(m);
         m.Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-        FillSignalInfo(m.MonitorVideoSignalInfo, modes[i].w, modes[i].h, modes[i].hz, true);
+        FillSignalInfo(m.MonitorVideoSignalInfo, modes[i].w, modes[i].h, modes[i].milliHz, true);
     }
     pOutArgs->PreferredMonitorModeIdx = 0;
     return STATUS_SUCCESS;
@@ -831,7 +1117,7 @@ NTSTATUS SdParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION* pInAr
 _Use_decl_annotations_
 NTSTATUS SdMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* pInArgs, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
 {
-    auto modes = ModeList(WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject)->pContext->Index());
+    auto modes = ModeList(WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject)->pContext->Index(), true);
     pOutArgs->DefaultMonitorModeBufferOutputCount = (UINT)modes.size();
     if (pInArgs->DefaultMonitorModeBufferInputCount == 0) return STATUS_SUCCESS;
     if (pInArgs->DefaultMonitorModeBufferInputCount < modes.size()) return STATUS_BUFFER_TOO_SMALL;
@@ -841,7 +1127,7 @@ NTSTATUS SdMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GE
         m = {};
         m.Size = sizeof(m);
         m.Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
-        FillSignalInfo(m.MonitorVideoSignalInfo, modes[i].w, modes[i].h, modes[i].hz, true);
+        FillSignalInfo(m.MonitorVideoSignalInfo, modes[i].w, modes[i].h, modes[i].milliHz, true);
     }
     pOutArgs->PreferredMonitorModeIdx = 0;
     return STATUS_SUCCESS;
@@ -850,7 +1136,7 @@ NTSTATUS SdMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GE
 _Use_decl_annotations_
 NTSTATUS SdMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTARGETMODES* pInArgs, IDARG_OUT_QUERYTARGETMODES* pOutArgs)
 {
-    auto modes = ModeList(WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject)->pContext->Index());
+    auto modes = ModeList(WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject)->pContext->Index(), true);
     pOutArgs->TargetModeBufferOutputCount = (UINT)modes.size();
     if (pInArgs->TargetModeBufferInputCount >= modes.size())
     {
@@ -859,7 +1145,7 @@ NTSTATUS SdMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTA
             IDDCX_TARGET_MODE& t = pInArgs->pTargetModes[i];
             t = {};
             t.Size = sizeof(t);
-            FillSignalInfo(t.TargetVideoSignalInfo.targetVideoSignalInfo, modes[i].w, modes[i].h, modes[i].hz, false);
+            FillSignalInfo(t.TargetVideoSignalInfo.targetVideoSignalInfo, modes[i].w, modes[i].h, modes[i].milliHz, false);
         }
     }
     return STATUS_SUCCESS;
