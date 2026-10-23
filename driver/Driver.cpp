@@ -423,10 +423,8 @@ void FrameRing::Publish(ID3D11Texture2D* Source)
     }
 
     auto& m = g_Shm->mon[m_Index];
-    LONG latest = m.latest;
-    LONG reader = m.readerIndex;
-    LONG w = 0;
-    while (w == latest || w == reader) w++;
+    int w = SdPickWriteSlot(m.latest, m.readerIndex);
+    if (w < 0) return; // shared state out of range (torn down or corrupted): drop the frame
 
     m_Device->DeviceContext->CopyResource(m_Tex[w].Get(), Source);
     m_Device->DeviceContext->Signal(m_Fence.Get(), ++m_FenceValue);

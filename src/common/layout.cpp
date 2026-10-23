@@ -25,6 +25,45 @@ std::vector<int> Distribute(const std::vector<int>& sizes, int extent)
     return out;
 }
 
+// Smallest extent a node can take along the axis of `kind` without squeezing any region
+// below kMinRegionSize; defined after KidRect, forward-declared for DistributeNode.
+int MinExtent(const LayoutNode& n, LayoutNode::Kind kind);
+
+// Splits `extent` among a cut node's kids in proportion to their sizes, but never below a
+// kid's minimum extent along the cut axis: proportional distribution alone lets an unequal
+// sibling set squeeze the smallest kid under kMinRegionSize when an outer splitter moves,
+// because the splitter clamp only protects the sum of the minimums. Falls back to plain
+// proportional when the extent cannot satisfy all minimums (a layout designed for a bigger
+// panel shown on a much smaller one).
+std::vector<int> DistributeNode(const LayoutNode& n, int extent)
+{
+    std::vector<int> out = Distribute(n.sizes, extent);
+    if (n.kids.size() != out.size()) return out;
+    std::vector<int> mins(out.size());
+    long long sumMin = 0;
+    for (size_t i = 0; i < out.size(); i++)
+    {
+        mins[i] = MinExtent(n.kids[i], n.kind);
+        sumMin += mins[i];
+    }
+    if (extent < sumMin) return out;
+    for (;;)
+    {
+        size_t needy = out.size();
+        for (size_t i = 0; i < out.size(); i++)
+            if (out[i] < mins[i]) needy = i;
+        if (needy == out.size()) return out;
+        int deficit = mins[needy] - out[needy];
+        out[needy] = mins[needy];
+        // Take the deficit from the kid with the most slack; sumMin <= extent guarantees one exists.
+        size_t donor = out.size();
+        for (size_t i = 0; i < out.size(); i++)
+            if (i != needy && (donor == out.size() || out[i] - mins[i] > out[donor] - mins[donor])) donor = i;
+        if (donor == out.size() || out[donor] - deficit < mins[donor]) return out; // unreachable while extent >= sumMin
+        out[donor] -= deficit;
+    }
+}
+
 RECT KidRect(const RECT& r, LayoutNode::Kind kind, int offset, int size)
 {
     RECT k = r;
@@ -57,7 +96,7 @@ void Walk(const LayoutNode& n, const RECT& r, NodePath& path, Fn&& fn)
 {
     fn(n, r, path);
     if (n.kind == LayoutNode::Leaf) return;
-    auto parts = Distribute(n.sizes, Extent(r, n.kind));
+    auto parts = DistributeNode(n, Extent(r, n.kind));
     int offset = 0;
     for (size_t i = 0; i < n.kids.size(); i++)
     {
@@ -152,7 +191,7 @@ bool Parse(const wchar_t*& p, LayoutNode& n, int depth)
 void Normalize(LayoutNode& n, const RECT& r)
 {
     if (n.kind == LayoutNode::Leaf) return;
-    auto parts = Distribute(n.sizes, Extent(r, n.kind));
+    auto parts = DistributeNode(n, Extent(r, n.kind));
     int offset = 0;
     for (size_t i = 0; i < n.kids.size(); i++)
     {
@@ -195,7 +234,7 @@ std::vector<LayoutSplitter> ResolveSplitters(const LayoutNode& root, int width, 
     NodePath path;
     Walk(root, RECT{ 0, 0, width, height }, path, [&](const LayoutNode& n, const RECT& r, const NodePath& p) {
         if (n.kind == LayoutNode::Leaf) return;
-        auto parts = Distribute(n.sizes, Extent(r, n.kind));
+        auto parts = DistributeNode(n, Extent(r, n.kind));
         int offset = 0;
         for (size_t i = 0; i + 1 < parts.size(); i++)
         {
