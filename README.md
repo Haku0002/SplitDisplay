@@ -23,8 +23,13 @@ monitors of any size, with equal cuts and freely placed lines that can be nested
 can be split at the same time, each with its own layout (up to 16 split monitors in total).
 
 All split monitors of a display share its refresh rate: a single cable carries one signal. Changing the refresh rate
-of any split monitor (e.g. in Windows Settings) switches the whole display and all of its split monitors to that rate;
-only rates the display supports are offered.
+of any split monitor (in Windows Settings, or in the settings window) switches the whole display to that rate in
+place, without re-plugging anything; only rates the display supports are offered, at their exact fractional value
+(59.94 Hz stays 59.94 Hz), so a split monitor is paced exactly with the panel.
+
+Only what actually changed is copied between the driver and the compositor: the driver reports each frame's dirty
+rectangles, and both copy hops move just those (skipping static regions and unchanged rects entirely). That keeps
+the GPU and memory-bandwidth cost of a mostly-idle split desktop near zero, which matters most on integrated GPUs.
 
 ## How it works
 
@@ -106,7 +111,7 @@ To choose the mode yourself, set `mode=exclusive` or `mode=window` in the `[Spli
 
 ## Download
 
-Prebuilt zips are on the [Releases](https://github.com/brkDOTstl/SplitDisplay/releases) page. Unzip and double-click
+Prebuilt zips are on the [Releases](https://github.com/Haku0002/SplitDisplay/releases) page. Unzip and double-click
 `Install.cmd`; the display to split is detected automatically (with several displays, click it on the map). The installer signs the bundled driver with a certificate created on
 your machine and deletes its private key right after. Nothing needs to be built, and test-signing mode is not used.
 
@@ -152,14 +157,16 @@ Start `splitdisplay.exe` without arguments (the installer opens it for you) to g
 - **Displays**: a map of all connected displays at their desktop positions (name, resolution, connector). Click a
   display to edit its layout; *Split this display* / *Don't split this display* adds it to or removes it from the
   split. Displays that are not split are left where they are.
-- **Start / Stop split** and **Start automatically when I sign in**.
+- **Start / Stop split** and **Start automatically when I sign in**. Closing the window leaves a tray icon with the
+  split state, start/stop and *Exit*; the window follows the Windows light/dark theme. Per-region display scaling
+  set in Windows Settings is remembered, and the *Refresh rate* box switches the whole display like Settings does.
 - **Layout editor**: a live preview of the display picked on the map. Edits are a draft until you press *Apply
   layout*, which saves that display's layout (adding it to the split if needed) and restarts a running split.
   - *Presets*: top/bottom, left/right, 2 x 2, top + bottom halved, three rows, three columns.
   - *Equal split*: click a region, pick rows or columns and a count (2 to 8), press *Cut*. Every piece can be cut
     again.
-  - *Manual*: drag a split line (it snaps to 8 px; hold Shift for single pixels), or click it and type an exact
-    position.
+  - *Manual*: drag a split line (it snaps to 8 px; hold Shift for single pixels), click it and type an exact
+    position, or select it and use the arrow keys (Shift for single pixels).
   - *Undo this cut* merges a region back with its siblings. Limits: 8 regions, 320 px minimum per side.
 
 The Windows desktop arrangement mirrors the layout, so the cursor moves between the monitors exactly as they sit on
@@ -196,7 +203,10 @@ Taking over your only display is risky, so there are several layers of protectio
 
 - The compositor plugs the virtual monitors *before* removing the panel, so Windows always has a desktop.
 - A separate watchdog process restores the panel if the compositor exits, crashes or stops sending heartbeats for
-  6 seconds.
+  6 seconds. The compositor watches the *driver's* heartbeat in turn: if the driver host dies, the session ends and
+  restarts instead of freezing on the last frame. A crash leaves a minidump (`crash-*.dmp`) next to the logs.
+- The settings window itself runs unprivileged; only splitting, reverting and the logon task ask for elevation
+  (those commands relaunch themselves).
 - On start, a panel left off the desktop by an earlier crash or power loss is restored first.
 - After 3 failures within 2 minutes, the program gives up and leaves the panel as a single display.
 
@@ -207,9 +217,12 @@ Taking over your only display is risky, so there are several layers of protectio
   while any other desktop is up, so the displays are whole there. Running it as a service in the console session,
   with an agent on the secure desktop, would split those screens too — the split monitors already receive them.
 - Hardware-DRM video may be black on the virtual monitors.
-- Changing the layout re-plugs the virtual monitors, so the screen flickers for a second and Windows re-places
-  windows.
-- GPU cost depends only on the panels' pixel count, not on the number of regions.
+- Changing the layout re-plugs the virtual monitors whose regions changed size, so the screen flickers briefly and
+  Windows re-places windows. A refresh-rate change alone no longer does this.
+- A split monitor can also run at 3/4 or 1/2 of its region size (for fullscreen games); the compositor stretches
+  those frames to the region. Latency-critical use should stay at the native size.
+- GPU cost now tracks what actually changes on screen rather than the panels' pixel count, but a full-screen video
+  or game still copies every pixel twice, as before.
 - All split displays must be connected to the same GPU (Windows renders an indirect display's monitors on one
   adapter). Displays on another GPU are skipped, with a note in the log.
 

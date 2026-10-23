@@ -50,7 +50,7 @@ struct PanelConfig
 };
 
 std::vector<PanelConfig> LoadPanels();
-void SavePanels(const std::vector<PanelConfig>& panels);
+bool SavePanels(const std::vector<PanelConfig>& panels);
 bool Matches(const PanelConfig& c, const PanelTarget& t);
 PanelConfig ConfigFor(const PanelTarget& t);
 

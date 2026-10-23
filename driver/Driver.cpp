@@ -514,8 +514,16 @@ void FrameRing::Publish(ID3D11Texture2D* Source, IDDCX_SWAPCHAIN SwapChain, cons
     bool full = Meta.HwProtectedSurface || Meta.MoveRegionCount != 0 || Meta.DirtyRectCount == 0;
     if (!full && Meta.DirtyRectCount <= 4096)
     {
-        std::vector<RECT> rects(Meta.DirtyRectCount);
-        IDARG_IN_GETDIRTYRECTS in = { Meta.DirtyRectCount, rects.data() };
+        // The usual desktop frame has a handful of rects; only pathological ones go to the heap.
+        RECT stackRects[64];
+        std::vector<RECT> heapRects;
+        RECT* rects = stackRects;
+        if (Meta.DirtyRectCount > ARRAYSIZE(stackRects))
+        {
+            heapRects.resize(Meta.DirtyRectCount);
+            rects = heapRects.data();
+        }
+        IDARG_IN_GETDIRTYRECTS in = { Meta.DirtyRectCount, rects };
         IDARG_OUT_GETDIRTYRECTS out = {};
         if (SUCCEEDED(IddCxSwapChainGetDirtyRects(SwapChain, &in, &out)))
         {
