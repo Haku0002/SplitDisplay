@@ -11,7 +11,14 @@ param([string]$Panel)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $dest = Join-Path $env:ProgramFiles 'SplitDisplay'
+$data = Join-Path $env:ProgramData 'SplitDisplay'
 $subject = 'CN=SplitDisplay Local Driver Signing'
+
+# The settings window runs unprivileged and writes config/logs here; files created so far were
+# made by an elevated process and are read-only for the user. Grant the installing user Modify.
+New-Item -ItemType Directory -Force $data | Out-Null
+$me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls $data /grant "${me}:(OI)(CI)M" /T /C 2>&1 | Out-Null
 
 function Step($msg) { Write-Host "`n== $msg" -ForegroundColor Cyan }
 

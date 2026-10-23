@@ -51,6 +51,7 @@
 
 #include "autostart.h"
 #include "frames.h"
+#include "guard.h"
 #include "ring.h"
 #include "layout.h"
 #include "log.h"
@@ -766,6 +767,7 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
     int nextPrimary = 0;
     bool presented = false;
     ULONGLONG darkSince = 0;
+    ULONGLONG loopStart = GetTickCount64();
     ULONGLONG nextDriverCheck = 0;
     bool poweredOff = false;
     Outcome outcome = Outcome::Stop;
@@ -799,6 +801,12 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
         }
         if (status != wdc::DisplaySourceStatus::Active)
         {
+            // The source can report a transient status while the path is being applied.
+            if (!presented && GetTickCount64() - loopStart < 3000)
+            {
+                if (!Nap(50)) break;
+                continue;
+            }
             Log(L"panel %u source status %d", panel.targetId, static_cast<int>(status));
             outcome = Outcome::Lost;
             break;
@@ -923,335 +931,6 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
 // split monitors in a topmost window covering it. A guard thread keeps the cursor and application
 // windows off the parked panels. Costs one DWM composition step compared to exclusive mode.
 
-static constexpr wchar_t kCompositorClass[] = L"SplitDisplayCompositor";
-
-static bool MonitorRectByName(const std::wstring& gdiName, RECT& out)
-{
-    struct Ctx
-    {
-        const std::wstring* name;
-        RECT* out;
-        bool found;
-    } c{ &gdiName, &out, false };
-    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL {
-        auto* c = (Ctx*)lp;
-        MONITORINFOEXW mi{};
-        mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(m, &mi) && _wcsicmp(mi.szDevice, c->name->c_str()) == 0)
-        {
-            *c->out = mi.rcMonitor;
-            c->found = true;
-            return FALSE;
-        }
-        return TRUE;
-    }, (LPARAM)&c);
-    return c.found;
-}
-
-// Finds a parked panel's desktop rect. Resolving the GDI name goes through QueryDisplayConfig, which
-// takes about a millisecond, so it is cached and only re-resolved now and then, or when it stops
-// matching a monitor (the rect lookup itself is cheap).
-struct PanelLocator
-{
-    LUID adapter{};
-    UINT32 targetId = 0;
-    std::wstring gdi;
-    int uses = 0;
-
-    bool Rect(RECT& out)
-    {
-        if (gdi.empty() || ++uses % 10 == 0) gdi = GdiNameOfTarget(adapter, targetId);
-        if (!gdi.empty() && MonitorRectByName(gdi, out)) return true;
-        gdi = GdiNameOfTarget(adapter, targetId);
-        return !gdi.empty() && MonitorRectByName(gdi, out);
-    }
-};
-
-struct ParkedPanel
-{
-    PanelLocator where;
-    std::wstring homeName; // the panel's first split monitor ("Split N"): stray windows are moved there
-    RECT home;             // its desktop rect (the split monitors can be moved around as a group)
-    RECT rect{}; // where the panel is on the desktop now (refreshed by the guard)
-};
-
-// Owned by the guard thread; the mouse hook runs on that thread too, so no locking is needed.
-static std::vector<ParkedPanel> g_parked;
-static std::vector<RECT> g_openMonitors; // every monitor the cursor may use
-static std::atomic_bool g_guardQuit = false;
-static std::set<HWND> g_remaximize;    // restored on a parked panel by the guard, to maximize again once moved
-static std::map<HWND, int> g_moveTries; // windows the guard tried to move off a parked panel
-
-static void RefreshGuardRects(bool homes)
-{
-    for (auto& p : g_parked)
-    {
-        if (!p.where.Rect(p.rect)) p.rect = {};
-        if (homes) DesktopRectOf(p.homeName, p.home); // keeps the last known rect if it is off right now
-    }
-    g_openMonitors.clear();
-    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM) -> BOOL {
-        MONITORINFO mi{ sizeof(mi) };
-        if (!GetMonitorInfoW(m, &mi)) return TRUE;
-        for (auto& p : g_parked)
-            if (EqualRect(&p.rect, &mi.rcMonitor)) return TRUE;
-        g_openMonitors.push_back(mi.rcMonitor);
-        return TRUE;
-    }, 0);
-}
-
-static const ParkedPanel* ParkedAt(POINT pt)
-{
-    for (auto& p : g_parked)
-        if (PtInRect(&p.rect, pt)) return &p;
-    return nullptr;
-}
-
-static POINT NearestOpenPoint(POINT pt)
-{
-    POINT best = pt;
-    LONGLONG bestDist = LLONG_MAX;
-    for (auto& r : g_openMonitors)
-    {
-        POINT c{ std::clamp(pt.x, r.left, r.right - 1), std::clamp(pt.y, r.top, r.bottom - 1) };
-        LONGLONG d = (LONGLONG)(c.x - pt.x) * (c.x - pt.x) + (LONGLONG)(c.y - pt.y) * (c.y - pt.y);
-        if (d < bestDist)
-        {
-            bestDist = d;
-            best = c;
-        }
-    }
-    return best;
-}
-
-static LRESULT CALLBACK GuardMouseProc(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HC_ACTION && wp == WM_MOUSEMOVE && !g_openMonitors.empty())
-    {
-        POINT pt = ((MSLLHOOKSTRUCT*)lp)->pt;
-        if (ParkedAt(pt))
-        {
-            // Swallow the move and put the cursor at the nearest point of an open monitor.
-            POINT to = NearestOpenPoint(pt);
-            SetCursorPos(to.x, to.y);
-            return 1;
-        }
-    }
-    return CallNextHookEx(nullptr, code, wp, lp);
-}
-
-// Moves application windows that ended up on a parked panel (hidden behind its compositor window)
-// to the panel's first split monitor. Async calls only: a hung application must not stall the
-// thread that also runs the mouse hook.
-static BOOL CALLBACK SweepWindow(HWND hwnd, LPARAM)
-{
-    // Cheap checks first: this runs for every top-level window twice a second, on the thread that
-    // also serves the mouse hook.
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
-    RECT r;
-    if (!GetWindowRect(hwnd, &r)) return TRUE;
-    auto* p = ParkedAt({ (r.left + r.right) / 2, (r.top + r.bottom) / 2 });
-    if (!p)
-    {
-        // Moved off a parked panel after being restored there: maximize it again in its new place.
-        if (g_remaximize.erase(hwnd)) ShowWindowAsync(hwnd, SW_MAXIMIZE);
-        g_moveTries.erase(hwnd);
-        return TRUE;
-    }
-    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
-    wchar_t cls[64] = {};
-    GetClassNameW(hwnd, cls, 64);
-    for (auto* shell : { L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", kCompositorClass })
-        if (wcscmp(cls, shell) == 0) return TRUE;
-    BOOL cloaked = FALSE;
-    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
-
-    // A window that keeps coming back (it positions itself, or ignores the move) is left alone after a
-    // few seconds rather than fought over twice a second.
-    int& tries = g_moveTries[hwnd];
-    if (++tries > 10) return TRUE;
-    wchar_t title[128] = {};
-    GetWindowTextW(hwnd, title, 128);
-    if (tries == 10) Log(L"window '%s' (%s) keeps returning to a parked panel; leaving it there", title, cls);
-
-    // A maximized window is restored first and moved on a later sweep, once the restore is done
-    // (async calls to another thread may run in any order), then maximized again where it landed.
-    if (IsZoomed(hwnd))
-    {
-        ShowWindowAsync(hwnd, SW_RESTORE);
-        g_remaximize.insert(hwnd);
-        return TRUE;
-    }
-    LONG hw = p->home.right - p->home.left, hh = p->home.bottom - p->home.top;
-    LONG w = std::min(r.right - r.left, hw), h = std::min(r.bottom - r.top, hh);
-    SetWindowPos(hwnd, nullptr, p->home.left + (hw - w) / 2, p->home.top + (hh - h) / 2, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-    if (tries == 1) Log(L"moved window '%s' (%s) off a parked panel", title, cls);
-    return TRUE;
-}
-
-static void GuardThread()
-{
-    HHOOK hook = SetWindowsHookExW(WH_MOUSE_LL, GuardMouseProc, GetModuleHandleW(nullptr), 0);
-    if (!hook) Log(L"warning: mouse guard not installed (%lu); the cursor can reach the parked panel", GetLastError());
-    ULONGLONG nextSweep = 0;
-    int sweeps = 0;
-    while (!g_guardQuit)
-    {
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
-        if (GetTickCount64() >= nextSweep)
-        {
-            nextSweep = GetTickCount64() + 500;
-            RefreshGuardRects(sweeps++ % 10 == 0); // split monitor rects every 5 s: a QueryDisplayConfig
-            for (auto it = g_remaximize.begin(); it != g_remaximize.end();)
-                it = IsWindow(*it) ? std::next(it) : g_remaximize.erase(it);
-            for (auto it = g_moveTries.begin(); it != g_moveTries.end();)
-                it = IsWindow(it->first) ? std::next(it) : g_moveTries.erase(it);
-            EnumWindows(SweepWindow, 0);
-        }
-        // The hook only sees mouse input; programs can still place the cursor with SetCursorPos.
-        POINT cur;
-        if (!g_openMonitors.empty() && GetCursorPos(&cur) && ParkedAt(cur))
-        {
-            POINT to = NearestOpenPoint(cur);
-            SetCursorPos(to.x, to.y);
-        }
-    }
-    if (hook) UnhookWindowsHookEx(hook);
-}
-
-// A session that ends because the desktop went away (lock screen, Ctrl+Alt+Del, a prompt on its own
-// desktop) unplugs the split monitors, and Windows piles every window onto the one display left
-// behind. Their placement is taken first and applied again once the split is back, so an
-// interruption costs a flicker instead of the arrangement the user had set up.
-struct SavedWindow
-{
-    HWND hwnd;
-    RECT rect;      // where to put it back, in screen coordinates
-    bool maximized; // then maximize it there again
-};
-static std::vector<SavedWindow> g_savedWindows;
-
-static bool ArrangeableWindow(HWND hwnd)
-{
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
-    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return false;
-    wchar_t cls[64] = {};
-    GetClassNameW(hwnd, cls, 64);
-    for (auto* shell : { L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", kCompositorClass })
-        if (wcscmp(cls, shell) == 0) return false;
-    BOOL cloaked = FALSE;
-    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return false;
-    return true;
-}
-
-// Everything is kept in screen coordinates. WINDOWPLACEMENT's rectangle is relative to the primary
-// monitor's work area instead, and that work area is not back yet when the windows are put back
-// (the taskbar is still being rebuilt), which would shift every window by the taskbar's size.
-static void SaveWindowLayout()
-{
-    g_savedWindows.clear();
-    RECT work{};
-    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) work = {};
-    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
-        if (!ArrangeableWindow(hwnd)) return TRUE;
-        RECT rc;
-        if (!GetWindowRect(hwnd, &rc)) return TRUE;
-        WINDOWPLACEMENT wp{ sizeof(wp) };
-        bool maximized = GetWindowPlacement(hwnd, &wp) && wp.showCmd == SW_SHOWMAXIMIZED;
-        if (maximized)
-        {
-            // Its screen rectangle is the whole monitor; the restored one says where to maximize it.
-            const RECT& work = *(const RECT*)lp;
-            rc = wp.rcNormalPosition;
-            OffsetRect(&rc, work.left, work.top);
-        }
-        g_savedWindows.push_back({ hwnd, rc, maximized });
-        return TRUE;
-    }, (LPARAM)&work);
-    Log(L"noted where %zu windows sit", g_savedWindows.size());
-}
-
-// Runs on its own thread, so a slow application cannot hold up the split that has just come back.
-// A maximized window is placed while restored first, so it maximizes on the right monitor.
-static void RestoreWindowLayout()
-{
-    if (g_savedWindows.empty()) return;
-    auto saved = std::move(g_savedWindows);
-    g_savedWindows.clear();
-    HWND front = GetForegroundWindow();
-    std::thread([saved = std::move(saved), front] {
-        Sleep(150); // let Windows settle the split monitors it has just placed
-        auto alive = [](HWND hwnd) { return IsWindow(hwnd) && IsWindowVisible(hwnd); };
-        // Restored first, so the move below decides which monitor each one ends up on.
-        for (auto& w : saved)
-            if (alive(w.hwnd) && IsZoomed(w.hwnd)) ShowWindowAsync(w.hwnd, SW_RESTORE);
-        Sleep(80);
-
-        // Asked asynchronously and checked afterwards: an application still laying itself out after
-        // the monitor change can take a moment to accept a move, or undo it once, and a synchronous
-        // call would make every other window wait for the slowest one. Each window leaves the rounds
-        // as soon as it is in place, so the pass ends with the last window that moves.
-        struct Pending
-        {
-            const SavedWindow* w;
-            int tries;
-        };
-        std::vector<Pending> pending;
-        for (auto& w : saved) pending.push_back({ &w, 0 });
-
-        int moved = 0, zoomed = 0;
-        while (!pending.empty())
-        {
-            for (auto& p : pending)
-                if (alive(p.w->hwnd))
-                    SetWindowPos(p.w->hwnd, nullptr, p.w->rect.left, p.w->rect.top, p.w->rect.right - p.w->rect.left,
-                        p.w->rect.bottom - p.w->rect.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-            Sleep(120);
-            for (auto it = pending.begin(); it != pending.end();)
-            {
-                RECT now;
-                bool gone = !alive(it->w->hwnd);
-                bool there = !gone && GetWindowRect(it->w->hwnd, &now) && EqualRect(&now, &it->w->rect);
-                if (there) moved++;
-                // One that will not take the move (a system window, or one that places itself) is
-                // given up on rather than holding the pass up.
-                if (gone || there || ++it->tries >= 4) it = pending.erase(it);
-                else ++it;
-            }
-        }
-        Sleep(120);
-        // ShowWindow, not a posted SW_MAXIMIZE: some applications ignore that one.
-        for (auto& w : saved)
-            if (w.maximized && alive(w.hwnd) && ShowWindow(w.hwnd, SW_MAXIMIZE) >= 0) zoomed++;
-        if (front && IsWindow(front)) SetForegroundWindow(front);
-        Log(L"put %d windows back where they were (%d maximized)", moved, zoomed);
-    }).detach();
-}
-
-struct GuardRun
-{
-    std::thread thread;
-
-    void Start()
-    {
-        g_guardQuit = false;
-        g_remaximize.clear();
-        g_moveTries.clear();
-        thread = std::thread(GuardThread);
-    }
-
-    void Stop()
-    {
-        if (!thread.joinable()) return;
-        g_guardQuit = true;
-        thread.join();
-    }
-
-    ~GuardRun() { Stop(); }
-};
-
 // Where the panel's scanout is right now: 0..99 = percent of the active area, 100 = vertical blank.
 // Used by test runs to show when split monitor frames arrive relative to the panel's refresh.
 struct ScanlineProbe
@@ -1328,13 +1007,13 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    wc.lpszClassName = kCompositorClass;
+    wc.lpszClassName = kCompositorWindowClass;
     RegisterClassExW(&wc); // fails harmlessly if another panel thread registered it
     // Exactly covering the panel, so Windows scans the swap chain out directly (independent flip)
     // instead of compositing it once more. Filters of the GPU vendor's app (e.g. NVIDIA RTX Dynamic
     // Vibrance) then treat SplitDisplay like a game; exclude splitdisplay.exe there.
     UINT width = (UINT)(rc.right - rc.left), height = (UINT)(rc.bottom - rc.top);
-    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCompositorClass, L"SplitDisplay", WS_POPUP, rc.left, rc.top,
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCompositorWindowClass, L"SplitDisplay", WS_POPUP, rc.left, rc.top,
         (int)width, (int)height, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) throw std::runtime_error("could not create the compositor window");
     struct WindowOwner // destroyed on every way out, including exceptions (e.g. a GPU reset mid-resize)
@@ -1811,12 +1490,12 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     WriteRuntime(ps);
     InheritColorProfiles(ps);
 
-    GuardRun guard;
+    WindowGuard guard;
     if (g_windowMode)
     {
-        g_parked.clear();
-        for (auto& p : ps) g_parked.push_back({ PanelLocator{ p.target.adapter, p.target.targetId }, VirtualName(p.first), desktop[p.first] });
-        guard.Start();
+        std::vector<ParkedPanel> parked;
+        for (auto& p : ps) parked.push_back({ PanelLocator{ p.target.adapter, p.target.targetId }, VirtualName(p.first), desktop[p.first], {} });
+        guard.Start(std::move(parked));
     }
     // The split is back: undo the pile-up Windows made of the windows while it was gone.
     RestoreWindowLayout();

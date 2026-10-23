@@ -1,5 +1,7 @@
 #include "panel.h"
 
+#include "log.h"
+
 #include <wingdi.h>
 #include <winternl.h>
 
@@ -195,7 +197,7 @@ std::vector<PanelConfig> LoadPanels()
     return out;
 }
 
-void SavePanels(const std::vector<PanelConfig>& panels)
+bool SavePanels(const std::vector<PanelConfig>& panels)
 {
     wchar_t dir[MAX_PATH];
     ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay", dir, MAX_PATH);
@@ -223,7 +225,9 @@ void SavePanels(const std::vector<PanelConfig>& panels)
     WritePrivateProfileStringW(L"SplitDisplay", L"panels", (L"\"" + std::to_wstring(panels.size()) + L"\"").c_str(), path);
     // Retire the v0.1 keys once migrated.
     for (const wchar_t* key : { L"panel_id", L"panel", L"layout" }) WritePrivateProfileStringW(L"SplitDisplay", key, nullptr, path);
-    ini.Commit();
+    bool ok = ini.Commit();
+    if (!ok) Log(L"could not save config.ini (access denied? the installer grants the user modify rights on %s)", ConfigPath().c_str());
+    return ok;
 }
 
 bool Matches(const PanelConfig& c, const PanelTarget& t)
