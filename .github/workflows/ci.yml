@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the WDK NuGet package
+        uses: actions/cache@v4
+        with:
+          path: third_party/wdk
+          key: wdk-${{ hashFiles('scripts/fetch-deps.ps1') }}
+
+      - name: Fetch the WDK (headers and libs for the driver)
+        shell: pwsh
+        run: scripts/fetch-deps.ps1
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationVersion
+          $gen = if ($vs -like '18.*') { 'Visual Studio 18 2026' } else { 'Visual Studio 17 2022' }
+          cmake -S . -B build -G $gen -A x64
+
+      - name: Build (warnings are errors)
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: SplitDisplay-binaries
+          path: |
+            build/Release/splitdisplay.exe
+            build/Release/sdctl.exe
+            build/Release/SplitDisplayIdd.dll

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "protocol.h"
+#include "ring.h"
 
 namespace SplitDisplay
 {

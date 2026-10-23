@@ -8,6 +8,12 @@ $name = "SplitDisplay-v$Version-x64"
 $stage = Join-Path $root "out\$name"
 $zip = Join-Path $root "out\$name.zip"
 
+# The one true version lives in CMakeLists.txt (manifest, VERSIONINFO and the settings window
+# all read it from there); refuse to package a zip whose name would disagree with the binaries.
+$cmakeLists = Get-Content (Join-Path $root 'CMakeLists.txt') -Raw
+if ($cmakeLists -notmatch 'project\(SplitDisplay VERSION ([0-9]+\.[0-9]+\.[0-9]+)') { throw 'could not read the project version from CMakeLists.txt' }
+if ($Matches[1] -ne $Version) { throw "release version $Version != CMakeLists.txt version $($Matches[1]); bump the project version there first" }
+
 cmake --build (Join-Path $root 'build') --config Release
 if ($LASTEXITCODE) { throw 'build failed' }
 
