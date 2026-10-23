@@ -50,7 +50,7 @@ add_executable(splitdisplay
     src/splitdisplay/main.cpp src/splitdisplay/topology.cpp src/splitdisplay/gui.cpp src/splitdisplay/autostart.cpp
     src/splitdisplay/guard.cpp src/splitdisplay/frames.cpp
     src/splitdisplay/splitdisplay.rc ${CMAKE_BINARY_DIR}/generated/splitdisplay.manifest)
-target_link_libraries(splitdisplay PRIVATE sdcommon comctl32 shcore taskschd secur32 comsuppw oleaut32 shell32 dwmapi slc wtsapi32 dbghelp mscms uxtheme d3dcompiler)
+target_link_libraries(splitdisplay PRIVATE sdcommon comctl32 shcore taskschd secur32 comsuppw oleaut32 shell32 dwmapi slc wtsapi32 dbghelp mscms uxtheme d3dcompiler avrt)
 target_compile_definitions(splitdisplay PRIVATE SPLITDISPLAY_VERSION="${PROJECT_VERSION}"
     SD_VER_MAJOR=${PROJECT_VERSION_MAJOR} SD_VER_MINOR=${PROJECT_VERSION_MINOR} SD_VER_PATCH=${PROJECT_VERSION_PATCH})
 # No console window when started at logon; everything goes to splitdisplay.log.

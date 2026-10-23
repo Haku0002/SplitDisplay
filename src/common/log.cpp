@@ -15,6 +15,16 @@ void LogInit(const wchar_t* fileName)
     ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay\\", path, MAX_PATH);
     CreateDirectoryW(path, nullptr);
     wcscat_s(path, fileName);
+    // One rotation step at startup: logs are appended for the life of the install and a
+    // machine that splits at every logon for years would grow them without bound.
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad) && fad.nFileSizeHigh == 0 && fad.nFileSizeLow > 5 * 1024 * 1024)
+    {
+        wchar_t old[MAX_PATH];
+        wcscpy_s(old, path);
+        wcscat_s(old, L".old");
+        MoveFileExW(path, old, MOVEFILE_REPLACE_EXISTING);
+    }
     // Shared so the watchdog (a second process) and readers can use the same file.
     g_file = _wfsopen(path, L"a, ccs=UTF-8", _SH_DENYNO);
 }
