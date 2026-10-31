@@ -1,6 +1,27 @@
 # SplitDisplay uninstaller (run through Uninstall.cmd, which elevates).
 # Restores the display, removes the logon task, the driver, the certificate and the program files.
 $ErrorActionPreference = 'Continue'
+
+# Published names (oemNN.inf) of every SplitDisplayIdd package in the driver store.
+# pnputil's text output is localized, so parse its XML; fall back to the text form on
+# Windows versions whose pnputil has no /format option.
+function Get-SplitDisplayDriverPackages {
+    try {
+        $text = (pnputil /enum-drivers /format xml 2>$null | Out-String)
+        $start = $text.IndexOf('<?xml')
+        if ($start -ge 0) {
+            $doc = [xml]$text.Substring($start)
+            return @($doc.PnpUtil.Driver | Where-Object { $_.OriginalName -ieq 'splitdisplayidd.inf' } | ForEach-Object { $_.DriverName })
+        }
+    } catch { }
+    $names = @()
+    $lines = pnputil /enum-drivers
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match 'Original Name:\s+splitdisplayidd\.inf' -and $lines[$i - 1] -match 'Published Name:\s+(oem\d+\.inf)') { $names += $Matches[1] }
+    }
+    return $names
+}
+
 $dest = Join-Path $env:ProgramFiles 'SplitDisplay'
 $exe = Join-Path $dest 'splitdisplay.exe'
 $sdctl = Join-Path $dest 'sdctl.exe'
@@ -16,12 +37,9 @@ Unregister-ScheduledTask -TaskName 'SplitDisplay' -Confirm:$false -ErrorAction S
 
 Write-Host '== Removing the driver'
 if (Test-Path $sdctl) { & $sdctl driver-remove | Out-Null }
-$lines = pnputil /enum-drivers
-for ($i = 0; $i -lt $lines.Count; $i++) {
-    if ($lines[$i] -match 'Original Name:\s+splitdisplayidd\.inf' -and $lines[$i - 1] -match 'Published Name:\s+(oem\d+\.inf)') {
-        pnputil /delete-driver $Matches[1] /uninstall | Out-Null
-        Write-Host "  removed $($Matches[1])"
-    }
+foreach ($oem in Get-SplitDisplayDriverPackages) {
+    pnputil /delete-driver $oem /uninstall | Out-Null
+    Write-Host "  removed $oem"
 }
 
 Write-Host '== Removing the certificate'

@@ -1,4 +1,4 @@
-﻿# SplitDisplay installer (run through Install.cmd, which elevates).
+# SplitDisplay installer (run through Install.cmd, which elevates).
 #
 # 1. Signs the bundled driver with a brand-new certificate created on THIS machine, trusts that
 #    certificate, then deletes its private key. Nothing signed by anyone else is trusted, and
@@ -11,9 +11,37 @@ param([string]$Panel)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $dest = Join-Path $env:ProgramFiles 'SplitDisplay'
+$data = Join-Path $env:ProgramData 'SplitDisplay'
 $subject = 'CN=SplitDisplay Local Driver Signing'
 
+# The settings window runs unprivileged and writes config/logs here; files created so far were
+# made by an elevated process and are read-only for the user. Grant the installing user Modify.
+New-Item -ItemType Directory -Force $data | Out-Null
+$me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls $data /grant "${me}:(OI)(CI)M" /T /C 2>&1 | Out-Null
+
 function Step($msg) { Write-Host "`n== $msg" -ForegroundColor Cyan }
+
+# Published names (oemNN.inf) of every SplitDisplayIdd package in the driver store.
+# pnputil's text output is localized, so parse its XML; fall back to the text form on
+# Windows versions whose pnputil has no /format option.
+function Get-SplitDisplayDriverPackages {
+    try {
+        $text = (pnputil /enum-drivers /format xml 2>$null | Out-String)
+        $start = $text.IndexOf('<?xml')
+        if ($start -ge 0) {
+            $doc = [xml]$text.Substring($start)
+            return @($doc.PnpUtil.Driver | Where-Object { $_.OriginalName -ieq 'splitdisplayidd.inf' } | ForEach-Object { $_.DriverName })
+        }
+    } catch { }
+    $names = @()
+    $lines = pnputil /enum-drivers
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match 'Original Name:\s+splitdisplayidd\.inf' -and $lines[$i - 1] -match 'Published Name:\s+(oem\d+\.inf)') { $names += $Matches[1] }
+    }
+    return $names
+}
+
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run Install.cmd (it asks for administrator rights).' }
@@ -53,8 +81,10 @@ try {
     if ($sig.Status -ne 'Valid') { throw "signing the driver catalog failed: $($sig.Status) $($sig.StatusMessage)" }
 }
 finally {
-    # The private key is never needed again.
+    # The private key is never needed again. The trusted root stays behind, so a key that
+    # survives this would let its holder sign drivers forever: verify it is really gone.
     Remove-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -DeleteKey -ErrorAction SilentlyContinue
+    if (Get-Item "Cert:\LocalMachine\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue) { throw 'could not delete the one-time signing key' }
 }
 Write-Host "Certificate $($cert.Thumbprint) trusted; private key deleted."
 
@@ -63,12 +93,7 @@ Step 'Installing the virtual monitor driver'
 if ($LASTEXITCODE) { throw "driver install failed (see $env:ProgramData\SplitDisplay\sdctl.log)" }
 
 # Driver packages from earlier installs are no longer needed (the one in use cannot be deleted).
-$lines = pnputil /enum-drivers
-for ($i = 1; $i -lt $lines.Count; $i++) {
-    if ($lines[$i] -match 'Original Name:\s+splitdisplayidd\.inf' -and $lines[$i - 1] -match 'Published Name:\s+(oem\d+\.inf)') {
-        pnputil /delete-driver $Matches[1] 2>&1 | Out-Null
-    }
-}
+foreach ($oem in Get-SplitDisplayDriverPackages) { pnputil /delete-driver $oem 2>&1 | Out-Null }
 
 # Certificates from earlier installs are no longer needed.
 foreach ($store in 'Root', 'TrustedPublisher') {

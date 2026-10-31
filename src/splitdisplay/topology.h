@@ -10,8 +10,6 @@ int GetScalePercentForTarget(LUID adapter, UINT32 targetId);
 // Applies a scale percentage to the active monitors with exactly these names.
 void SetScalePercent(const std::vector<std::wstring>& names, int percent);
 
-#include <string>
-
 struct PlacedDisplay
 {
     std::wstring devicePath;
@@ -28,15 +26,36 @@ bool ArrangeMonitors(const std::vector<RECT>& desktop, const std::vector<PlacedD
 // which can leave gaps the cursor cannot cross. Returns true if a correction was applied.
 bool KeepGroupAligned(UINT first, const std::vector<RECT>& regions);
 
-// Sets every named active monitor to `hz` (and saves it for Windows to restore next time).
-void ForceRefresh(const std::vector<std::wstring>& names, int hz);
+// Sets every named active monitor to the given rate (and saves it for Windows to restore next
+// time). The mode switch itself goes through ChangeDisplaySettingsEx, which only takes whole
+// Hz and picks the closest offered mode; the offered modes carry the exact fractional rate.
+void ForceRefresh(const std::vector<std::wstring>& names, int milliHz);
 
-// Current refresh rate (Hz, rounded) of the active monitor with exactly this name, or 0.
-int CurrentRefreshOf(const std::wstring& name);
+// Current refresh rate (milli-Hz) of the active monitor with exactly this name, or 0.
+int CurrentRefreshMilliOf(const std::wstring& name);
 
 // The same for one target (a physical panel: its name need not be unique, or may be empty).
-void ForceRefreshTarget(LUID adapter, UINT32 targetId, int hz);
-int CurrentRefreshOfTarget(LUID adapter, UINT32 targetId);
+void ForceRefreshTarget(LUID adapter, UINT32 targetId, int milliHz);
+int CurrentRefreshMilliOfTarget(LUID adapter, UINT32 targetId);
+
+// One QueryDisplayConfig pass describing every active monitor. The session loop used to query
+// per monitor per question (aligned? rate of monitor k? scale? rotation?), each a full CCD
+// round trip with per-path device-info calls; a snapshot answers all of them at once.
+struct MonitorSnapshot
+{
+    std::wstring name;
+    std::wstring devicePath;
+    std::wstring gdiName;
+    LUID adapter{};
+    UINT32 targetId = 0;
+    POINT position{};
+    UINT32 width = 0, height = 0;
+    int refreshMilliHz = 0;
+    int scalePercent = 0;
+    DISPLAYCONFIG_ROTATION rotation = DISPLAYCONFIG_ROTATION_IDENTITY;
+};
+std::vector<MonitorSnapshot> SnapshotMonitors();
+const MonitorSnapshot* FindInSnapshot(const std::vector<MonitorSnapshot>& snap, const std::wstring& name);
 
 // Desktop rect of the active monitor with exactly this name.
 bool DesktopRectOf(const std::wstring& name, RECT& out);
@@ -57,3 +76,9 @@ void ForceExtendTopology();
 
 // GDI device name (\\.\DISPLAYn) of the source driving this target while it is on the desktop, else "".
 std::wstring GdiNameOfTarget(LUID adapter, UINT32 targetId);
+
+// GDI device name of the active monitor with exactly this friendly name, else "".
+std::wstring GdiNameOfMonitor(const std::wstring& name);
+
+// "100" / "59.94" style formatting for a milli-Hz rate.
+std::wstring FormatHz(int milliHz);

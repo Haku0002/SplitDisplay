@@ -18,6 +18,10 @@
 // Emergency exit while running: Ctrl+Alt+Shift+F12.
 
 #include <Windows.h>
+#include <DbgHelp.h>
+#include <Icm.h>
+#include <Shellapi.h>
+#include <avrt.h>
 #include <d3d11_4.h>
 #include <dwmapi.h>
 #include <dxgi1_6.h>
@@ -46,6 +50,9 @@
 #include <vector>
 
 #include "autostart.h"
+#include "frames.h"
+#include "guard.h"
+#include "ring.h"
 #include "layout.h"
 #include "log.h"
 #include "names.h"
@@ -62,6 +69,10 @@ static std::atomic_bool g_abort = false;   // end the session (a panel was lost,
 static std::atomic_bool g_restart = false; // end the session and start a new one right away
 static bool g_windowMode = false;          // this session composites into a window (see "Window mode")
 static HANDLE g_stopEvent = nullptr;
+// Per-panel session state shared between the session loop and the panel workers,
+// indexed by PanelSession::index.
+static std::atomic<int> g_desiredMilliHz[SD_MAX_MONITORS]; // refresh rate the panel should run at now
+static std::atomic<int> g_rotations[SD_MAX_MONITORS];      // DISPLAYCONFIG_ROTATION per virtual monitor
 static volatile LONG64* g_heartbeat = nullptr;
 // Panel workers report here; the main thread only beats while every worker is alive.
 static thread_local std::atomic<ULONGLONG>* t_workerBeat = nullptr;
@@ -201,21 +212,27 @@ struct PanelSession
     PanelTarget target;
     std::vector<RECT> regions; // on the panel
     UINT first = 0;            // index of its first virtual monitor
-    int scale = 0;
-    int refresh = 0;           // Hz for the panel and all of its split monitors
-    std::vector<int> rates;    // rates the panel supports (offered on the split monitors)
+    int index = 0;             // slot in the session arrays (g_desiredMilliHz, beats, ...)
+    int scale = 0;             // scale inherited from the physical panel, percent
+    std::vector<int> scales;   // per-region scale actually in effect (persisted on user change)
+    int refreshMilliHz = 0;    // milli-Hz for the panel and all of its split monitors (session start)
+    std::vector<int> rates;    // rates the panel supports in milli-Hz (offered on the split monitors)
 };
 
 static void WriteRuntime(const std::vector<PanelSession>& ps)
 {
     auto path = RuntimePath();
-    DeleteFileW(path.c_str());
-    WritePrivateProfileStringW(L"Runtime", L"panels", std::to_wstring(ps.size()).c_str(), path.c_str());
+    // Written to a temp file and renamed over the original: the settings window reads this
+    // file every second and must never see it half-written.
+    auto temp = path + L".tmp" + std::to_wstring(GetCurrentProcessId());
+    DeleteFileW(temp.c_str());
+    const wchar_t* file = temp.c_str();
+    WritePrivateProfileStringW(L"Runtime", L"panels", std::to_wstring(ps.size()).c_str(), file);
     for (size_t i = 0; i < ps.size(); i++)
     {
         auto sec = L"Panel" + std::to_wstring(i + 1);
         auto& p = ps[i];
-        auto put = [&](const wchar_t* k, const std::wstring& v) { WritePrivateProfileStringW(sec.c_str(), k, v.c_str(), path.c_str()); };
+        auto put = [&](const wchar_t* k, const std::wstring& v) { WritePrivateProfileStringW(sec.c_str(), k, v.c_str(), file); };
         put(L"id", p.target.monitorDevicePath);
         put(L"x", std::to_wstring(p.target.position.x));
         put(L"y", std::to_wstring(p.target.position.y));
@@ -224,6 +241,8 @@ static void WriteRuntime(const std::vector<PanelSession>& ps)
         put(L"first", std::to_wstring(p.first));
         put(L"count", std::to_wstring(p.regions.size()));
     }
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, file); // flush
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(temp.c_str());
 }
 
 static void ClearRuntime()
@@ -511,98 +530,28 @@ static void SpawnWatchdog(const std::vector<PanelTarget>& ts, DWORD maxSeconds)
 
 #pragma endregion
 
-#pragma region Frame source
-
-// Consumer side of one virtual monitor's texture ring (protocol.h).
-struct FrameSource
-{
-    int index = 0;
-    LONG gen = -1;     // generation of the handles we hold, -1 = none
-    LONG seenGen = -1; // last driver generation we tried to attach to (even if that failed)
-    winrt::com_ptr<ID3D11Texture2D> tex[SD_BUFFERS];
-    winrt::com_ptr<ID3D11Fence> fence;
-    UINT width = 0, height = 0;
-    LONG64 lastSeq = -1;
-    bool reserved = false;
-
-    void Drop()
-    {
-        for (auto& t : tex) t = nullptr;
-        fence = nullptr;
-        gen = -1;
-    }
-
-    bool Refresh(ID3D11Device5* dev, SdShared* s, HANDLE driverProc)
-    {
-        auto& m = s->mon[index];
-        LONG g1 = m.handleGeneration;
-        Drop();
-        if ((g1 & 1) || m.fenceHandle == 0) return false;
-        MemoryBarrier();
-
-        auto open = [&](UINT64 remote, auto&& fn) -> bool {
-            HANDLE h = nullptr;
-            if (!DuplicateHandle(driverProc, (HANDLE)(ULONG_PTR)remote, GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS)) return false;
-            HRESULT hr = fn(h);
-            CloseHandle(h);
-            return SUCCEEDED(hr);
-        };
-        bool ok = true;
-        for (int i = 0; i < SD_BUFFERS && ok; i++)
-            ok = open(m.texHandle[i], [&](HANDLE h) { return dev->OpenSharedResource1(h, IID_PPV_ARGS(tex[i].put())); });
-        if (ok) ok = open(m.fenceHandle, [&](HANDLE h) { return dev->OpenSharedFence(h, IID_PPV_ARGS(fence.put())); });
-
-        MemoryBarrier();
-        if (!ok || m.handleGeneration != g1)
-        {
-            Drop();
-            return false;
-        }
-        width = m.width;
-        height = m.height;
-        gen = g1;
-        Log(L"mon%d: attached ring gen=%ld %ux%u fmt=%u", index, gen, width, height, m.format);
-        return true;
-    }
-
-    // Returns the buffer index now reserved for reading, or -1.
-    int Acquire(SdShared* s, UINT64& fenceValue)
-    {
-        auto& m = s->mon[index];
-        for (int attempt = 0; attempt < 3; attempt++)
-        {
-            LONG l = m.latest;
-            if (l < 0 || l >= SD_BUFFERS) return -1;
-            InterlockedExchange(&m.readerIndex, l);
-            if (m.latest == l)
-            {
-                fenceValue = m.fenceValue[l];
-                reserved = true;
-                return l;
-            }
-            InterlockedExchange(&m.readerIndex, -1);
-        }
-        return -1;
-    }
-
-    void Release(SdShared* s)
-    {
-        if (!reserved) return;
-        InterlockedExchange(&s->mon[index].readerIndex, -1);
-        reserved = false;
-    }
-};
-
-#pragma endregion
-
 #pragma region Compositor
 
 enum class Outcome
 {
-    Stop,        // user asked to stop, test finished, or another panel ended the session
-    DisplaysOff, // Windows powered the virtual monitors off; panel released so it can sleep
-    Lost,        // panel/GPU went away; caller reverts and retries
+    Stop,           // user asked to stop, test finished, or another panel ended the session
+    DisplaysOff,    // Windows powered the virtual monitors off; panel released so it can sleep
+    RefreshChanged, // panel rate changed and could not be re-applied in place; restart this panel only
+    Lost,           // panel/GPU/driver went away; caller reverts and retries
 };
+
+// The driver updates driverHeartbeat once a second. If the UMDF host died and restarted,
+// the shared section and its textures outlive it: without this check the compositor would
+// keep scanning out the last frozen frame forever with every heartbeat looking healthy.
+// True while the driver is alive; throttled so callers can ask every frame.
+static bool DriverAlive(SharedView& shm, ULONGLONG& nextCheck)
+{
+    ULONGLONG now = GetTickCount64();
+    if (now < nextCheck) return true;
+    nextCheck = now + 500;
+    LONG64 beat = SdReadI64(&shm->driverHeartbeat);
+    return !beat || now - (ULONGLONG)beat <= 5000;
+}
 
 static wdc::DisplayTarget WaitForOwnableTarget(const wdc::DisplayManager& mgr, LUID luid, UINT32 targetId, int timeoutMs)
 {
@@ -650,54 +599,13 @@ static bool AnyVirtualSignal(SdShared* s, const PanelSession& p)
     return false;
 }
 
-// Compares with the generation last tried, not the one attached: a monitor whose ring cannot be opened
-// (switched off, or on another GPU) must not count as changed on every pass.
-static bool FramesChanged(SdShared* s, const std::vector<FrameSource>& src)
-{
-    for (auto& f : src)
-        if (f.seenGen != s->mon[f.index].handleGeneration || s->mon[f.index].frameSeq != f.lastSeq) return true;
-    return false;
-}
-
-// Copies the newest frame of every split monitor into its region of `dst` (black where a monitor has
-// no frame). The copies hold ring reservations until the caller's fence says they are done.
-static void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HANDLE driverProc, std::vector<FrameSource>& src,
-                        const std::vector<RECT>& regions, ID3D11Texture2D* dst, ID3D11RenderTargetView* rtv, UINT width, UINT height)
-{
-    const float black[4] = { 0, 0, 0, 1 };
-    for (size_t k = 0; k < src.size(); k++)
-    {
-        auto& f = src[k];
-        auto& m = s->mon[f.index];
-        LONG g = m.handleGeneration;
-        if (f.seenGen != g)
-        {
-            f.seenGen = g;
-            f.Refresh(dev, s, driverProc);
-        }
-        LONG64 seq = m.frameSeq;
-        f.lastSeq = seq;
-
-        // Region on the panel, clipped to the target size.
-        RECT rc = regions[k];
-        rc.right = std::min<LONG>(rc.right, (LONG)width);
-        rc.bottom = std::min<LONG>(rc.bottom, (LONG)height);
-        if (rc.right <= rc.left || rc.bottom <= rc.top) continue;
-        D3D11_RECT area{ rc.left, rc.top, rc.right, rc.bottom };
-        UINT64 fv = 0;
-        int idx = f.gen >= 0 ? f.Acquire(s, fv) : -1;
-        if (idx < 0)
-        {
-            ctx->ClearView(rtv, black, &area, 1);
-            continue;
-        }
-        ctx->Wait(f.fence.get(), fv);
-        D3D11_BOX box{ 0, 0, 0, std::min<UINT>(f.width, (UINT)(rc.right - rc.left)), std::min<UINT>(f.height, (UINT)(rc.bottom - rc.top)), 1 };
-        ctx->CopySubresourceRegion(dst, 0, (UINT)rc.left, (UINT)rc.top, 0, f.tex[idx].get(), 0, &box);
-    }
-}
-
 // Drives one panel until the session ends. Runs on its own thread.
+//
+// Frames are copied into the idle primary as soon as the driver signals them and the
+// scanout task is queued at once, so the flip takes effect at the next vblank; the
+// WaitForVBlank after each submit only paces submissions to the panel rate. (The old
+// order -- wait for the vblank, then copy -- made every frame that arrived mid-cycle
+// miss the vblank it could have made.)
 static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadline)
 {
     const PanelTarget& panel = p.target;
@@ -718,24 +626,30 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
             Log(L"this Windows edition cannot own a display; set mode=auto or mode=window in config.ini");
         return Outcome::Lost;
     }
+    int activeMilliHz = g_desiredMilliHz[p.index].load();
+    if (!activeMilliHz) activeMilliHz = p.refreshMilliHz;
+    auto pickMode = [&](const wdc::DisplayPath& ph, int milliHz) {
+        wdc::DisplayModeInfo best{ nullptr };
+        double bestDiff = 1e9;
+        for (auto&& m : ph.FindModes(wdc::DisplayModeQueryOptions::OnlyPreferredResolution))
+        {
+            auto v = m.PresentationRate().VerticalSyncRate;
+            double diff = std::abs((double)v.Numerator / v.Denominator - milliHz / 1000.0);
+            if (diff < bestDiff)
+            {
+                bestDiff = diff;
+                best = m;
+            }
+        }
+        return best;
+    };
     auto state = acq.State();
     auto path = state.ConnectTarget(target);
     path.IsInterlaced(false);
     path.Scaling(wdc::DisplayPathScaling::Identity);
     path.SourcePixelFormat(wgd::DirectXPixelFormat::B8G8R8A8UIntNormalized);
 
-    wdc::DisplayModeInfo best{ nullptr };
-    double bestDiff = 1e9;
-    for (auto&& m : path.FindModes(wdc::DisplayModeQueryOptions::OnlyPreferredResolution))
-    {
-        auto v = m.PresentationRate().VerticalSyncRate;
-        double diff = std::abs((double)v.Numerator / v.Denominator - p.refresh);
-        if (diff < bestDiff)
-        {
-            bestDiff = diff;
-            best = m;
-        }
-    }
+    auto best = pickMode(path, activeMilliHz);
     if (!best)
     {
         Log(L"no usable mode");
@@ -757,6 +671,26 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
     Log(L"panel %u owned: %dx%d @ %.3f Hz", panel.targetId, res.Width, res.Height, (double)rate.Numerator / rate.Denominator);
     Beat();
 
+    // Switches the owned path to another refresh rate without releasing the panel, so a
+    // rate change costs one mode switch instead of a teardown. False = caller restarts.
+    auto reapplyRate = [&](int milliHz) {
+        try
+        {
+            auto read = mgr.TryAcquireTargetsAndReadCurrentState(targets);
+            if (read.ErrorCode() != wdc::DisplayManagerResult::Success) return false;
+            auto st = read.State();
+            auto ph = st.GetPathForTarget(target);
+            auto mode = pickMode(ph, milliHz);
+            if (!mode) return false;
+            ph.ApplyPropertiesFromMode(mode);
+            return st.TryApply(wdc::DisplayStateApplyOptions::None).Status() == wdc::DisplayStateOperationStatus::Success;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    };
+
     winrt::com_ptr<IDXGIFactory6> factory;
     factory.capture(&CreateDXGIFactory2, 0);
     winrt::com_ptr<IDXGIAdapter4> adapter;
@@ -766,6 +700,12 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
     winrt::check_hresult(D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, d0.put(), nullptr, c0.put()));
     auto dev = d0.as<ID3D11Device5>();
     auto ctx = c0.as<ID3D11DeviceContext4>();
+    // Same reasoning as window mode: these copies sit on the path of every frame.
+    dev.as<IDXGIDevice>()->SetGPUThreadPriority(7);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    StretchBlitter blitter;
+    bool blitterOk = blitter.Init(dev.get());
+    if (!blitterOk) Log(L"panel %u: stretch blitter unavailable, scaled modes will be cropped", panel.targetId);
     winrt::com_ptr<ID3D11Fence> fence;
     fence.capture(dev, &ID3D11Device5::CreateFence, 0, D3D11_FENCE_FLAG_SHARED);
     UINT64 fenceValue = 0;
@@ -817,21 +757,30 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
             Log(L"warning: virtual monitor %d renders on GPU %08X:%08X but the panel is on %08X:%08X; cross-GPU copy is not supported, it will stay black",
                 src[i].index, a.HighPart, a.LowPart, panel.adapter.HighPart, panel.adapter.LowPart);
     }
+    FrameEventWaiter waiter(src.size());
 
     LARGE_INTEGER freq, t0, now{};
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
     UINT64 vblanks = 0, presents = 0, stalls = 0;
     UINT64 pendingFence = 0; // our copies that still hold ring reservations
+    int nextPrimary = 0;
     bool presented = false;
     ULONGLONG darkSince = 0;
+    ULONGLONG loopStart = GetTickCount64();
+    ULONGLONG nextDriverCheck = 0;
     bool poweredOff = false;
     Outcome outcome = Outcome::Stop;
 
     while (!ShouldExit())
     {
         Beat();
-        device.WaitForVBlank(source);
+        if (!DriverAlive(shm, nextDriverCheck))
+        {
+            Log(L"panel %u: driver heartbeat lost, ending the session", panel.targetId);
+            outcome = Outcome::Lost;
+            break;
+        }
         auto status = source.Status();
         if (status == wdc::DisplaySourceStatus::PoweredOff)
         {
@@ -852,20 +801,45 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
         }
         if (status != wdc::DisplaySourceStatus::Active)
         {
+            // The source can report a transient status while the path is being applied.
+            if (!presented && GetTickCount64() - loopStart < 3000)
+            {
+                if (!Nap(50)) break;
+                continue;
+            }
             Log(L"panel %u source status %d", panel.targetId, static_cast<int>(status));
             outcome = Outcome::Lost;
             break;
         }
-        vblanks++;
+
+        int desiredMilliHz = g_desiredMilliHz[p.index].load();
+        if (desiredMilliHz && desiredMilliHz != activeMilliHz)
+        {
+            if (reapplyRate(desiredMilliHz))
+            {
+                Log(L"panel %u switched to %s Hz in place", panel.targetId, FormatHz(desiredMilliHz).c_str());
+                activeMilliHz = desiredMilliHz;
+                presented = false;
+            }
+            else
+            {
+                Log(L"panel %u: could not re-apply %s Hz in place, restarting this panel", panel.targetId, FormatHz(desiredMilliHz).c_str());
+                outcome = Outcome::RefreshChanged;
+                break;
+            }
+        }
 
         // Copies issued last frame are almost always done by now; only wait if they are not.
+        // The reservations are only released once the copies have finished, or the driver
+        // could overwrite a ring buffer that is still being read (window mode already did).
         if (pendingFence && fence->GetCompletedValue() < pendingFence)
         {
             stalls++;
             fence->SetEventOnCompletion(pendingFence, fenceEvent);
             WaitForSingleObject(fenceEvent, 100);
+            if (fence->GetCompletedValue() < pendingFence) continue;
         }
-        for (auto& s : src) s.Release(shm.get());
+        for (auto& s1 : src) s1.Release(shm.get());
         pendingFence = 0;
 
         // Windows turned this panel's virtual monitors off: let the panel lose signal and sleep too.
@@ -877,17 +851,20 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
                 outcome = Outcome::DisplaysOff;
                 break;
             }
+            if (!Nap(100)) break;
+            if (deadline && GetTickCount64() >= deadline) break;
+            continue;
         }
-        else
-        {
-            darkSince = 0;
-        }
+        darkSince = 0;
 
         if (!presented || FramesChanged(shm.get(), src))
         {
-            int back = (int)(presents & 1);
+            int back = nextPrimary;
+            nextPrimary ^= 1;
+            int rotations[SD_MAX_MONITORS] = {};
+            for (size_t k = 0; k < src.size() && p.first + k < SD_MAX_MONITORS; k++) rotations[k] = g_rotations[p.first + k].load();
             DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc, src, p.regions, primTex[back].get(), primRtv[back].get(), (UINT)res.Width,
-                (UINT)res.Height);
+                (UINT)res.Height, back, blitterOk ? &blitter : nullptr, rotations);
             ctx->Signal(fence.get(), ++fenceValue);
             ctx->Flush();
             pendingFence = fenceValue;
@@ -898,6 +875,20 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
             pool.ExecuteTask(task);
             presents++;
             presented = true;
+            device.WaitForVBlank(source); // pace to the panel; the flip lands on this edge
+            vblanks++;
+        }
+        else
+        {
+            HANDLE wake[SD_MAX_MONITORS];
+            DWORD n = waiter.Build(src, wake, ARRAYSIZE(wake));
+            if (FramesChanged(shm.get(), src)) continue;
+            if (n) WaitForMultipleObjects(n, wake, FALSE, 100);
+            else
+            {
+                device.WaitForVBlank(source);
+                vblanks++;
+            }
         }
 
         if (deadline && GetTickCount64() >= deadline) break;
@@ -908,10 +899,10 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
         fence->SetEventOnCompletion(pendingFence, fenceEvent);
         WaitForSingleObject(fenceEvent, 250);
     }
-    for (auto& s : src)
+    for (auto& s1 : src)
     {
-        s.Release(shm.get());
-        s.Drop();
+        s1.Release(shm.get());
+        s1.Drop();
     }
 
     QueryPerformanceCounter(&now);
@@ -931,6 +922,7 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
     return outcome;
 }
 
+
 #pragma region Window mode
 
 // Without display specialization (see SpecializedDisplaysLicensed) a panel cannot be taken off the
@@ -938,335 +930,6 @@ static Outcome Composite(SharedView& shm, const PanelSession& p, ULONGLONG deadl
 // the bottom-right corner of all other displays so only one corner touches them, and shows its
 // split monitors in a topmost window covering it. A guard thread keeps the cursor and application
 // windows off the parked panels. Costs one DWM composition step compared to exclusive mode.
-
-static constexpr wchar_t kCompositorClass[] = L"SplitDisplayCompositor";
-
-static bool MonitorRectByName(const std::wstring& gdiName, RECT& out)
-{
-    struct Ctx
-    {
-        const std::wstring* name;
-        RECT* out;
-        bool found;
-    } c{ &gdiName, &out, false };
-    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL {
-        auto* c = (Ctx*)lp;
-        MONITORINFOEXW mi{};
-        mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(m, &mi) && _wcsicmp(mi.szDevice, c->name->c_str()) == 0)
-        {
-            *c->out = mi.rcMonitor;
-            c->found = true;
-            return FALSE;
-        }
-        return TRUE;
-    }, (LPARAM)&c);
-    return c.found;
-}
-
-// Finds a parked panel's desktop rect. Resolving the GDI name goes through QueryDisplayConfig, which
-// takes about a millisecond, so it is cached and only re-resolved now and then, or when it stops
-// matching a monitor (the rect lookup itself is cheap).
-struct PanelLocator
-{
-    LUID adapter{};
-    UINT32 targetId = 0;
-    std::wstring gdi;
-    int uses = 0;
-
-    bool Rect(RECT& out)
-    {
-        if (gdi.empty() || ++uses % 10 == 0) gdi = GdiNameOfTarget(adapter, targetId);
-        if (!gdi.empty() && MonitorRectByName(gdi, out)) return true;
-        gdi = GdiNameOfTarget(adapter, targetId);
-        return !gdi.empty() && MonitorRectByName(gdi, out);
-    }
-};
-
-struct ParkedPanel
-{
-    PanelLocator where;
-    std::wstring homeName; // the panel's first split monitor ("Split N"): stray windows are moved there
-    RECT home;             // its desktop rect (the split monitors can be moved around as a group)
-    RECT rect{}; // where the panel is on the desktop now (refreshed by the guard)
-};
-
-// Owned by the guard thread; the mouse hook runs on that thread too, so no locking is needed.
-static std::vector<ParkedPanel> g_parked;
-static std::vector<RECT> g_openMonitors; // every monitor the cursor may use
-static std::atomic_bool g_guardQuit = false;
-static std::set<HWND> g_remaximize;    // restored on a parked panel by the guard, to maximize again once moved
-static std::map<HWND, int> g_moveTries; // windows the guard tried to move off a parked panel
-
-static void RefreshGuardRects(bool homes)
-{
-    for (auto& p : g_parked)
-    {
-        if (!p.where.Rect(p.rect)) p.rect = {};
-        if (homes) DesktopRectOf(p.homeName, p.home); // keeps the last known rect if it is off right now
-    }
-    g_openMonitors.clear();
-    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM) -> BOOL {
-        MONITORINFO mi{ sizeof(mi) };
-        if (!GetMonitorInfoW(m, &mi)) return TRUE;
-        for (auto& p : g_parked)
-            if (EqualRect(&p.rect, &mi.rcMonitor)) return TRUE;
-        g_openMonitors.push_back(mi.rcMonitor);
-        return TRUE;
-    }, 0);
-}
-
-static const ParkedPanel* ParkedAt(POINT pt)
-{
-    for (auto& p : g_parked)
-        if (PtInRect(&p.rect, pt)) return &p;
-    return nullptr;
-}
-
-static POINT NearestOpenPoint(POINT pt)
-{
-    POINT best = pt;
-    LONGLONG bestDist = LLONG_MAX;
-    for (auto& r : g_openMonitors)
-    {
-        POINT c{ std::clamp(pt.x, r.left, r.right - 1), std::clamp(pt.y, r.top, r.bottom - 1) };
-        LONGLONG d = (LONGLONG)(c.x - pt.x) * (c.x - pt.x) + (LONGLONG)(c.y - pt.y) * (c.y - pt.y);
-        if (d < bestDist)
-        {
-            bestDist = d;
-            best = c;
-        }
-    }
-    return best;
-}
-
-static LRESULT CALLBACK GuardMouseProc(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HC_ACTION && wp == WM_MOUSEMOVE && !g_openMonitors.empty())
-    {
-        POINT pt = ((MSLLHOOKSTRUCT*)lp)->pt;
-        if (ParkedAt(pt))
-        {
-            // Swallow the move and put the cursor at the nearest point of an open monitor.
-            POINT to = NearestOpenPoint(pt);
-            SetCursorPos(to.x, to.y);
-            return 1;
-        }
-    }
-    return CallNextHookEx(nullptr, code, wp, lp);
-}
-
-// Moves application windows that ended up on a parked panel (hidden behind its compositor window)
-// to the panel's first split monitor. Async calls only: a hung application must not stall the
-// thread that also runs the mouse hook.
-static BOOL CALLBACK SweepWindow(HWND hwnd, LPARAM)
-{
-    // Cheap checks first: this runs for every top-level window twice a second, on the thread that
-    // also serves the mouse hook.
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return TRUE;
-    RECT r;
-    if (!GetWindowRect(hwnd, &r)) return TRUE;
-    auto* p = ParkedAt({ (r.left + r.right) / 2, (r.top + r.bottom) / 2 });
-    if (!p)
-    {
-        // Moved off a parked panel after being restored there: maximize it again in its new place.
-        if (g_remaximize.erase(hwnd)) ShowWindowAsync(hwnd, SW_MAXIMIZE);
-        g_moveTries.erase(hwnd);
-        return TRUE;
-    }
-    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
-    wchar_t cls[64] = {};
-    GetClassNameW(hwnd, cls, 64);
-    for (auto* shell : { L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", kCompositorClass })
-        if (wcscmp(cls, shell) == 0) return TRUE;
-    BOOL cloaked = FALSE;
-    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
-
-    // A window that keeps coming back (it positions itself, or ignores the move) is left alone after a
-    // few seconds rather than fought over twice a second.
-    int& tries = g_moveTries[hwnd];
-    if (++tries > 10) return TRUE;
-    wchar_t title[128] = {};
-    GetWindowTextW(hwnd, title, 128);
-    if (tries == 10) Log(L"window '%s' (%s) keeps returning to a parked panel; leaving it there", title, cls);
-
-    // A maximized window is restored first and moved on a later sweep, once the restore is done
-    // (async calls to another thread may run in any order), then maximized again where it landed.
-    if (IsZoomed(hwnd))
-    {
-        ShowWindowAsync(hwnd, SW_RESTORE);
-        g_remaximize.insert(hwnd);
-        return TRUE;
-    }
-    LONG hw = p->home.right - p->home.left, hh = p->home.bottom - p->home.top;
-    LONG w = std::min(r.right - r.left, hw), h = std::min(r.bottom - r.top, hh);
-    SetWindowPos(hwnd, nullptr, p->home.left + (hw - w) / 2, p->home.top + (hh - h) / 2, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-    if (tries == 1) Log(L"moved window '%s' (%s) off a parked panel", title, cls);
-    return TRUE;
-}
-
-static void GuardThread()
-{
-    HHOOK hook = SetWindowsHookExW(WH_MOUSE_LL, GuardMouseProc, GetModuleHandleW(nullptr), 0);
-    if (!hook) Log(L"warning: mouse guard not installed (%lu); the cursor can reach the parked panel", GetLastError());
-    ULONGLONG nextSweep = 0;
-    int sweeps = 0;
-    while (!g_guardQuit)
-    {
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
-        if (GetTickCount64() >= nextSweep)
-        {
-            nextSweep = GetTickCount64() + 500;
-            RefreshGuardRects(sweeps++ % 10 == 0); // split monitor rects every 5 s: a QueryDisplayConfig
-            for (auto it = g_remaximize.begin(); it != g_remaximize.end();)
-                it = IsWindow(*it) ? std::next(it) : g_remaximize.erase(it);
-            for (auto it = g_moveTries.begin(); it != g_moveTries.end();)
-                it = IsWindow(it->first) ? std::next(it) : g_moveTries.erase(it);
-            EnumWindows(SweepWindow, 0);
-        }
-        // The hook only sees mouse input; programs can still place the cursor with SetCursorPos.
-        POINT cur;
-        if (!g_openMonitors.empty() && GetCursorPos(&cur) && ParkedAt(cur))
-        {
-            POINT to = NearestOpenPoint(cur);
-            SetCursorPos(to.x, to.y);
-        }
-    }
-    if (hook) UnhookWindowsHookEx(hook);
-}
-
-// A session that ends because the desktop went away (lock screen, Ctrl+Alt+Del, a prompt on its own
-// desktop) unplugs the split monitors, and Windows piles every window onto the one display left
-// behind. Their placement is taken first and applied again once the split is back, so an
-// interruption costs a flicker instead of the arrangement the user had set up.
-struct SavedWindow
-{
-    HWND hwnd;
-    RECT rect;      // where to put it back, in screen coordinates
-    bool maximized; // then maximize it there again
-};
-static std::vector<SavedWindow> g_savedWindows;
-
-static bool ArrangeableWindow(HWND hwnd)
-{
-    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
-    if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return false;
-    wchar_t cls[64] = {};
-    GetClassNameW(hwnd, cls, 64);
-    for (auto* shell : { L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", kCompositorClass })
-        if (wcscmp(cls, shell) == 0) return false;
-    BOOL cloaked = FALSE;
-    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return false;
-    return true;
-}
-
-// Everything is kept in screen coordinates. WINDOWPLACEMENT's rectangle is relative to the primary
-// monitor's work area instead, and that work area is not back yet when the windows are put back
-// (the taskbar is still being rebuilt), which would shift every window by the taskbar's size.
-static void SaveWindowLayout()
-{
-    g_savedWindows.clear();
-    RECT work{};
-    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) work = {};
-    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
-        if (!ArrangeableWindow(hwnd)) return TRUE;
-        RECT rc;
-        if (!GetWindowRect(hwnd, &rc)) return TRUE;
-        WINDOWPLACEMENT wp{ sizeof(wp) };
-        bool maximized = GetWindowPlacement(hwnd, &wp) && wp.showCmd == SW_SHOWMAXIMIZED;
-        if (maximized)
-        {
-            // Its screen rectangle is the whole monitor; the restored one says where to maximize it.
-            const RECT& work = *(const RECT*)lp;
-            rc = wp.rcNormalPosition;
-            OffsetRect(&rc, work.left, work.top);
-        }
-        g_savedWindows.push_back({ hwnd, rc, maximized });
-        return TRUE;
-    }, (LPARAM)&work);
-    Log(L"noted where %zu windows sit", g_savedWindows.size());
-}
-
-// Runs on its own thread, so a slow application cannot hold up the split that has just come back.
-// A maximized window is placed while restored first, so it maximizes on the right monitor.
-static void RestoreWindowLayout()
-{
-    if (g_savedWindows.empty()) return;
-    auto saved = std::move(g_savedWindows);
-    g_savedWindows.clear();
-    HWND front = GetForegroundWindow();
-    std::thread([saved = std::move(saved), front] {
-        Sleep(150); // let Windows settle the split monitors it has just placed
-        auto alive = [](HWND hwnd) { return IsWindow(hwnd) && IsWindowVisible(hwnd); };
-        // Restored first, so the move below decides which monitor each one ends up on.
-        for (auto& w : saved)
-            if (alive(w.hwnd) && IsZoomed(w.hwnd)) ShowWindowAsync(w.hwnd, SW_RESTORE);
-        Sleep(80);
-
-        // Asked asynchronously and checked afterwards: an application still laying itself out after
-        // the monitor change can take a moment to accept a move, or undo it once, and a synchronous
-        // call would make every other window wait for the slowest one. Each window leaves the rounds
-        // as soon as it is in place, so the pass ends with the last window that moves.
-        struct Pending
-        {
-            const SavedWindow* w;
-            int tries;
-        };
-        std::vector<Pending> pending;
-        for (auto& w : saved) pending.push_back({ &w, 0 });
-
-        int moved = 0, zoomed = 0;
-        while (!pending.empty())
-        {
-            for (auto& p : pending)
-                if (alive(p.w->hwnd))
-                    SetWindowPos(p.w->hwnd, nullptr, p.w->rect.left, p.w->rect.top, p.w->rect.right - p.w->rect.left,
-                        p.w->rect.bottom - p.w->rect.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-            Sleep(120);
-            for (auto it = pending.begin(); it != pending.end();)
-            {
-                RECT now;
-                bool gone = !alive(it->w->hwnd);
-                bool there = !gone && GetWindowRect(it->w->hwnd, &now) && EqualRect(&now, &it->w->rect);
-                if (there) moved++;
-                // One that will not take the move (a system window, or one that places itself) is
-                // given up on rather than holding the pass up.
-                if (gone || there || ++it->tries >= 4) it = pending.erase(it);
-                else ++it;
-            }
-        }
-        Sleep(120);
-        // ShowWindow, not a posted SW_MAXIMIZE: some applications ignore that one.
-        for (auto& w : saved)
-            if (w.maximized && alive(w.hwnd) && ShowWindow(w.hwnd, SW_MAXIMIZE) >= 0) zoomed++;
-        if (front && IsWindow(front)) SetForegroundWindow(front);
-        Log(L"put %d windows back where they were (%d maximized)", moved, zoomed);
-    }).detach();
-}
-
-struct GuardRun
-{
-    std::thread thread;
-
-    void Start()
-    {
-        g_guardQuit = false;
-        g_remaximize.clear();
-        g_moveTries.clear();
-        thread = std::thread(GuardThread);
-    }
-
-    void Stop()
-    {
-        if (!thread.joinable()) return;
-        g_guardQuit = true;
-        thread.join();
-    }
-
-    ~GuardRun() { Stop(); }
-};
 
 // Where the panel's scanout is right now: 0..99 = percent of the active area, 100 = vertical blank.
 // Used by test runs to show when split monitor frames arrive relative to the panel's refresh.
@@ -1332,6 +995,8 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     // Our copies are tiny and sit on the path of every frame: let them jump the GPU queue.
     dev.as<IDXGIDevice>()->SetGPUThreadPriority(7);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    StretchBlitter blitter;
+    bool blitterOk = blitter.Init(dev.get());
     winrt::com_ptr<ID3D11Fence> fence;
     fence.capture(dev, &ID3D11Device5::CreateFence, 0, D3D11_FENCE_FLAG_NONE);
     UINT64 fenceValue = 0;
@@ -1342,13 +1007,13 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    wc.lpszClassName = kCompositorClass;
+    wc.lpszClassName = kCompositorWindowClass;
     RegisterClassExW(&wc); // fails harmlessly if another panel thread registered it
     // Exactly covering the panel, so Windows scans the swap chain out directly (independent flip)
     // instead of compositing it once more. Filters of the GPU vendor's app (e.g. NVIDIA RTX Dynamic
     // Vibrance) then treat SplitDisplay like a game; exclude splitdisplay.exe there.
     UINT width = (UINT)(rc.right - rc.left), height = (UINT)(rc.bottom - rc.top);
-    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCompositorClass, L"SplitDisplay", WS_POPUP, rc.left, rc.top,
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCompositorWindowClass, L"SplitDisplay", WS_POPUP, rc.left, rc.top,
         (int)width, (int)height, nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) throw std::runtime_error("could not create the compositor window");
     struct WindowOwner // destroyed on every way out, including exceptions (e.g. a GPU reset mid-resize)
@@ -1365,7 +1030,10 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     // Three buffers: one on screen, one waiting for the next vblank, one to draw the next frame into.
     sd.BufferCount = 3;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    // FLIP_SEQUENTIAL, not FLIP_DISCARD: contents of each buffer survive its present, so a
+    // later pass can leave regions (and rects) that have not changed untouched instead of
+    // recopying the whole panel every frame -- with DISCARD they would be undefined.
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     // With a waitable swap chain, Present never blocks on frame latency: a present right after the
     // previous one must not wait for that one to reach the screen.
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -1389,12 +1057,12 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
         return Outcome::Lost;
     }
     std::vector<FrameSource> src(p.regions.size());
-    std::vector<winrt::handle> frameEvents(src.size());
-    std::vector<std::pair<ID3D11Fence*, UINT64>> armed(src.size()); // fence value each frame event waits for
+    FrameEventWaiter waiter(src.size());
+    ULONGLONG nextDriverCheck = 0;
+    auto swap3 = swap.try_as<IDXGISwapChain3>();
     for (int i = 0; i < (int)src.size(); i++)
     {
         src[i].index = (int)p.first + i;
-        frameEvents[i].attach(CreateEventW(nullptr, FALSE, FALSE, nullptr));
         LUID a = shm->mon[src[i].index].adapter;
         if ((a.LowPart || a.HighPart) && (a.LowPart != panel.adapter.LowPart || a.HighPart != panel.adapter.HighPart))
             Log(L"warning: virtual monitor %d renders on GPU %08X:%08X but the panel is on %08X:%08X; cross-GPU copy is not supported, it will stay black",
@@ -1420,6 +1088,12 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     while (!ShouldExit())
     {
         Beat();
+        if (!DriverAlive(shm, nextDriverCheck))
+        {
+            Log(L"panel %u: driver heartbeat lost, ending the session", panel.targetId);
+            outcome = Outcome::Lost;
+            break;
+        }
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
 
@@ -1483,10 +1157,14 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
                 int at = scan.Percent();
                 if (at >= 0) arrivalAt[at / 10]++;
             }
-            // Flip-discard buffers are undefined after a present: clear what the regions may not cover.
-            const float black[4] = { 0, 0, 0, 1 };
-            ctx->ClearRenderTargetView(backRtv.get(), black);
-            DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc.get(), src, p.regions, back.get(), backRtv.get(), width, height);
+            // No blanket clear: the regions tile the panel, buffers keep their contents
+            // (FLIP_SEQUENTIAL), and DrawRegions tracks per buffer what is already there --
+            // it blacks out exactly the regions that have no frame yet.
+            int rotations[SD_MAX_MONITORS] = {};
+            for (size_t k2 = 0; k2 < src.size() && p.first + k2 < SD_MAX_MONITORS; k2++) rotations[k2] = g_rotations[p.first + k2].load();
+            int targetIndex = swap3 ? (int)swap3->GetCurrentBackBufferIndex() : 0;
+            DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc.get(), src, p.regions, back.get(), backRtv.get(), width, height,
+                targetIndex, blitterOk ? &blitter : nullptr, rotations);
             ctx->Signal(fence.get(), ++fenceValue);
             pendingFence = fenceValue;
             LARGE_INTEGER presentAt;
@@ -1513,21 +1191,11 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
             // Each event is armed once per frame (a wait that stays pending is not registered again), and
             // the frames are checked again afterwards, as one may have completed just before arming.
             HANDLE wake[SD_MAX_MONITORS];
-            DWORD n = 0;
-            for (size_t k = 0; k < src.size(); k++)
-            {
-                auto* f = src[k].fence.get();
-                if (!f) continue;
-                UINT64 next = f->GetCompletedValue() + 1;
-                if (armed[k].first != f || armed[k].second != next)
-                {
-                    if (FAILED(f->SetEventOnCompletion(next, frameEvents[k].get()))) continue;
-                    armed[k] = { f, next };
-                }
-                wake[n++] = frameEvents[k].get();
-            }
+            DWORD n = waiter.Build(src, wake, ARRAYSIZE(wake));
             if (FramesChanged(shm.get(), src)) continue;
-            if (n) WaitForMultipleObjects(n, wake, FALSE, 20);
+            // The events wake us the moment a frame lands; the timeout is only a safety
+            // net (deadline and panel checks below), so it can be long and idle-cheap.
+            if (n) WaitForMultipleObjects(n, wake, FALSE, 100);
             else Sleep(2);
         }
 
@@ -1587,6 +1255,15 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
 // One panel's thread: composite, sit out display power-off, repeat.
 static Outcome PanelWorker(SharedView& shm, const PanelSession& p, ULONGLONG deadline)
 {
+    // MMCSS like the driver's frame threads; every panel worker is latency-critical,
+    // not just the window-mode one that used to be the only privileged thread.
+    DWORD avTask = 0;
+    HANDLE avHandle = AvSetMmThreadCharacteristicsW(L"Distribution", &avTask);
+    struct AvRevert
+    {
+        HANDLE h;
+        ~AvRevert() { if (h) AvRevertMmThreadCharacteristics(h); }
+    } avRevert{ avHandle };
     try
     {
         winrt::init_apartment();
@@ -1594,6 +1271,12 @@ static Outcome PanelWorker(SharedView& shm, const PanelSession& p, ULONGLONG dea
         for (;;)
         {
             Outcome o = Composite(shm, p, deadline);
+            if (o == Outcome::RefreshChanged)
+            {
+                // Only this panel restarts; the virtual monitors were never unplugged.
+                Log(L"panel %u: restarting compositor for the new refresh rate", p.target.targetId);
+                continue;
+            }
             if (o != Outcome::DisplaysOff) return o;
 
             // Panel released (no signal -> it sleeps). Resume on the first new frame.
@@ -1617,12 +1300,50 @@ static Outcome PanelWorker(SharedView& shm, const PanelSession& p, ULONGLONG dea
     return Outcome::Lost;
 }
 
+// Gives the split monitors the panel's ICC profile. Without this, a calibrated panel's
+// colours shift the moment it is split, because the virtual monitors get the system
+// default (sRGB) association. Best effort: association keys off GDI device names, which
+// Windows renumbers between sessions, so this runs at every session start. Per-user scope
+// matches how calibration tools install display profiles.
+static void InheritColorProfiles(const std::vector<PanelSession>& ps)
+{
+    for (auto& p : ps)
+    {
+        if (p.target.gdiName.empty()) continue;
+        DWORD bytes = 0;
+        if (!WcsGetDefaultColorProfileSize(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, p.target.gdiName.c_str(), CPT_ICC, CPST_NONE, 0, &bytes) || !bytes)
+            continue;
+        std::wstring profile(bytes / sizeof(wchar_t) + 1, L'\0');
+        if (!WcsGetDefaultColorProfile(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, p.target.gdiName.c_str(), CPT_ICC, CPST_NONE, 0, bytes,
+                profile.data()))
+            continue;
+        profile.resize(wcslen(profile.c_str()));
+        if (profile.empty()) continue;
+        for (UINT i = 0; i < p.regions.size(); i++)
+        {
+            auto gdi = GdiNameOfMonitor(VirtualName(p.first + i));
+            if (gdi.empty()) continue;
+            if (WcsAssociateColorProfileWithDevice(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, profile.c_str(), gdi.c_str()))
+            {
+                WcsSetDefaultColorProfile(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, gdi.c_str(), CPT_ICC, CPST_NONE, 0, profile.c_str());
+                Log(L"color profile '%s' inherited by Split %u", profile.c_str(), p.first + i + 1);
+            }
+        }
+    }
+}
+
 // One full split session: plug every panel's monitors, take the panels over, composite until
 // stop / loss. Returns true if the session ended because a stop was requested.
 static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
 {
     SharedView shm;
     if (!shm.Open()) throw std::runtime_error("SplitDisplay driver not loaded");
+    for (size_t i = 0; i < ps.size() && i < SD_MAX_MONITORS; i++)
+    {
+        ps[i].index = (int)i;
+        g_desiredMilliHz[i] = ps[i].refreshMilliHz;
+    }
+    for (auto& rot : g_rotations) rot = (int)DISPLAYCONFIG_ROTATION_IDENTITY;
 
     // Start from a clean slate: monitors left plugged by an earlier session would keep old sizes.
     if (shm->desiredPlugged)
@@ -1656,31 +1377,35 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
         std::wstring desc;
         for (auto& r : p.regions)
         {
-            SdMonitorConfig m{ (UINT32)(r.right - r.left), (UINT32)(r.bottom - r.top), (UINT32)p.refresh, 0, {} };
+            SdMonitorConfig m{ (UINT32)(r.right - r.left), (UINT32)(r.bottom - r.top), (UINT32)p.refreshMilliHz, 0, {}, 0, 0 };
+            // The region's share of the real panel, so its EDID reports true physical size
+            // (and with it a correct Windows scaling recommendation) on any panel.
+            if (p.target.widthMm && p.target.width) m.widthMm = (UINT32)((UINT64)p.target.widthMm * (r.right - r.left) / p.target.width);
+            if (p.target.heightMm && p.target.height) m.heightMm = (UINT32)((UINT64)p.target.heightMm * (r.bottom - r.top) / p.target.height);
             for (int hz : p.rates)
-                if (m.rateCount < SD_MAX_RATES) m.rates[m.rateCount++] = (UINT32)hz;
+                if (m.rateCount < SD_MAX_RATES) m.ratesMilliHz[m.rateCount++] = (UINT32)hz;
             cfg.mon[cfg.count++] = m;
             desktop.push_back({ p.target.position.x + r.left, p.target.position.y + r.top, p.target.position.x + r.right, p.target.position.y + r.bottom });
             desc += L" " + std::to_wstring(r.right - r.left) + L"x" + std::to_wstring(r.bottom - r.top) + L"@" + std::to_wstring(r.left) + L"," +
                     std::to_wstring(r.top);
         }
         std::wstring rates;
-        for (int hz : p.rates) rates += (rates.empty() ? L"" : L"/") + std::to_wstring(hz);
-        Log(L"panel '%s' %ux%u@%d Hz (supports %s) at (%ld,%ld), scale %d%%, monitors %u..%u:%s", p.cfg.name.c_str(), p.target.width,
-            p.target.height, p.refresh, rates.empty() ? L"?" : rates.c_str(), p.target.position.x, p.target.position.y, p.scale, p.first + 1,
-            cfg.count, desc.c_str());
+        for (int hz : p.rates) rates += (rates.empty() ? L"" : L"/") + FormatHz(hz);
+        Log(L"panel '%s' %ux%u@%s Hz (supports %s) at (%ld,%ld), scale %d%%, monitors %u..%u:%s", p.cfg.name.c_str(), p.target.width,
+            p.target.height, FormatHz(p.refreshMilliHz).c_str(), rates.empty() ? L"?" : rates.c_str(), p.target.position.x, p.target.position.y, p.scale,
+            p.first + 1, cfg.count, desc.c_str());
     }
 
     // Counters survive from earlier sessions, so require fresh frames after this plug.
     LONG64 base[SD_MAX_MONITORS];
-    for (int i = 0; i < SD_MAX_MONITORS; i++) base[i] = shm->mon[i].frameSeq;
-    shm->config = cfg;
-    MemoryBarrier();
+    for (int i = 0; i < SD_MAX_MONITORS; i++) base[i] = (LONG64)SdReadI64(&shm->mon[i].frameSeq);
+    SdWriteConfig(shm.get(), cfg);
+    InterlockedIncrement(&shm->modesGeneration);
     InterlockedExchange(&shm->desiredPlugged, 1);
     shm.Kick();
     auto live = [&] {
         for (UINT i = 0; i < cfg.count; i++)
-            if (!shm->mon[i].plugged || shm->mon[i].frameSeq <= base[i] || !IsTargetActive(VirtualName(i).c_str())) return false;
+            if (!shm->mon[i].plugged || SdReadI64(&shm->mon[i].frameSeq) <= base[i] || !IsTargetActive(VirtualName(i).c_str())) return false;
         return true;
     };
     std::vector<std::wstring> allNames;
@@ -1698,11 +1423,20 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     for (auto& p : ps)
     {
         std::vector<std::wstring> names;
-        for (UINT i = 0; i < p.regions.size(); i++) names.push_back(VirtualName(p.first + i));
-        if (p.scale) SetScalePercent(names, p.scale);
+        p.scales.resize(p.regions.size());
+        for (UINT i = 0; i < p.regions.size(); i++)
+        {
+            names.push_back(VirtualName(p.first + i));
+            // Per region, remembered across sessions; a region without a stored scale
+            // inherits the physical panel's, as before. Changes made later in Windows
+            // Settings are captured by the session loop instead of being overwritten.
+            int want = p.scales[i] ? p.scales[i] : p.scale;
+            p.scales[i] = want;
+            if (want) SetScalePercent({ names.back() }, want);
+        }
         // Windows restores the rate it last saw on each monitor; make them all the panel's rate, so a
         // later difference can only be a user change (which then applies to the whole panel).
-        ForceRefresh(names, p.refresh);
+        ForceRefresh(names, p.refreshMilliHz);
     }
     Beat();
 
@@ -1752,15 +1486,16 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
         if (!Nap(300)) return true;
     // Moving a panel can make Windows fall back to 60 Hz; it must run at the rate of its split monitors.
     if (g_windowMode)
-        for (auto& p : ps) ForceRefreshTarget(p.target.adapter, p.target.targetId, p.refresh);
+        for (auto& p : ps) ForceRefreshTarget(p.target.adapter, p.target.targetId, p.refreshMilliHz);
     WriteRuntime(ps);
+    InheritColorProfiles(ps);
 
-    GuardRun guard;
+    WindowGuard guard;
     if (g_windowMode)
     {
-        g_parked.clear();
-        for (auto& p : ps) g_parked.push_back({ PanelLocator{ p.target.adapter, p.target.targetId }, VirtualName(p.first), desktop[p.first] });
-        guard.Start();
+        std::vector<ParkedPanel> parked;
+        for (auto& p : ps) parked.push_back({ PanelLocator{ p.target.adapter, p.target.targetId }, VirtualName(p.first), desktop[p.first], {} });
+        guard.Start(std::move(parked));
     }
     // The split is back: undo the pile-up Windows made of the windows while it was gone.
     RestoreWindowLayout();
@@ -1787,6 +1522,9 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     int hiddenPolls = 0;
     int corrections = 0;
     ULONGLONG correctionWindow = 0;
+    ULONGLONG superviseStart = GetTickCount64();
+    std::vector<ULONGLONG> rateGrace(ps.size(), superviseStart + 10000); // let rate switches settle before judging them
+    std::map<std::pair<int, int>, std::pair<int, int>> scaleCandidates;  // (panel, region) -> (percent, matching polls)
     for (;;)
     {
         // The session was locked, or Windows switched to another desktop (Ctrl+Alt+Del, a secure
@@ -1816,40 +1554,123 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
                 correctionWindow = GetTickCount64();
                 corrections = 0;
             }
-            // If Windows keeps undoing it, stop fighting for this minute.
-            for (auto& p : ps)
-                if (corrections < 5 && KeepGroupAligned(p.first, p.regions)) corrections++;
-            for (auto& p : ps)
+            // One CCD pass answers every question below (drifted? rates? scales? rotations?);
+            // this used to be a full QueryDisplayConfig per monitor per question.
+            auto snap = SnapshotMonitors();
+            for (auto& e : snap)
             {
-                if (!g_windowMode || corrections >= 5) break;
-                int hz = CurrentRefreshOfTarget(p.target.adapter, p.target.targetId);
-                if (!hz || std::abs(hz - p.refresh) <= 1) continue;
-                Log(L"parked panel '%s' runs at %d Hz, switching it back to %d Hz", p.cfg.name.c_str(), hz, p.refresh);
-                ForceRefreshTarget(p.target.adapter, p.target.targetId, p.refresh);
-                corrections++;
+                if (e.name.rfind(L"Split ", 0) != 0) continue;
+                int n = _wtoi(e.name.c_str() + 6);
+                if (n >= 1 && n <= SD_MAX_MONITORS) g_rotations[n - 1] = (int)e.rotation;
             }
-
-            // A split monitor's refresh rate was changed (e.g. in Settings): the whole panel follows.
             for (auto& p : ps)
             {
-                if (g_restart) break;
+                // If Windows keeps undoing it, stop fighting for this minute.
+                if (corrections < 5 && !p.regions.empty())
+                {
+                    const MonitorSnapshot* first = FindInSnapshot(snap, VirtualName(p.first));
+                    bool drift = false, complete = first != nullptr;
+                    if (first)
+                    {
+                        LONG ox = first->position.x - p.regions[0].left, oy = first->position.y - p.regions[0].top;
+                        for (UINT i = 0; i < p.regions.size(); i++)
+                        {
+                            auto* e = FindInSnapshot(snap, VirtualName(p.first + i));
+                            if (!e) complete = false;
+                            else if (e->position.x != ox + p.regions[i].left || e->position.y != oy + p.regions[i].top) drift = true;
+                        }
+                    }
+                    if (complete && drift && KeepGroupAligned(p.first, p.regions)) corrections++;
+                }
+                int desired = g_desiredMilliHz[p.index].load();
+                if (g_windowMode && corrections < 5)
+                {
+                    for (auto& e : snap)
+                    {
+                        if (e.adapter.LowPart != p.target.adapter.LowPart || e.adapter.HighPart != p.target.adapter.HighPart ||
+                            e.targetId != p.target.targetId || !e.refreshMilliHz)
+                            continue;
+                        if (std::abs(e.refreshMilliHz - desired) <= 100) continue;
+                        Log(L"parked panel '%s' runs at %s Hz, switching it back to %s Hz", p.cfg.name.c_str(),
+                            FormatHz(e.refreshMilliHz).c_str(), FormatHz(desired).c_str());
+                        ForceRefreshTarget(p.target.adapter, p.target.targetId, desired);
+                        corrections++;
+                    }
+                }
+
+                // A split monitor's refresh rate was changed (e.g. in Settings): the whole panel
+                // follows, in place -- the driver updates its mode lists and the exclusive
+                // compositor re-applies its mode, so nothing is unplugged and nothing flickers
+                // beyond the panel's own mode switch.
                 for (UINT i = 0; i < p.regions.size(); i++)
                 {
-                    int hz = CurrentRefreshOf(VirtualName(p.first + i));
-                    if (!hz || std::abs(hz - p.refresh) <= 1) continue;
-                    Log(L"'%s' split monitor %u switched to %d Hz: switching the whole display from %d Hz", p.cfg.name.c_str(), p.first + i + 1, hz,
-                        p.refresh);
+                    auto* e = FindInSnapshot(snap, VirtualName(p.first + i));
+                    if (!e || !e->refreshMilliHz || std::abs(e->refreshMilliHz - desired) <= 100) continue;
+                    if (GetTickCount64() < rateGrace[p.index])
+                    {
+                        ForceRefresh({ e->name }, desired); // still settling from the last switch: nudge, don't flip-flop
+                        continue;
+                    }
+                    int milliHz = e->refreshMilliHz;
+                    Log(L"'%s' split monitor %u switched to %s Hz: switching the whole display from %s Hz", p.cfg.name.c_str(), p.first + i + 1,
+                        FormatHz(milliHz).c_str(), FormatHz(desired).c_str());
+                    p.refreshMilliHz = milliHz;
+                    g_desiredMilliHz[p.index] = milliHz;
+                    rateGrace[p.index] = GetTickCount64() + 10000;
                     auto panels = LoadPanels();
                     for (auto& c : panels)
-                        if (Matches(c, p.target)) c.refresh = hz;
+                        if (Matches(c, p.target)) c.refreshMilliHz = milliHz;
                     SavePanels(panels);
-                    g_restart = true;
-                    g_abort = true;
+                    SdConfig liveCfg;
+                    if (SdReadConfig(shm.get(), liveCfg))
+                    {
+                        for (UINT k = 0; k < p.regions.size() && p.first + k < (UINT)SD_MAX_MONITORS; k++)
+                            liveCfg.mon[p.first + k].refreshMilliHz = (UINT32)milliHz;
+                        SdWriteConfig(shm.get(), liveCfg);
+                        InterlockedIncrement(&shm->modesGeneration);
+                        shm.Kick();
+                    }
+                    std::vector<std::wstring> names;
+                    for (UINT k = 0; k < p.regions.size(); k++) names.push_back(VirtualName(p.first + k));
+                    ForceRefresh(names, milliHz);
+                    if (g_windowMode) ForceRefreshTarget(p.target.adapter, p.target.targetId, milliHz);
                     break;
+                }
+
+                // Scale changes made in Settings belong to the user, not to the panel: remember
+                // them per region (two matching polls, so a transition cannot be captured),
+                // instead of overwriting them at every session start.
+                if (GetTickCount64() - superviseStart > 15000)
+                {
+                    bool scaleDirty = false;
+                    for (UINT i = 0; i < p.regions.size(); i++)
+                    {
+                        auto* e = FindInSnapshot(snap, VirtualName(p.first + i));
+                        if (!e || !e->scalePercent || i >= p.scales.size()) continue;
+                        auto& cand = scaleCandidates[{ p.index, (int)i }];
+                        if (e->scalePercent == p.scales[i])
+                        {
+                            cand = { 0, 0 };
+                            continue;
+                        }
+                        if (cand.first != e->scalePercent) cand = { e->scalePercent, 1 };
+                        else cand.second++;
+                        if (cand.second < 2) continue;
+                        Log(L"'%s' split monitor %u scale changed to %d%%: remembering it", p.cfg.name.c_str(), p.first + i + 1, e->scalePercent);
+                        p.scales[i] = e->scalePercent;
+                        cand = { 0, 0 };
+                        scaleDirty = true;
+                    }
+                    if (scaleDirty)
+                    {
+                        auto panels = LoadPanels();
+                        for (auto& c : panels)
+                            if (Matches(c, p.target)) c.scales = p.scales;
+                        SavePanels(panels);
+                    }
                 }
             }
         }
-
         bool allDone = true, allFresh = true;
         ULONGLONG t = GetTickCount64();
         for (auto& b : beats)
@@ -1890,11 +1711,32 @@ static int CmdRun(DWORD testSeconds)
 
     ULONGLONG deadline = testSeconds ? GetTickCount64() + testSeconds * 1000ULL : 0;
     bool watchdogArmed = false;
+    std::vector<std::wstring> watchdogCovered; // monitor device paths some watchdog already knows
+    bool loggedOtherSession = false;
     int failures = 0;
     ULONGLONG firstFailure = 0;
 
     while (!StopRequested())
     {
+        // Fast user switching: the instance mutex is per-session, so a second user's logon
+        // task would start a second compositor that mistakes this session's specialized
+        // panels for stale leftovers and reverts them. Only the console session composes;
+        // everyone else waits until they become the console session.
+        {
+            DWORD mine = 0;
+            bool console = ProcessIdToSessionId(GetCurrentProcessId(), &mine) && mine == WTSGetActiveConsoleSessionId();
+            if (!console)
+            {
+                if (!loggedOtherSession)
+                {
+                    Log(L"another session is at the console; waiting");
+                    loggedOtherSession = true;
+                }
+                if (!Nap(2000)) break;
+                continue;
+            }
+            loggedOtherSession = false;
+        }
         auto scan = ScanPanels();
         if (!scan.stale.empty())
         {
@@ -1938,17 +1780,36 @@ static int CmdRun(DWORD testSeconds)
                 continue;
             }
             used += (UINT)regions.size();
-            auto rates = SupportedRefreshRates(t);
-            int want = cfg.refresh ? cfg.refresh : (int)std::lround(t.refreshHz);
-            ps.push_back({ cfg, t, regions, 0, GetScalePercentForTarget(t.adapter, t.targetId), ClosestRate(rates, want), rates });
+            auto rates = SupportedRefreshRatesMilli(t);
+            int want = cfg.refreshMilliHz ? cfg.refreshMilliHz : (int)std::lround(t.refreshHz * 1000);
+            PanelSession session;
+            session.cfg = cfg;
+            session.target = t;
+            session.regions = regions;
+            session.scale = GetScalePercentForTarget(t.adapter, t.targetId);
+            session.scales = cfg.scales;
+            session.refreshMilliHz = ClosestRate(rates, want);
+            session.rates = rates;
+            ps.push_back(std::move(session));
         }
         std::vector<PanelTarget> sessionTargets;
         for (auto& p : ps) sessionTargets.push_back(p.target);
 
-        if (!watchdogArmed)
+        // Arm again when a panel joins that no living watchdog has heard of (a display plugged
+        // in mid-run and picked up by a later session); the older watchdog simply stays as a
+        // second, now-redundant pair of hands -- reverting is idempotent.
+        bool uncovered = false;
+        for (auto& t : sessionTargets)
+        {
+            bool known = false;
+            for (auto& covered : watchdogCovered) known |= _wcsicmp(covered.c_str(), t.monitorDevicePath.c_str()) == 0;
+            uncovered |= !known;
+        }
+        if (!watchdogArmed || uncovered)
         {
             SpawnWatchdog(sessionTargets, testSeconds ? testSeconds + 30 : 0);
             watchdogArmed = true;
+            for (auto& t : sessionTargets) watchdogCovered.push_back(t.monitorDevicePath);
         }
 
         g_windowMode = ChooseWindowMode();
@@ -2024,9 +1885,109 @@ static int CmdRun(DWORD testSeconds)
 
 int RunGui();
 
+// A crash leaves a minidump next to the logs. The watchdog restores the display either way,
+// but without a dump a field crash is undiagnosable.
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
+{
+    static volatile LONG inside = 0;
+    if (InterlockedExchange(&inside, 1)) return EXCEPTION_EXECUTE_HANDLER;
+    wchar_t dir[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay", dir, MAX_PATH);
+    CreateDirectoryW(dir, nullptr);
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%s\\crash-%lu-%llu.dmp", dir, GetCurrentProcessId(), GetTickCount64());
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        MINIDUMP_EXCEPTION_INFORMATION mei{};
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = ep;
+        mei.ClientPointers = FALSE;
+        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
+            (MINIDUMP_TYPE)(MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory), &mei, nullptr, nullptr);
+        CloseHandle(f);
+        Log(L"crashed; minidump written to %s", path);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static bool IsElevated()
+{
+    HANDLE tok;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
+    TOKEN_ELEVATION e{};
+    DWORD len = 0;
+    bool ok = GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &len) && e.TokenIsElevated;
+    CloseHandle(tok);
+    return ok;
+}
+
+static std::wstring QuoteArg(const std::wstring& arg)
+{
+    if (arg.empty()) return L"\"\"";
+    if (arg.find_first_of(L" \t\"") == std::wstring::npos) return arg;
+    std::wstring out = L"\"";
+    for (wchar_t c : arg)
+    {
+        if (c == L'\\' || c == L'"') out += L'\\';
+        out += c;
+    }
+    return out + L"\"";
+}
+
+// The binary is asInvoker: the settings window (and the links it opens) run unprivileged,
+// and only the commands that truly need it (composing, reverting, the logon task) ask for
+// elevation by relaunching themselves. Returns the elevated process's exit code when
+// waited for, 0 when detached (the run command: the elevated twin is the real instance).
+static int RelaunchElevated(int argc, wchar_t** argv, bool wait)
+{
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring params;
+    for (int i = 1; i < argc; i++) params += (params.empty() ? L"" : L" ") + QuoteArg(argv[i]);
+    SHELLEXECUTEINFOW sei{ sizeof(sei) };
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = params.c_str();
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei))
+    {
+        Log(L"elevation declined or failed: %lu", GetLastError());
+        return 1;
+    }
+    int code = 0;
+    if (sei.hProcess)
+    {
+        if (wait)
+        {
+            WaitForSingleObject(sei.hProcess, INFINITE);
+            DWORD ec = 1;
+            GetExitCodeProcess(sei.hProcess, &ec);
+            code = (int)ec;
+        }
+        CloseHandle(sei.hProcess);
+    }
+    return code;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     LogInit(L"splitdisplay.log");
+    SetUnhandledExceptionFilter(CrashFilter);
+    // Elevation must be decided before ParsePanelOption rewrites argv, so the elevated twin
+    // receives the original command line including --panel.
+    {
+        std::wstring rawCmd;
+        for (int i = 1; i < argc; i++)
+        {
+            if (_wcsicmp(argv[i], L"--panel") == 0) i++; // skip its value
+            else rawCmd = argv[i];
+            if (!rawCmd.empty()) break;
+        }
+        bool needsAdmin = rawCmd == L"run" || rawCmd == L"revert" || rawCmd == L"autostart" || rawCmd == L"watchdog";
+        if (needsAdmin && !IsElevated()) return RelaunchElevated(argc, argv, rawCmd != L"run" && rawCmd != L"watchdog");
+    }
     SetConsoleCtrlHandler(OnCtrl, TRUE);
     ParsePanelOption(argc, argv);
     if (argc == 1) return RunGui();
