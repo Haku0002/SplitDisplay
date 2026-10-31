@@ -15,6 +15,12 @@ if ($running) {
     $running | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
 }
 
+# The settings window runs unprivileged but writes config/logs under ProgramData.
+$data = Join-Path $env:ProgramData 'SplitDisplay'
+New-Item -ItemType Directory -Force $data | Out-Null
+$me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+icacls $data /grant "${me}:(OI)(CI)M" /T /C 2>&1 | Out-Null
+
 New-Item -ItemType Directory -Force $dest | Out-Null
 foreach ($f in 'splitdisplay.exe', 'sdctl.exe') {
     Copy-Item (Join-Path $root "build\Release\$f") $dest -Force

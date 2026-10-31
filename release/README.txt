@@ -42,4 +42,4 @@ Requirements
   display; your windows are put back where they were a moment afterwards.
   Developed and tested on an NVIDIA RTX 4060. AMD and Intel should work but are untested.
 
-Source, issues and details: https://github.com/brkDOTstl/SplitDisplay
+Source, issues and details: https://github.com/Haku0002/SplitDisplay

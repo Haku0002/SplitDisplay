@@ -20,15 +20,17 @@ struct PanelTarget
     bool primary = false;
     POINT position{};               // desktop position (active targets)
     UINT32 width = 0, height = 0;   // desktop mode, or native resolution when not active
+    UINT32 widthMm = 0, heightMm = 0; // physical size (EDID via DisplayCore), 0 if unknown
     double refreshHz = 0;
     DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY connector = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER;
     bool isVirtual = false;         // one of our own "Split N" monitors
     std::wstring gdiName;           // \\.\DISPLAYn of an active target (for mode queries)
 };
 
-// Refresh rates (Hz, highest first) the display supports at its current resolution. Needs an
-// active target; empty otherwise.
-std::vector<int> SupportedRefreshRates(const PanelTarget& t);
+// Refresh rates (milli-Hz, highest first) the display supports at its current resolution.
+// Needs an active target; empty otherwise. EnumDisplaySettings only knows whole Hz, so the
+// entry matching the current mode is refined with the exact rational rate from CCD.
+std::vector<int> SupportedRefreshRatesMilli(const PanelTarget& t);
 
 // The supported rate closest to `want` (or `want` itself if the list is empty).
 int ClosestRate(const std::vector<int>& rates, int want);
@@ -42,12 +44,13 @@ struct PanelConfig
 {
     std::wstring id;     // monitor device path (preferred key)
     std::wstring name;   // EDID name; case-insensitive prefix match when id is empty
-    std::wstring layout; // SerializeLayout() text; empty = default halves
-    int refresh = 0;     // Hz for the whole display (all of its split monitors); 0 = keep Windows' setting
+    std::wstring layout;     // SerializeLayout() text; empty = default halves
+    int refreshMilliHz = 0;  // milli-Hz for the whole display (all of its split monitors); 0 = keep Windows' setting
+    std::vector<int> scales; // per-region scale percent in layout order; empty/0 = inherit the panel's scale
 };
 
 std::vector<PanelConfig> LoadPanels();
-void SavePanels(const std::vector<PanelConfig>& panels);
+bool SavePanels(const std::vector<PanelConfig>& panels);
 bool Matches(const PanelConfig& c, const PanelTarget& t);
 PanelConfig ConfigFor(const PanelTarget& t);
 

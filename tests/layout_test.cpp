@@ -1,4 +1,6 @@
 // Unit tests for the layout tree (no display access). Run: build\Release\layout_test.exe
+#include <algorithm>
+#include <algorithm>
 #include <cstdio>
 #include <string>
 
@@ -127,6 +129,48 @@ int main()
         auto sp = ResolveSplitters(n, W, H);
         CHECK(sp.size() == 2);
         CHECK(sp[0].hi == H - 2 * kMinRegionSize); // bottom holds two rows
+    }
+
+    // Random trees (deterministic seed): serialization round-trips, regions tile the
+    // panel exactly, and every region honours the minimum size.
+    {
+        unsigned rng = 20261024;
+        auto rnd = [&] { rng = rng * 1664525u + 1013904223u; return rng >> 16; };
+        for (int trial = 0; trial < 300; trial++)
+        {
+            auto n = DefaultLayout(W, H);
+            for (int step = 0; step < 12; step++)
+            {
+                auto regs = ResolveLayout(n, W, H);
+                auto& pick = regs[rnd() % regs.size()];
+                if (rnd() % 3 == 0)
+                {
+                    MergeParent(n, pick.path);
+                }
+                else
+                {
+                    SplitEqual(n, pick.path, rnd() % 2 ? LayoutNode::Rows : LayoutNode::Cols, 2 + (int)(rnd() % 3), W, H);
+                }
+                // Also shove a random splitter around.
+                auto sp = ResolveSplitters(n, W, H);
+                if (!sp.empty())
+                {
+                    auto& s = sp[rnd() % sp.size()];
+                    MoveSplitter(n, s, s.lo + (int)(rnd() % (unsigned)std::max(1, s.hi - s.lo + 1)), W, H);
+                }
+            }
+            LayoutNode back;
+            CHECK(ParseLayout(SerializeLayout(n), back));
+            CHECK(SerializeLayout(back) == SerializeLayout(n));
+            long long area = 0;
+            for (auto& r : ResolveLayout(n, W, H))
+            {
+                CHECK(r.rc.right - r.rc.left >= kMinRegionSize || CountRegions(n) == 1);
+                CHECK(r.rc.bottom - r.rc.top >= kMinRegionSize || CountRegions(n) == 1);
+                area += (long long)(r.rc.right - r.rc.left) * (r.rc.bottom - r.rc.top);
+            }
+            CHECK(area == (long long)W * H);
+        }
     }
 
     // Presets resolve to full coverage.

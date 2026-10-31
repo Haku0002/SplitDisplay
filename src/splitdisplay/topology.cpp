@@ -219,19 +219,29 @@ bool KeepGroupAligned(UINT first, const std::vector<RECT>& regions)
     return true;
 }
 
-static int RoundHz(const DISPLAYCONFIG_RATIONAL& r)
+static int MilliHz(const DISPLAYCONFIG_RATIONAL& r)
 {
-    return r.Denominator ? (int)((r.Numerator + r.Denominator / 2) / r.Denominator) : 0;
+    return r.Denominator ? (int)(((long long)r.Numerator * 1000 + r.Denominator / 2) / r.Denominator) : 0;
 }
 
-static void ForceRefreshWhere(const std::function<bool(const DISPLAYCONFIG_PATH_INFO&)>& wanted, int hz)
+std::wstring FormatHz(int milliHz)
+{
+    if (milliHz % 1000 == 0) return std::to_wstring(milliHz / 1000);
+    wchar_t buf[32];
+    swprintf_s(buf, L"%d.%02d", milliHz / 1000, (milliHz % 1000 + 5) / 10);
+    return buf;
+}
+
+static void ForceRefreshWhere(const std::function<bool(const DISPLAYCONFIG_PATH_INFO&)>& wanted, int milliHz)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
-    if (hz <= 0 || !QueryActive(paths, modes)) return;
+    if (milliHz <= 0 || !QueryActive(paths, modes)) return;
     for (auto& p : paths)
     {
-        if (!wanted(p) || RoundHz(p.targetInfo.refreshRate) == hz) continue;
+        int cur = MilliHz(p.targetInfo.refreshRate);
+        if (!wanted(p) || std::abs(cur - milliHz) <= 100) continue;
+        int hz = (milliHz + 500) / 1000;
         auto n = TargetName(p);
         DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
         src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
@@ -244,27 +254,27 @@ static void ForceRefreshWhere(const std::function<bool(const DISPLAYCONFIG_PATH_
         dm.dmFields = DM_DISPLAYFREQUENCY;
         dm.dmDisplayFrequency = (DWORD)hz;
         LONG r = ChangeDisplaySettingsExW(src.viewGdiDeviceName, &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
-        Log(L"refresh '%s' %d -> %d Hz: %ld", n.c_str(), RoundHz(p.targetInfo.refreshRate), hz, r);
+        Log(L"refresh '%s' %s -> %s Hz: %ld", n.c_str(), FormatHz(cur).c_str(), FormatHz(milliHz).c_str(), r);
     }
 }
 
-void ForceRefresh(const std::vector<std::wstring>& names, int hz)
+void ForceRefresh(const std::vector<std::wstring>& names, int milliHz)
 {
-    ForceRefreshWhere([&](const DISPLAYCONFIG_PATH_INFO& p) { return std::find(names.begin(), names.end(), TargetName(p)) != names.end(); }, hz);
+    ForceRefreshWhere([&](const DISPLAYCONFIG_PATH_INFO& p) { return std::find(names.begin(), names.end(), TargetName(p)) != names.end(); }, milliHz);
 }
 
-void ForceRefreshTarget(LUID adapter, UINT32 targetId, int hz)
+void ForceRefreshTarget(LUID adapter, UINT32 targetId, int milliHz)
 {
-    ForceRefreshWhere([&](const DISPLAYCONFIG_PATH_INFO& p) { return IsTarget(p, adapter, targetId); }, hz);
+    ForceRefreshWhere([&](const DISPLAYCONFIG_PATH_INFO& p) { return IsTarget(p, adapter, targetId); }, milliHz);
 }
 
-int CurrentRefreshOfTarget(LUID adapter, UINT32 targetId)
+int CurrentRefreshMilliOfTarget(LUID adapter, UINT32 targetId)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     if (!QueryActive(paths, modes)) return 0;
     for (auto& p : paths)
-        if (IsTarget(p, adapter, targetId)) return RoundHz(p.targetInfo.refreshRate);
+        if (IsTarget(p, adapter, targetId)) return MilliHz(p.targetInfo.refreshRate);
     return 0;
 }
 
@@ -285,14 +295,14 @@ bool DesktopRectOf(const std::wstring& name, RECT& out)
     return false;
 }
 
-int CurrentRefreshOf(const std::wstring& name)
+int CurrentRefreshMilliOf(const std::wstring& name)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     if (!QueryActive(paths, modes)) return 0;
     for (auto& p : paths)
     {
-        if (TargetName(p) == name) return RoundHz(p.targetInfo.refreshRate);
+        if (TargetName(p) == name) return MilliHz(p.targetInfo.refreshRate);
     }
     return 0;
 }
@@ -386,6 +396,68 @@ std::wstring GdiNameOfTarget(LUID adapter, UINT32 targetId)
     {
         if (p.targetInfo.id != targetId || p.targetInfo.adapterId.LowPart != adapter.LowPart || p.targetInfo.adapterId.HighPart != adapter.HighPart)
             continue;
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+        src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src.header.size = sizeof(src);
+        src.header.adapterId = p.sourceInfo.adapterId;
+        src.header.id = p.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS) return src.viewGdiDeviceName;
+    }
+    return L"";
+}
+
+std::vector<MonitorSnapshot> SnapshotMonitors()
+{
+    std::vector<MonitorSnapshot> out;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActive(paths, modes)) return out;
+    for (auto& p : paths)
+    {
+        MonitorSnapshot s;
+        s.name = TargetName(p);
+        s.devicePath = TargetDevicePath(p);
+        s.adapter = p.targetInfo.adapterId;
+        s.targetId = p.targetInfo.id;
+        s.refreshMilliHz = MilliHz(p.targetInfo.refreshRate);
+        s.rotation = p.targetInfo.rotation;
+        s.scalePercent = ScalePercentForSource(p.sourceInfo.adapterId, p.sourceInfo.id, nullptr);
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
+        src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src.header.size = sizeof(src);
+        src.header.adapterId = p.sourceInfo.adapterId;
+        src.header.id = p.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS) s.gdiName = src.viewGdiDeviceName;
+        if (p.sourceInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && p.sourceInfo.modeInfoIdx < modes.size())
+        {
+            auto& mi = modes[p.sourceInfo.modeInfoIdx];
+            if (mi.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            {
+                s.position = { mi.sourceMode.position.x, mi.sourceMode.position.y };
+                s.width = mi.sourceMode.width;
+                s.height = mi.sourceMode.height;
+            }
+        }
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+const MonitorSnapshot* FindInSnapshot(const std::vector<MonitorSnapshot>& snap, const std::wstring& name)
+{
+    for (auto& s : snap)
+        if (s.name == name) return &s;
+    return nullptr;
+}
+
+std::wstring GdiNameOfMonitor(const std::wstring& name)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActive(paths, modes)) return L"";
+    for (auto& p : paths)
+    {
+        if (TargetName(p) != name) continue;
         DISPLAYCONFIG_SOURCE_DEVICE_NAME src{};
         src.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         src.header.size = sizeof(src);
