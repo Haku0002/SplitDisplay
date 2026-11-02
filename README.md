@@ -28,8 +28,8 @@ place, without re-plugging anything; only rates the display supports are offered
 (59.94 Hz stays 59.94 Hz), so a split monitor is paced exactly with the panel.
 
 Nothing is copied while a split monitor shows nothing new, and a region whose monitor did not change is left as it
-is. A frame that did change is copied whole: the dirty rectangles Windows reports do not cover the mouse cursor it
-draws into these frames, so copying only them left cursor trails (0.4.0 and 0.4.1).
+is. In window mode the compositor also draws the mouse cursor itself (hardware cursor): moving the mouse costs no
+frame from the split monitors, and only the parts of a frame that actually changed are copied.
 
 ## How it works
 
@@ -90,8 +90,12 @@ There SplitDisplay switches to **window mode** automatically:
 - A topmost, non-activating window exactly covering the panel (not in the taskbar or `Alt+Tab`) shows the split
   monitors through a flip-model swap chain on the panel's GPU. Windows scans it out directly (independent flip), so
   the DWM does not composite it once more. Each split monitor frame is presented as soon as the driver signals it,
-  with sync interval 0 and no tearing: a newer frame replaces one still waiting, so every vblank shows the newest
-  frame and nothing queues up, whatever the timing between the split monitors and the panel.
+  and by default without waiting for the panel's vblank (tearing allowed): measured at 100 Hz, content reaches the
+  panel in about 1 ms instead of one refresh, and the cursor in about 2 ms instead of 10. Fast motion can show tear
+  lines; *Prevent tearing* in the settings window trades that for one frame of latency.
+- The mouse cursor is drawn by the compositor (the driver takes it over from Windows), including inverting cursors
+  such as the text beam. *Compatibility mode* in the settings window turns all of this off and behaves like 0.4.3
+  (Windows draws the cursor into the frames, whole frames are copied, presents wait for vblank).
 - A guard keeps the cursor off the parked panel (a low-level mouse hook plus a position check) and moves application
   windows that end up there back to the panel's first split monitor.
 - While Windows shows another desktop, the split is undone and every display is handed back whole; it returns a
@@ -157,6 +161,8 @@ Start `splitdisplay.exe` without arguments (the installer opens it for you) to g
 - **Displays**: a map of all connected displays at their desktop positions (name, resolution, connector). Click a
   display to edit its layout; *Split this display* / *Don't split this display* adds it to or removes it from the
   split. Displays that are not split are left where they are.
+- **Prevent tearing** and **Compatibility mode** (see [window mode](#window-mode-windows-home-and-pro-experimental));
+  changing either restarts a running split.
 - **Start / Stop split** and **Start automatically when I sign in**. Closing the window leaves a tray icon with the
   split state, start/stop and *Exit*; the window follows the Windows light/dark theme. Per-region display scaling
   set in Windows Settings is remembered, and the *Refresh rate* box switches the whole display like Settings does.
@@ -212,7 +218,8 @@ Taking over your only display is risky, so there are several layers of protectio
 
 ## Limitations and ideas
 
-- About one frame of extra latency. No VRR/G-Sync or HDR yet.
+- Exclusive mode, and window mode with *Prevent tearing* or *Compatibility mode*, add about one frame of latency.
+  No VRR/G-Sync or HDR yet.
 - The sign-in and lock screens are never split: the compositor starts at logon, and in window mode it steps aside
   while any other desktop is up, so the displays are whole there. Running it as a service in the console session,
   with an agent on the secure desktop, would split those screens too — the split monitors already receive them.
@@ -221,8 +228,8 @@ Taking over your only display is risky, so there are several layers of protectio
   Windows re-places windows. A refresh-rate change alone no longer does this.
 - A split monitor can also run at 3/4 or 1/2 of its region size (for fullscreen games); the compositor stretches
   those frames to the region. Latency-critical use should stay at the native size.
-- GPU cost follows how often the split monitors change: an idle desktop costs nothing, and every changed frame is
-  copied twice (driver, then compositor), as in 0.3.0.
+- GPU cost follows how often the split monitors change: an idle desktop costs nothing, a cursor move costs one copy
+  of the panel image, and a changed frame costs its changed parts twice (driver, then compositor).
 - All split displays must be connected to the same GPU (Windows renders an indirect display's monitors on one
   adapter). Displays on another GPU are skipped, with a note in the log.
 

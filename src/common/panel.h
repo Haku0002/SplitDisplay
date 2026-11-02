@@ -8,6 +8,8 @@
 // %ProgramData%\SplitDisplay\config.ini
 std::wstring LoadConfigValue(const wchar_t* key);
 bool SaveConfigValue(const wchar_t* key, const std::wstring& value);
+// Integer setting from config.ini [SplitDisplay]; `def` if the key is missing or empty.
+int ReadConfigInt(const wchar_t* key, int def);
 
 // A connected display target (CCD, plus DisplayCore for displays removed from the desktop).
 struct PanelTarget

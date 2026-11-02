@@ -1095,17 +1095,16 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     // Present without waiting for the panel's vblank (DXGI_PRESENT_ALLOW_TEARING; the compositor
     // window covers the panel, so DWM flips it directly). Measured at 100 Hz with both split monitors
     // busy: content latency 0.9 ms median instead of 9.2 ms, cursor 1.9 ms instead of 10.1 ms. The
-    // cost is possible tear lines on fast motion (none on VRR panels). tearing=0 in config.ini
-    // ([SplitDisplay]) goes back to vblank-synced presents.
+    // cost is possible tear lines on fast motion (none on VRR panels). Settings: "Prevent tearing"
+    // (tearing=0) and "Compatibility mode" (compat=1) go back to vblank-synced presents.
+    const bool compat = ReadConfigInt(L"compat", 0) != 0;
     bool tearing = false;
     {
-        wchar_t cfgPath[MAX_PATH];
-        ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay\\config.ini", cfgPath, MAX_PATH);
         BOOL supported = FALSE;
         auto factory5 = factory.try_as<IDXGIFactory5>();
         if (factory5) factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &supported, sizeof(supported));
-        tearing = supported && GetPrivateProfileIntW(L"SplitDisplay", L"tearing", 1, cfgPath) != 0;
-        Log(L"panel %u: tearing %s (supported=%d)", panel.targetId, tearing ? L"on" : L"off", supported);
+        tearing = supported && !compat && ReadConfigInt(L"tearing", 1) != 0;
+        Log(L"panel %u: tearing %s (supported=%d)%s", panel.targetId, tearing ? L"on" : L"off", supported, compat ? L", compatibility mode" : L"");
     }
     if (tearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     winrt::com_ptr<IDXGISwapChain1> swap;
@@ -1158,7 +1157,7 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     // and it must be drawn here.
     CursorSource cursors;
     CursorPainter painter;
-    const bool hwCursor = cursors.Open() && painter.Init(dev.get());
+    const bool hwCursor = !compat && cursors.Open() && painter.Init(dev.get());
     std::vector<BYTE> shapeBuf;
     std::vector<LONG> cursorSeq(src.size(), -1);
     RECT cursorNow{};              // where the next present puts the cursor (empty: none)
@@ -1606,7 +1605,8 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     // keeps the OS-drawn cursor.
     {
         CursorSource probe;
-        if (g_windowMode && probe.Open()) cfg.flags |= SD_CFG_HW_CURSOR;
+        // Compatibility mode (a setting) keeps the 0.4.3 behaviour: OS-drawn cursor, whole frames.
+        if (g_windowMode && probe.Open() && !ReadConfigInt(L"compat", 0)) cfg.flags |= SD_CFG_HW_CURSOR;
     }
     SdWriteConfig(shm.get(), cfg);
     InterlockedIncrement(&shm->modesGeneration);

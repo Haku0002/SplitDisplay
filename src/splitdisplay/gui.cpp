@@ -53,6 +53,8 @@ enum : int
     IDC_STOP,
     IDC_AUTOSTART,
     IDC_AUTOSTART_L,
+    IDC_NO_TEARING,
+    IDC_COMPAT,
     IDC_LOGS,
     IDC_INSTALL,
     IDC_UPDATE,
@@ -174,14 +176,16 @@ const Item kItems[] = {
     { IDC_PICK, WC_BUTTON, L"Split this display", BS_PUSHBUTTON | WS_TABSTOP, 294, 325, 136, 28, 0 },
     { IDC_START, WC_BUTTON, L"Start split", BS_PUSHBUTTON | WS_TABSTOP, 16, 366, 203, 34, 0 },
     { IDC_STOP, WC_BUTTON, L"Stop split", BS_PUSHBUTTON | WS_TABSTOP, 227, 366, 203, 34, 0 },
-    { IDC_AUTOSTART, WC_BUTTON, L"Start splitting automatically when I sign in", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 412, 414, 22, 0 },
-    { IDC_LOGS, WC_BUTTON, L"Open logs", BS_PUSHBUTTON | WS_TABSTOP, 16, 444, 92, 28, 0 },
-    { IDC_INSTALL, WC_BUTTON, L"Install now", BS_PUSHBUTTON | WS_TABSTOP, 114, 444, 104, 28, 0 },
-    { IDC_UPDATE, WC_BUTTON, L"Check update", BS_PUSHBUTTON | WS_TABSTOP, 224, 444, 116, 28, 0 },
-    { IDC_UNINSTALL, WC_BUTTON, L"Uninstall...", BS_PUSHBUTTON | WS_TABSTOP, 346, 444, 84, 28, 0 },
-    { IDC_UPDATE_INFO, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 16, 480, 414, 28, 3 },
-    { IDC_HINT, WC_STATIC, L"Emergency exit while split: Ctrl+Alt+Shift+F12", SS_LEFT, 16, 514, 414, 20, 3 },
-    { IDC_LINK, WC_STATIC, L"github.com/Haku0002/SplitDisplay", SS_LEFT | SS_NOTIFY, 16, 536, 260, 20, 4 },
+    { IDC_AUTOSTART, WC_BUTTON, L"Start splitting automatically when I sign in", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 410, 414, 22, 0 },
+    { IDC_NO_TEARING, WC_BUTTON, L"Prevent tearing (adds about one frame of latency)", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 434, 414, 22, 0 },
+    { IDC_COMPAT, WC_BUTTON, L"Compatibility mode (like 0.4.3: slower, most conservative)", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 458, 414, 22, 0 },
+    { IDC_LOGS, WC_BUTTON, L"Open logs", BS_PUSHBUTTON | WS_TABSTOP, 16, 490, 92, 28, 0 },
+    { IDC_INSTALL, WC_BUTTON, L"Install now", BS_PUSHBUTTON | WS_TABSTOP, 114, 490, 104, 28, 0 },
+    { IDC_UPDATE, WC_BUTTON, L"Check update", BS_PUSHBUTTON | WS_TABSTOP, 224, 490, 116, 28, 0 },
+    { IDC_UNINSTALL, WC_BUTTON, L"Uninstall...", BS_PUSHBUTTON | WS_TABSTOP, 346, 490, 84, 28, 0 },
+    { IDC_UPDATE_INFO, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 16, 526, 414, 28, 3 },
+    { IDC_HINT, WC_STATIC, L"Emergency exit while split: Ctrl+Alt+Shift+F12", SS_LEFT, 16, 560, 414, 20, 3 },
+    { IDC_LINK, WC_STATIC, L"github.com/Haku0002/SplitDisplay", SS_LEFT | SS_NOTIFY, 16, 582, 260, 20, 4 },
 
     { IDC_LAYOUT_L, WC_STATIC, L"Layout", SS_LEFT, 452, 56, 100, 20, 1 },
     { IDC_PRESET, WC_COMBOBOX, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 452, 80, 250, 300, 0 },
@@ -204,7 +208,7 @@ const Item kItems[] = {
     { IDC_REFRESH_L, WC_STATIC, L"Refresh rate", SS_LEFT, 716, 504, 168, 20, 1 },
     { IDC_REFRESH, WC_COMBOBOX, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 716, 526, 168, 200, 0 },
 };
-constexpr int kClientW = 900, kClientH = 568;
+constexpr int kClientW = 900, kClientH = 612;
 
 // Region fill colors (light / dark) and the selection accent.
 const COLORREF kRegionColors[] = { RGB(0xDC, 0xE9, 0xF8), RGB(0xE3, 0xF1, 0xDF), RGB(0xFB, 0xEB, 0xD7), RGB(0xEE, 0xE3, 0xF6),
@@ -590,6 +594,36 @@ void UpdateAutostart()
 {
     auto s = GetAutostart();
     Button_SetCheck(Ctl(IDC_AUTOSTART), s == AutostartState::Enabled ? BST_CHECKED : BST_UNCHECKED);
+}
+
+// "Prevent tearing" (tearing=0) and "Compatibility mode" (compat=1) in config.ini. Compatibility
+// mode is the 0.4.3 pipeline (OS-drawn cursor, whole frames, synced presents), which already never
+// tears, so the tearing box is shown checked and greyed out while it is on.
+void UpdatePerformanceOptions()
+{
+    bool compat = ReadConfigInt(L"compat", 0) != 0;
+    bool noTearing = ReadConfigInt(L"tearing", 1) == 0;
+    Button_SetCheck(Ctl(IDC_COMPAT), compat ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(Ctl(IDC_NO_TEARING), compat || noTearing ? BST_CHECKED : BST_UNCHECKED);
+    EnableWindow(Ctl(IDC_NO_TEARING), !compat);
+}
+
+void RestartIfRunning();
+
+void OnPerformanceOption(int id)
+{
+    bool on = Button_GetCheck(Ctl(id)) == BST_CHECKED;
+    bool ok = id == IDC_COMPAT ? SaveConfigValue(L"compat", on ? L"1" : L"0") : SaveConfigValue(L"tearing", on ? L"0" : L"1");
+    if (!ok)
+    {
+        MessageBoxW(g.wnd, L"Could not save config.ini. Check write access to the SplitDisplay folder under ProgramData.", L"SplitDisplay", MB_ICONERROR);
+    }
+    else
+    {
+        Log(L"gui: %s %s", id == IDC_COMPAT ? L"compatibility mode" : L"prevent tearing", on ? L"on" : L"off");
+        RestartIfRunning(); // the compositor reads these when a session starts
+    }
+    UpdatePerformanceOptions();
 }
 
 #pragma region Layout editor
@@ -1439,6 +1473,7 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         InitLayoutControls();
         LoadDraftFromConfig();
         UpdateAutostart();
+        UpdatePerformanceOptions();
         AddTray();
         UpdateStatus();
         StartUpdateCheck(false, false);
@@ -1655,6 +1690,8 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
             Busy([on] { g.autostartFailed = RunSelfAndWait(on ? L"autostart on" : L"autostart off") != 0; });
             break;
         }
+        case IDC_NO_TEARING:
+        case IDC_COMPAT: OnPerformanceOption(LOWORD(wp)); break;
         case IDC_INSTALL: OnInstallLocal(); break;
         case IDC_UPDATE: OnCheckOrUpgrade(); break;
         case IDC_LINK:

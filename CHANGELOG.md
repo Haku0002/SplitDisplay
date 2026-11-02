@@ -1,5 +1,28 @@
 # SplitDisplay changelog
 
+## 0.5.0
+
+Lower latency and lower GPU cost in window mode, measured on hardware (100 Hz panel, both split monitors busy,
+Desktop Duplication timestamps on the real outputs):
+
+| | 0.4.3 | 0.5.0 |
+|---|---|---|
+| content latency, median / p90 | 9.6 / 10.2 ms | 0.9 / 1.1 ms |
+| cursor latency, median | 8.6 ms | 1.9 ms |
+| driver frames while moving the mouse (5 s) | 501 | 15 |
+
+- Presents no longer wait for the panel's vblank (`DXGI_PRESENT_ALLOW_TEARING`). Fast motion can show tear lines;
+  *Prevent tearing* in the settings window goes back to synced presents.
+- Hardware cursor: the driver takes the cursor over from Windows (`IddCxMonitorSetupHardwareCursor`) and the
+  compositor draws it on the panel, so mouse moves no longer cost frames from the split monitors. Inverting
+  cursors (text beam, magnifier) are drawn as on a real display.
+- With the cursor out of the frames, the driver copies only the dirty rectangles again (safe now: they never
+  covered the cursor, which is what broke 0.4.0).
+- *Compatibility mode* in the settings window restores the 0.4.3 behaviour (OS-drawn cursor, whole frames,
+  synced presents) in case something misbehaves on another machine.
+- Tried and dropped after measuring: incremental back-buffer updates with `FLIP_SEQUENTIAL` (added a frame of
+  latency) and waiting on the frame latency object (made latency worse).
+
 ## 0.4.3
 
 Fixes the mouse cursor leaving trails that never cleared, and heavy stutter, in window mode (0.4.0 - 0.4.2).

@@ -159,6 +159,12 @@ static std::wstring ReadIni(const wchar_t* section, const wchar_t* key)
     return buf;
 }
 
+int ReadConfigInt(const wchar_t* key, int def)
+{
+    std::wstring v = Trim(ReadIni(L"SplitDisplay", key));
+    return v.empty() ? def : _wtoi(v.c_str());
+}
+
 std::vector<PanelConfig> LoadPanels()
 {
     std::vector<PanelConfig> out;
