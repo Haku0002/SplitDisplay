@@ -177,8 +177,11 @@ void StretchBlitter::Blit(ID3D11DeviceContext4* ctx, ID3D11ShaderResourceView* s
 
 void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HANDLE driverProc, std::vector<FrameSource>& src,
     const std::vector<RECT>& regions, ID3D11Texture2D* dst, ID3D11RenderTargetView* rtv, UINT width, UINT height, int targetIndex,
-    StretchBlitter* blitter, const int* rotations)
+    StretchBlitter* blitter, const int* rotations, std::vector<RECT>* changed)
 {
+    auto note = [&](LONG l, LONG t, LONG r, LONG b) {
+        if (changed && r > l && b > t) changed->push_back({ l, t, r, b });
+    };
     const float black[4] = { 0, 0, 0, 1 };
     if (targetIndex < 0 || targetIndex >= kMaxTargetBuffers) targetIndex = 0;
     for (size_t k = 0; k < src.size(); k++)
@@ -209,6 +212,7 @@ void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HAN
             if (drawn != 0)
             {
                 ctx->ClearView(rtv, black, &area, 1);
+                note(rc.left, rc.top, rc.right, rc.bottom);
                 drawn = 0;
             }
             continue;
@@ -220,6 +224,7 @@ void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HAN
             if (drawn < 0) // buffer state unknown: show black rather than garbage
             {
                 ctx->ClearView(rtv, black, &area, 1);
+                note(rc.left, rc.top, rc.right, rc.bottom);
                 drawn = 0;
             }
             continue; // else keep the previous frame for this pass
@@ -235,6 +240,7 @@ void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HAN
         if (stretch && blitter && f.srv[idx])
         {
             blitter->Blit(ctx, f.srv[idx].get(), rtv, rc, rotation);
+            note(rc.left, rc.top, rc.right, rc.bottom);
             drawn = seq;
             continue;
         }
@@ -279,9 +285,14 @@ void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HAN
         {
             // A buffer that never showed this monitor may hold a bigger previous layout's
             // pixels outside the copied box: black first, once.
-            if (drawn < 0) ctx->ClearView(rtv, black, &area, 1);
+            if (drawn < 0)
+            {
+                ctx->ClearView(rtv, black, &area, 1);
+                note(rc.left, rc.top, rc.right, rc.bottom);
+            }
             D3D11_BOX box{ 0, 0, 0, copyW, copyH, 1 };
             ctx->CopySubresourceRegion(dst, 0, (UINT)rc.left, (UINT)rc.top, 0, f.tex[idx].get(), 0, &box);
+            note(rc.left, rc.top, rc.left + (LONG)copyW, rc.top + (LONG)copyH);
         }
         else
         {
@@ -290,6 +301,7 @@ void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HAN
                 const SdRect& r = rects[i];
                 D3D11_BOX box{ (UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1 };
                 ctx->CopySubresourceRegion(dst, 0, (UINT)(rc.left + r.left), (UINT)(rc.top + r.top), 0, f.tex[idx].get(), 0, &box);
+                note(rc.left + r.left, rc.top + r.top, rc.left + r.right, rc.top + r.bottom);
             }
         }
         drawn = seq;

@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "autostart.h"
+#include "cursor.h"
 #include "frames.h"
 #include "guard.h"
 #include "ring.h"
@@ -1081,11 +1082,32 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     // Three buffers: one on screen, one waiting for the next vblank, one to draw the next frame into.
     sd.BufferCount = 3;
-    // Every present overwrites the whole back buffer from the canvas below, so DISCARD is right.
+    // FLIP_DISCARD and the whole canvas copied to the back buffer at every present. Measured against
+    // FLIP_SEQUENTIAL with per-buffer incremental copies (and dirty rects passed to DXGI): sequential
+    // added a full frame of latency (content 9.8 ms vs 1.5 ms median at 100 Hz) for no GPU saving
+    // worth having, and the D3D11 back buffer cannot be identified reliably for incremental updates.
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     // With a waitable swap chain, Present never blocks on frame latency: a present right after the
-    // previous one must not wait for that one to reach the screen.
+    // previous one must not wait for that one to reach the screen. (Measured in 0.5.0: waiting on
+    // the latency object before composing, with maximum latency 1, made content latency worse,
+    // 11-19.5 ms median instead of 9.7 ms with both split monitors busy.)
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    // Present without waiting for the panel's vblank (DXGI_PRESENT_ALLOW_TEARING; the compositor
+    // window covers the panel, so DWM flips it directly). Measured at 100 Hz with both split monitors
+    // busy: content latency 0.9 ms median instead of 9.2 ms, cursor 1.9 ms instead of 10.1 ms. The
+    // cost is possible tear lines on fast motion (none on VRR panels). tearing=0 in config.ini
+    // ([SplitDisplay]) goes back to vblank-synced presents.
+    bool tearing = false;
+    {
+        wchar_t cfgPath[MAX_PATH];
+        ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay\\config.ini", cfgPath, MAX_PATH);
+        BOOL supported = FALSE;
+        auto factory5 = factory.try_as<IDXGIFactory5>();
+        if (factory5) factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &supported, sizeof(supported));
+        tearing = supported && GetPrivateProfileIntW(L"SplitDisplay", L"tearing", 1, cfgPath) != 0;
+        Log(L"panel %u: tearing %s (supported=%d)", panel.targetId, tearing ? L"on" : L"off", supported);
+    }
+    if (tearing) sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     winrt::com_ptr<IDXGISwapChain1> swap;
     winrt::check_hresult(factory->CreateSwapChainForHwnd(dev.get(), hwnd, &sd, nullptr, nullptr, swap.put()));
     factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
@@ -1093,12 +1115,10 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     // With a D3D11 flip-model swap chain, buffer 0 is always the current back buffer.
     winrt::com_ptr<ID3D11Texture2D> back;
     back.capture(swap, &IDXGISwapChain1::GetBuffer, 0);
-    // Frames are composed into one persistent canvas and the canvas is copied to the back buffer
-    // at every present. Incremental (dirty-rect) updates need a target whose contents are known,
-    // and a D3D11 swap chain's back buffer is not one: buffer 0 rotates through the physical
-    // buffers and IDXGISwapChain3::GetCurrentBackBufferIndex always reports 0 there, so 0.4.0/0.4.1,
-    // which tracked contents per back buffer, left every buffer partly stale -- cursor trails that
-    // never cleared and three different images alternating (severe stutter).
+    winrt::com_ptr<ID3D11RenderTargetView> backRtv;
+    winrt::check_hresult(dev->CreateRenderTargetView(back.get(), nullptr, backRtv.put()));
+    // Frames are composed into one persistent canvas (content only, never the cursor), which is
+    // copied whole to the back buffer at each present.
     D3D11_TEXTURE2D_DESC cd{};
     cd.Width = width;
     cd.Height = height;
@@ -1132,6 +1152,47 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
             Log(L"warning: virtual monitor %d renders on GPU %08X:%08X but the panel is on %08X:%08X; cross-GPU copy is not supported, it will stay black",
                 src[i].index, a.HighPart, a.LowPart, panel.adapter.HighPart, panel.adapter.LowPart);
     }
+
+    // Hardware cursor: the session asked the driver for it (SD_CFG_HW_CURSOR) only if the cursor
+    // section opened, so a monitor whose cursor is "active" there is missing it from its frames
+    // and it must be drawn here.
+    CursorSource cursors;
+    CursorPainter painter;
+    const bool hwCursor = cursors.Open() && painter.Init(dev.get());
+    std::vector<BYTE> shapeBuf;
+    std::vector<LONG> cursorSeq(src.size(), -1);
+    RECT cursorNow{};              // where the next present puts the cursor (empty: none)
+    UINT cursorShapeShown = 0;
+    bool cursorDirty = true;
+    // Reads the cursor of every split monitor on this panel; true if what the next present must
+    // show differs from the last one.
+    auto readCursor = [&]() -> bool {
+        if (!hwCursor) return false;
+        RECT next{};
+        for (size_t k = 0; k < src.size(); k++)
+        {
+            CursorSource::State st;
+            if (!cursors.Read(src[k].index, st, &shapeBuf, painter.ShapeId())) continue;
+            cursorSeq[k] = st.seq;
+            if (!shapeBuf.empty()) painter.SetShape(dev.get(), st.shapeId, st.type, st.width, st.height, st.pitch, shapeBuf.data());
+            if (!st.active || !st.visible || !painter.HasShape()) continue;
+            // Monitor pixels -> panel pixels; scaled modes are stretched to the region.
+            const RECT& r = p.regions[k];
+            LONG rw = r.right - r.left, rh = r.bottom - r.top;
+            UINT sw = src[k].width ? src[k].width : (UINT)rw, sh = src[k].height ? src[k].height : (UINT)rh;
+            LONG hx = st.x + (LONG)st.xHot, hy = st.y + (LONG)st.yHot;
+            LONG px = r.left + (LONG)((LONGLONG)hx * rw / (LONG)sw) - (LONG)st.xHot;
+            LONG py = r.top + (LONG)((LONGLONG)hy * rh / (LONG)sh) - (LONG)st.yHot;
+            next = { px, py, px + (LONG)painter.Width(), py + (LONG)painter.Height() };
+        }
+        RECT full{ 0, 0, (LONG)width, (LONG)height };
+        IntersectRect(&next, &next, &full);
+        bool moved = !EqualRect(&next, &cursorNow) || (!IsRectEmpty(&next) && painter.ShapeId() != cursorShapeShown);
+        cursorNow = next;
+        cursorShapeShown = painter.ShapeId();
+        return moved;
+    };
+    if (hwCursor) Log(L"panel %u: drawing the hardware cursor", panel.targetId);
 
     LARGE_INTEGER freq, t0, now{};
     QueryPerformanceFrequency(&freq);
@@ -1211,7 +1272,9 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
         // does not allow tearing: the flip still waits for the vblank, but a newer present replaces one
         // that is still waiting. So every vblank shows the newest frame that made it in time, whatever
         // the phase between the split monitors and the panel, and nothing queues up behind a late frame.
-        bool ready = !presented || FramesChanged(shm.get(), src);
+        bool content = !presented || FramesChanged(shm.get(), src);
+        if (readCursor()) cursorDirty = true;
+        bool ready = content || cursorDirty;
         LARGE_INTEGER tArrive;
         QueryPerformanceCounter(&tArrive);
         if (ready)
@@ -1221,19 +1284,26 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
                 int at = scan.Percent();
                 if (at >= 0) arrivalAt[at / 10]++;
             }
-            // Bring the canvas up to date (only what changed), then hand the whole of it to the
-            // back buffer. DrawRegions tracks what the canvas shows and blacks out regions that
-            // have no frame yet.
-            int rotations[SD_MAX_MONITORS] = {};
-            for (size_t k2 = 0; k2 < src.size() && p.first + k2 < SD_MAX_MONITORS; k2++) rotations[k2] = g_rotations[p.first + k2].load();
-            DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc.get(), src, p.regions, canvas.get(), canvasRtv.get(), width, height,
-                0, blitterOk ? &blitter : nullptr, rotations);
+            // Bring the canvas up to date with the split monitors (only the regions and rects that
+            // changed), copy it whole to the back buffer, and draw the cursor on top. The cursor never
+            // enters the canvas, so moving it costs one canvas copy and no frame from any monitor.
+            if (content)
+            {
+                int rotations[SD_MAX_MONITORS] = {};
+                for (size_t k2 = 0; k2 < src.size() && p.first + k2 < SD_MAX_MONITORS; k2++) rotations[k2] = g_rotations[p.first + k2].load();
+                DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc.get(), src, p.regions, canvas.get(), canvasRtv.get(), width, height,
+                    0, blitterOk ? &blitter : nullptr, rotations);
+            }
             ctx->CopyResource(back.get(), canvas.get());
+            RECT clip{ 0, 0, (LONG)width, (LONG)height };
+            if (!IsRectEmpty(&cursorNow)) painter.Draw(ctx.get(), backRtv.get(), cursorNow.left, cursorNow.top, clip);
+            cursorDirty = false;
+
             ctx->Signal(fence.get(), ++fenceValue);
             pendingFence = fenceValue;
             LARGE_INTEGER presentAt;
             QueryPerformanceCounter(&presentAt);
-            HRESULT hr = swap->Present(0, 0);
+            HRESULT hr = swap->Present(0, tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
             LARGE_INTEGER tDone;
             QueryPerformanceCounter(&tDone);
             presentMs += (tDone.QuadPart - tArrive.QuadPart) * 1000.0 / freq.QuadPart;
@@ -1254,8 +1324,12 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
             // fence once per frame, so a new frame is picked up right away instead of at the next vblank.
             // Each event is armed once per frame (a wait that stays pending is not registered again), and
             // the frames are checked again afterwards, as one may have completed just before arming.
-            HANDLE wake[SD_MAX_MONITORS];
-            DWORD n = waiter.Build(src, wake, ARRAYSIZE(wake));
+            HANDLE wake[SD_MAX_MONITORS * 2];
+            DWORD n = waiter.Build(src, wake, SD_MAX_MONITORS);
+            // The cursor's own events: a cursor move needs a present but no frame.
+            if (hwCursor)
+                for (auto& s1 : src)
+                    if (HANDLE e = cursors.Event(s1.index)) wake[n++] = e;
             if (FramesChanged(shm.get(), src)) continue;
             // The events wake us the moment a frame lands; the timeout is only a safety
             // net (deadline and panel checks below), so it can be long and idle-cheap.
@@ -1526,6 +1600,13 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     {
         base[i] = (LONG64)SdReadI64(&shm->mon[i].frameSeq);
         baseKey[i] = FrameRingKey(shm.get(), i);
+    }
+    // Window mode draws the cursor itself (hardware cursor): cursor moves stop costing frames and
+    // partial frame copies become safe. Only if this driver has the cursor section; exclusive mode
+    // keeps the OS-drawn cursor.
+    {
+        CursorSource probe;
+        if (g_windowMode && probe.Open()) cfg.flags |= SD_CFG_HW_CURSOR;
     }
     SdWriteConfig(shm.get(), cfg);
     InterlockedIncrement(&shm->modesGeneration);

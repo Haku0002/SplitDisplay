@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 # Single source of truth for the version: the generated manifest, the VERSIONINFO resource,
 # the settings window and scripts/make-release.ps1 all read it from here.
-project(SplitDisplay VERSION 0.4.3 LANGUAGES CXX)
+project(SplitDisplay VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -76,7 +76,7 @@ configure_file(src/splitdisplay/splitdisplay.manifest.in ${CMAKE_BINARY_DIR}/gen
 
 add_executable(splitdisplay
     src/splitdisplay/main.cpp src/splitdisplay/topology.cpp src/splitdisplay/gui.cpp src/splitdisplay/autostart.cpp
-    src/splitdisplay/guard.cpp src/splitdisplay/frames.cpp src/splitdisplay/updater.cpp
+    src/splitdisplay/guard.cpp src/splitdisplay/frames.cpp src/splitdisplay/updater.cpp src/splitdisplay/cursor.cpp
     src/splitdisplay/splitdisplay.rc ${CMAKE_BINARY_DIR}/generated/splitdisplay.manifest)
 target_include_directories(splitdisplay PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(splitdisplay PRIVATE sdcommon comctl32 shcore taskschd secur32 comsuppw oleaut32 shell32 dwmapi slc wtsapi32 dbghelp uxtheme d3dcompiler avrt winhttp version)

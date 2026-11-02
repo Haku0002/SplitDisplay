@@ -20,6 +20,12 @@ using namespace SplitDisplay;
 
 static SdShared* g_Shm = nullptr;
 
+// Hardware cursor hand-over (see SdCursorShared); null if the section could not be created,
+// in which case the OS simply keeps drawing the cursor into the frames.
+static SdCursorShared* g_Cursor = nullptr;
+static HANDLE g_CursorSection = nullptr;
+static HANDLE g_CursorEvents[SD_MAX_MONITORS] = {}; // per monitor, signalled on every cursor update
+
 // Only one adapter instance per host process may own the shared memory and plug monitors;
 // a duplicate root device node would otherwise double the monitors.
 static std::atomic<void*> g_Owner = nullptr;
@@ -469,6 +475,11 @@ HRESULT FrameRing::Recreate(const D3D11_TEXTURE2D_DESC& Src)
     }
 
     m_FenceValue = 0;
+    for (int i = 0; i < SD_BUFFERS; i++)
+    {
+        m_Accum[i].clear();
+        m_AccumFull[i] = true; // a fresh texture holds nothing yet
+    }
     m_Width = d.Width;
     m_Height = d.Height;
     m_Format = d.Format;
@@ -491,7 +502,7 @@ HRESULT FrameRing::Recreate(const D3D11_TEXTURE2D_DESC& Src)
     return S_OK;
 }
 
-void FrameRing::Publish(ID3D11Texture2D* Source, const IDDCX_METADATA& Meta)
+void FrameRing::Publish(ID3D11Texture2D* Source, IDDCX_SWAPCHAIN SwapChain, const IDDCX_METADATA& Meta, bool Partial)
 {
     if (!g_Shm) return;
     D3D11_TEXTURE2D_DESC sd;
@@ -501,23 +512,81 @@ void FrameRing::Publish(ID3D11Texture2D* Source, const IDDCX_METADATA& Meta)
         if (FAILED(Recreate(sd))) return;
     }
 
-    // Every frame is copied whole and published. 0.4.0/0.4.1 copied only the IddCx dirty rects
-    // and skipped frames reported as "no image update", but the software cursor that the OS
-    // draws into these frames is not covered by the dirty rects: cursor moves were dropped,
-    // the cursor only appeared where other content happened to change, and every image of it
-    // left behind stayed forever ("infinite ghosting"). Verified on hardware. Partial copies
-    // need a cursor the driver draws itself (IddCxMonitorSetupHardwareCursor) first.
+    // What changed in this frame? Only asked while the hardware cursor is active (Partial): the
+    // cursor the OS otherwise draws into the frames is not covered by the dirty rects, and copying
+    // only them left every cursor image behind (0.4.0 - 0.4.2). With the cursor out of the frames,
+    // a single all-zero dirty rect really means "no image update" and the frame is dropped.
+    std::vector<RECT> frameDirty;
+    bool full = true;
+    if (Partial && !Meta.HwProtectedSurface && Meta.MoveRegionCount == 0 && Meta.DirtyRectCount > 0 && Meta.DirtyRectCount <= 4096)
+    {
+        RECT stackRects[64];
+        std::vector<RECT> heapRects;
+        RECT* rects = stackRects;
+        if (Meta.DirtyRectCount > ARRAYSIZE(stackRects))
+        {
+            heapRects.resize(Meta.DirtyRectCount);
+            rects = heapRects.data();
+        }
+        IDARG_IN_GETDIRTYRECTS in = { Meta.DirtyRectCount, rects };
+        IDARG_OUT_GETDIRTYRECTS out = {};
+        if (SUCCEEDED(IddCxSwapChainGetDirtyRects(SwapChain, &in, &out)))
+        {
+            UINT n = std::min(out.DirtyRectOutCount, Meta.DirtyRectCount);
+            if (n == 1 && rects[0].left == 0 && rects[0].top == 0 && rects[0].right == 0 && rects[0].bottom == 0) return; // no image update
+            for (UINT i = 0; i < n; i++)
+            {
+                RECT r = { std::clamp<LONG>(rects[i].left, 0, (LONG)sd.Width), std::clamp<LONG>(rects[i].top, 0, (LONG)sd.Height),
+                    std::clamp<LONG>(rects[i].right, 0, (LONG)sd.Width), std::clamp<LONG>(rects[i].bottom, 0, (LONG)sd.Height) };
+                if (r.right > r.left && r.bottom > r.top) frameDirty.push_back(r);
+            }
+            full = frameDirty.empty(); // something changed but nothing usable was listed: copy all
+        }
+    }
+
+    // Every slot still missing this frame's changes accumulates them: slot w is only correct
+    // once it has received all changes since the frame it currently holds.
+    for (int i = 0; i < SD_BUFFERS; i++)
+    {
+        if (full) m_AccumFull[i] = true;
+        else if (!m_AccumFull[i])
+        {
+            m_Accum[i].insert(m_Accum[i].end(), frameDirty.begin(), frameDirty.end());
+            if (m_Accum[i].size() > 256) m_AccumFull[i] = true; // a full copy beats hundreds of small ones
+        }
+    }
+
     auto& m = g_Shm->mon[m_Index];
     int w = SdPickWriteSlot(m.latest, m.readerIndex);
     if (w < 0) return; // shared state out of range (torn down or corrupted): drop the frame
 
     auto* ctx = m_Device->DeviceContext.Get();
-    ctx->CopyResource(m_Tex[w].Get(), Source);
+    bool copyFull = m_AccumFull[w];
+    if (!copyFull)
+    {
+        UINT64 area = 0;
+        for (auto& r : m_Accum[w]) area += (UINT64)(r.right - r.left) * (r.bottom - r.top);
+        copyFull = area >= (UINT64)sd.Width * sd.Height * 3 / 4;
+    }
+    if (copyFull)
+    {
+        ctx->CopyResource(m_Tex[w].Get(), Source);
+    }
+    else
+    {
+        for (auto& r : m_Accum[w])
+        {
+            D3D11_BOX box{ (UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1 };
+            ctx->CopySubresourceRegion(m_Tex[w].Get(), 0, (UINT)r.left, (UINT)r.top, 0, Source, 0, &box);
+        }
+    }
+    m_Accum[w].clear();
+    m_AccumFull[w] = false;
     ctx->Signal(m_Fence.Get(), ++m_FenceValue);
     ctx->Flush();
 
-    // Journal first, published state afterwards: a consumer that sees the new latest must also
-    // find the matching journal entry. Every entry says "whole frame changed" for now.
+    // Journal first (what changed in this frame only), published state afterwards: a consumer
+    // that sees the new latest must also find the matching journal entry.
     // frameSeq is monotonic for the life of the shared section, not per ring: a ring is
     // recreated on every swap-chain reassignment (mode change, ACCESS_LOST), and consumers
     // compare sequence numbers across that boundary ("has a new frame arrived since X?").
@@ -526,8 +595,33 @@ void FrameRing::Publish(ID3D11Texture2D* Source, const IDDCX_METADATA& Meta)
     SdDirtyFrame& j = m.journal[seq % SD_DIRTY_JOURNAL];
     j.seqEnd = 0;
     MemoryBarrier();
-    j.full = 1;
-    j.count = 0;
+    if (full)
+    {
+        j.full = 1;
+        j.count = 0;
+    }
+    else if ((int)frameDirty.size() > SD_MAX_DIRTY)
+    {
+        // Too many rects to store: their bounding box is a correct superset.
+        SdRect bb = { (INT32)sd.Width, (INT32)sd.Height, 0, 0 };
+        for (auto& r : frameDirty)
+        {
+            bb.left = std::min(bb.left, (INT32)r.left);
+            bb.top = std::min(bb.top, (INT32)r.top);
+            bb.right = std::max(bb.right, (INT32)r.right);
+            bb.bottom = std::max(bb.bottom, (INT32)r.bottom);
+        }
+        j.full = 0;
+        j.count = 1;
+        j.rects[0] = bb;
+    }
+    else
+    {
+        j.full = 0;
+        j.count = (UINT32)frameDirty.size();
+        for (UINT32 i = 0; i < j.count; i++)
+            j.rects[i] = { frameDirty[i].left, frameDirty[i].top, frameDirty[i].right, frameDirty[i].bottom };
+    }
     j.seq = seq;
     MemoryBarrier();
     j.seqEnd = seq;
@@ -544,17 +638,107 @@ void FrameRing::Publish(ID3D11Texture2D* Source, const IDDCX_METADATA& Meta)
 
 #pragma region SwapChainProcessor
 
-SwapChainProcessor::SwapChainProcessor(UINT MonitorIndex, IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent)
-    : m_Index(MonitorIndex), m_hSwapChain(hSwapChain), m_Device(std::move(Device)), m_hAvailableBufferEvent(NewFrameEvent)
+SwapChainProcessor::SwapChainProcessor(UINT MonitorIndex, IDDCX_MONITOR Monitor, IDDCX_SWAPCHAIN hSwapChain, std::shared_ptr<Direct3DDevice> Device,
+    HANDLE NewFrameEvent, HANDLE CursorEvent)
+    : m_Index(MonitorIndex), m_Monitor(Monitor), m_hSwapChain(hSwapChain), m_Device(std::move(Device)), m_hAvailableBufferEvent(NewFrameEvent)
 {
-    m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    m_hCursorEvent.Attach(CursorEvent);
+    m_hTerminateEvent.Attach(CreateEvent(nullptr, TRUE, FALSE, nullptr));
     m_hThread.Attach(CreateThread(nullptr, 0, RunThread, this, 0, nullptr));
+    if (m_hCursorEvent.IsValid()) m_hCursorThread.Attach(CreateThread(nullptr, 0, CursorThread, this, 0, nullptr));
 }
 
 SwapChainProcessor::~SwapChainProcessor()
 {
     SetEvent(m_hTerminateEvent.Get());
     if (m_hThread.Get()) WaitForSingleObject(m_hThread.Get(), INFINITE);
+    if (m_hCursorThread.Get()) WaitForSingleObject(m_hCursorThread.Get(), INFINITE);
+}
+
+DWORD CALLBACK SwapChainProcessor::CursorThread(LPVOID Argument)
+{
+    reinterpret_cast<SwapChainProcessor*>(Argument)->CursorLoop();
+    return 0;
+}
+
+// Copies every cursor update the OS signals into this monitor's block of the cursor section
+// (seqlock-protected; the shape is written straight into the block by the OS, and only when it
+// changed), then wakes the compositor. Runs as long as the swap chain does: once it is gone the
+// OS draws the cursor into the frames again until the next assignment sets it up anew.
+void SwapChainProcessor::CursorLoop()
+{
+    if (!g_Cursor) return;
+    auto& c = g_Cursor->mon[m_Index];
+    InterlockedIncrement(&c.seq);
+    MemoryBarrier();
+    c.visible = 0;
+    c.active = 1;
+    MemoryBarrier();
+    InterlockedIncrement(&c.seq);
+
+    HANDLE waits[] = { m_hCursorEvent.Get(), m_hTerminateEvent.Get() };
+    UINT lastShape = c.shapeId;
+    int logged = 0;
+    for (;;)
+    {
+        if (WaitForMultipleObjects(ARRAYSIZE(waits), waits, FALSE, INFINITE) != WAIT_OBJECT_0) break;
+        IDARG_IN_QUERY_HWCURSOR in = {};
+        in.LastShapeId = lastShape;
+        in.ShapeBufferSizeInBytes = sizeof(c.shape);
+        in.pShapeBuffer = c.shape;
+        IDARG_OUT_QUERY_HWCURSOR out = {};
+        InterlockedIncrement(&c.seq); // odd: the OS may write the shape buffer during the query
+        MemoryBarrier();
+        NTSTATUS st = IddCxMonitorQueryHardwareCursor(m_Monitor, &in, &out);
+        if (NT_SUCCESS(st))
+        {
+            c.visible = out.IsCursorVisible ? 1 : 0;
+            if (out.IsCursorVisible)
+            {
+                c.x = out.X;
+                c.y = out.Y;
+                if (out.IsCursorShapeUpdated)
+                {
+                    const auto& si = out.CursorShapeInfo;
+                    c.shapeId = si.ShapeId;
+                    c.type = (UINT)si.CursorType;
+                    c.width = std::min<UINT>(si.Width, SD_CURSOR_MAX);
+                    c.height = std::min<UINT>(si.Height, SD_CURSOR_MAX);
+                    c.pitch = si.Pitch;
+                    c.xHot = si.XHot;
+                    c.yHot = si.YHot;
+                    lastShape = si.ShapeId;
+                }
+            }
+            LARGE_INTEGER q;
+            QueryPerformanceCounter(&q);
+            c.updateQpc = q.QuadPart;
+        }
+        MemoryBarrier();
+        InterlockedIncrement(&c.seq); // even: stable
+        if (NT_SUCCESS(st))
+        {
+            if (g_CursorEvents[m_Index]) SetEvent(g_CursorEvents[m_Index]);
+            if (logged < 3 && out.IsCursorVisible)
+            {
+                logged++;
+                DLog(L"mon%u: cursor at %d,%d shape %u type %u %ux%u hot %u,%u", m_Index, out.X, out.Y, c.shapeId, c.type, c.width, c.height, c.xHot, c.yHot);
+            }
+        }
+        else if (logged < 3)
+        {
+            logged++;
+            DLog(L"mon%u: QueryHardwareCursor failed 0x%08X", m_Index, st);
+        }
+    }
+
+    InterlockedIncrement(&c.seq);
+    MemoryBarrier();
+    c.active = 0;
+    c.visible = 0;
+    MemoryBarrier();
+    InterlockedIncrement(&c.seq);
+    if (g_CursorEvents[m_Index]) SetEvent(g_CursorEvents[m_Index]);
 }
 
 DWORD CALLBACK SwapChainProcessor::RunThread(LPVOID Argument)
@@ -591,6 +775,8 @@ void SwapChainProcessor::RunCore()
 
     FrameRing ring(m_Index, m_Device);
     UINT64 frames = 0;
+    // Partial copies only while the OS hands the cursor to us instead of drawing it into frames.
+    const bool partial = m_hCursorEvent.IsValid();
 
     for (;;)
     {
@@ -613,7 +799,7 @@ void SwapChainProcessor::RunCore()
             ComPtr<ID3D11Texture2D> tex;
             if (SUCCEEDED(AcquiredBuffer.As(&tex)))
             {
-                ring.Publish(tex.Get(), Buffer.MetaData);
+                ring.Publish(tex.Get(), m_hSwapChain, Buffer.MetaData, partial);
                 if (++frames == 1) DLog(L"mon%u: first frame", m_Index);
             }
             AcquiredBuffer.Reset();
@@ -657,6 +843,18 @@ IndirectDeviceContext::~IndirectDeviceContext()
             g_Shm = nullptr;
         }
         if (m_Section) CloseHandle(m_Section);
+        if (g_Cursor)
+        {
+            UnmapViewOfFile(g_Cursor);
+            g_Cursor = nullptr;
+        }
+        if (g_CursorSection) CloseHandle(g_CursorSection);
+        g_CursorSection = nullptr;
+        for (auto& e : g_CursorEvents)
+        {
+            if (e) CloseHandle(e);
+            e = nullptr;
+        }
         ReleaseOwnership();
     }
 }
@@ -775,6 +973,33 @@ void IndirectDeviceContext::FinishInit()
         m.readerIndex = -1;
         m.handleGeneration = 0;
     }
+
+    // Cursor hand-over section. Optional: without it the cursor stays in the frames, as before.
+    SECURITY_ATTRIBUTES csa = { sizeof(csa) };
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GR;;;IU)", SDDL_REVISION_1, &csa.lpSecurityDescriptor, nullptr))
+    {
+        g_CursorSection = CreateFileMappingW(INVALID_HANDLE_VALUE, &csa, PAGE_READWRITE, 0, sizeof(SdCursorShared), SD_CURSOR_SHM_NAME);
+        if (g_CursorSection) g_Cursor = (SdCursorShared*)MapViewOfFile(g_CursorSection, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SdCursorShared));
+        if (g_Cursor)
+        {
+            g_Cursor->magic = SD_CURSOR_MAGIC;
+            g_Cursor->version = 1;
+            for (auto& c : g_Cursor->mon)
+            {
+                c.active = 0;
+                c.visible = 0;
+                c.seq &= ~1; // a writer that died mid-update must not leave the block "busy"
+            }
+            for (int i = 0; i < SD_MAX_MONITORS; i++)
+            {
+                wchar_t name[96];
+                swprintf_s(name, L"%s%d", SD_CURSOR_EVENT_PREFIX, i);
+                g_CursorEvents[i] = CreateEventW(&csa, FALSE, FALSE, name);
+            }
+        }
+        LocalFree(csa.lpSecurityDescriptor);
+    }
+    DLog(L"cursor section %s", g_Cursor ? L"ready" : L"unavailable");
 
     m_StopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     m_Thread = CreateThread(nullptr, 0, CommandThread, this, 0, nullptr);
@@ -982,7 +1207,33 @@ void IndirectMonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID Ren
         WdfObjectDelete(SwapChain);
         return;
     }
-    m_ProcessingThread.reset(new SwapChainProcessor(m_Index, SwapChain, Device, NewFrameEvent));
+
+    // Hardware cursor: only when the compositor asked for it (it then draws the cursor itself)
+    // and the cursor section exists. Set up again on every assignment.
+    HANDLE cursorEvent = nullptr;
+    if (g_Cursor && (CfgSnapshot().flags & SD_CFG_HW_CURSOR))
+    {
+        cursorEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        IDARG_IN_SETUP_HWCURSOR cursor = {};
+        cursor.CursorInfo.Size = sizeof(cursor.CursorInfo);
+        // XOR cursors (the text beam and magnifier of many apps, legacy monochrome cursors) arrive
+        // as masked-colour shapes and the compositor inverts the screen under them, like a real
+        // display. Not EMULATION: that turns them into alpha cursors with a solid border, which
+        // looks different from the native cursor (and showed as a black box in 0.5.0 previews).
+        cursor.CursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_FULL;
+        cursor.CursorInfo.AlphaCursorSupport = TRUE;
+        cursor.CursorInfo.MaxX = SD_CURSOR_MAX;
+        cursor.CursorInfo.MaxY = SD_CURSOR_MAX;
+        cursor.hNewCursorDataAvailable = cursorEvent;
+        NTSTATUS st = cursorEvent ? IddCxMonitorSetupHardwareCursor(m_Monitor, &cursor) : STATUS_NO_MEMORY;
+        DLog(L"mon%u: hardware cursor setup 0x%08X", m_Index, st);
+        if (!NT_SUCCESS(st) && cursorEvent)
+        {
+            CloseHandle(cursorEvent);
+            cursorEvent = nullptr;
+        }
+    }
+    m_ProcessingThread.reset(new SwapChainProcessor(m_Index, m_Monitor, SwapChain, Device, NewFrameEvent, cursorEvent));
 }
 
 void IndirectMonitorContext::UnassignSwapChain()

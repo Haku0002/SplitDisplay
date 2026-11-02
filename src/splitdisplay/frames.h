@@ -71,9 +71,10 @@ private:
 // rects that changed since (see the journal in protocol.h). Black where a monitor has no
 // frame. The copies hold ring reservations until the caller releases them after its fence.
 // rotations[k] is the DISPLAYCONFIG_ROTATION of monitor k (0/1 = identity), or nullptr.
+// If `changed` is given, every rectangle of `dst` written in this pass is appended to it.
 void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HANDLE driverProc, std::vector<FrameSource>& src,
     const std::vector<RECT>& regions, ID3D11Texture2D* dst, ID3D11RenderTargetView* rtv, UINT width, UINT height, int targetIndex,
-    StretchBlitter* blitter, const int* rotations);
+    StretchBlitter* blitter, const int* rotations, std::vector<RECT>* changed = nullptr);
 
 // Arms one event per source on the next fence value the driver will signal, so a compositor
 // can sleep until a new frame finishes instead of polling. Each event is armed once per

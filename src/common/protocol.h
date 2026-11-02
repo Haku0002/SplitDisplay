@@ -62,10 +62,13 @@ struct SdMonitorConfig
     UINT32 heightMm;
 };
 
+// SdConfig::flags
+constexpr UINT32 SD_CFG_HW_CURSOR = 1; // the compositor draws the cursor: take it out of the frames (see SdCursorShared)
+
 struct SdConfig
 {
     UINT32 count;                          // virtual monitors to plug (1..SD_MAX_MONITORS)
-    UINT32 reserved;
+    UINT32 flags;                          // SD_CFG_*; 0 in configs written before 0.5
     LUID renderAdapter;                    // GPU the physical panels are attached to
     SdMonitorConfig mon[SD_MAX_MONITORS];  // monitor i is "Split <i+1>"
 };
@@ -125,3 +128,37 @@ inline bool SdReadConfig(const SdShared* s, SdConfig& out)
     out = SdConfig{};
     return false;
 }
+
+// Hardware cursor (0.5+). A separate section, so the main one keeps its layout and old/new
+// compositors and drivers still pair up. When the compositor asks for it (SD_CFG_HW_CURSOR) and
+// IddCx accepts, the OS stops drawing the mouse cursor into the frames of that monitor and hands
+// over its position and shape instead; the compositor draws it on the panel. That takes cursor
+// movement off the frame path entirely (no frame per mouse move) and is what makes partial
+// (dirty-rect) frame copies safe: the dirty rects IddCx reports never covered the cursor.
+#define SD_CURSOR_SHM_NAME L"Global\\SplitDisplay.Cursor.v1"
+#define SD_CURSOR_EVENT_PREFIX L"Global\\SplitDisplay.CursorEvent.v1." // + monitor index; auto-reset
+
+constexpr UINT32 SD_CURSOR_MAGIC = 0x52435053; // 'SPCR'
+constexpr int SD_CURSOR_MAX = 256;             // largest cursor taken over (bigger ones stay in the frames)
+
+struct SdCursor
+{
+    volatile LONG seq;    // seqlock: odd while the driver writes this block
+    volatile LONG active; // 1 = the OS hands this monitor's cursor to us (it is NOT in the frames)
+    LONG visible;         // cursor shown on this monitor
+    INT x, y;             // top-left of the cursor image, in the monitor's pixels
+    UINT shapeId;         // changes whenever the OS sets a new image
+    UINT type;            // IDDCX_CURSOR_SHAPE_TYPE: 1 masked colour, 2 alpha
+    UINT width, height, pitch;
+    UINT xHot, yHot;
+    LONG64 updateQpc;     // QueryPerformanceCounter when the driver took this update
+    BYTE shape[SD_CURSOR_MAX * SD_CURSOR_MAX * 4];
+};
+
+struct SdCursorShared
+{
+    UINT32 magic;
+    UINT32 version;
+    SdCursor mon[SD_MAX_MONITORS];
+};
+
