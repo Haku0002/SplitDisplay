@@ -5,58 +5,47 @@
 #include <taskschd.h>
 #define SECURITY_WIN32
 #include <security.h>
+#include <winrt/base.h>
 
 #include <string>
 
 #include "log.h"
 
-static constexpr wchar_t kTaskName[] = L"SplitDisplay";
+namespace
+{
 
-struct ComInit
+constexpr wchar_t kTaskName[] = L"SplitDisplay";
+
+struct ComScope
 {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    ~ComInit()
+    ~ComScope()
     {
         if (SUCCEEDED(hr)) CoUninitialize();
     }
 };
 
-static ITaskFolder* RootFolder(ITaskService** serviceOut)
+winrt::com_ptr<ITaskFolder> OpenRootFolder()
 {
-    ITaskService* service = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&service)))) return nullptr;
-    if (FAILED(service->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t())))
-    {
-        service->Release();
-        return nullptr;
-    }
-    ITaskFolder* folder = nullptr;
-    service->GetFolder(_bstr_t(L"\\"), &folder);
-    *serviceOut = service;
-    return folder;
+    winrt::com_ptr<ITaskService> svc;
+    if (FAILED(CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(svc.put())))) return nullptr;
+    if (FAILED(svc->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t()))) return nullptr;
+    winrt::com_ptr<ITaskFolder> root;
+    if (FAILED(svc->GetFolder(_bstr_t(L"\\"), root.put()))) return nullptr;
+    return root;
 }
 
-AutostartState GetAutostart()
+std::wstring CurrentUserAccount()
 {
-    ComInit com;
-    ITaskService* service = nullptr;
-    ITaskFolder* folder = RootFolder(&service);
-    if (!folder) return AutostartState::Missing;
-    AutostartState state = AutostartState::Missing;
-    IRegisteredTask* task = nullptr;
-    if (SUCCEEDED(folder->GetTask(_bstr_t(kTaskName), &task)))
-    {
-        VARIANT_BOOL enabled = VARIANT_FALSE;
-        task->get_Enabled(&enabled);
-        state = enabled ? AutostartState::Enabled : AutostartState::Disabled;
-        task->Release();
-    }
-    folder->Release();
-    service->Release();
-    return state;
+    wchar_t buf[256] = {};
+    ULONG len = 256;
+    if (GetUserNameExW(NameSamCompatible, buf, &len) && buf[0]) return buf;
+    len = 256;
+    if (GetUserNameW(buf, &len) && buf[0]) return buf;
+    return L"";
 }
 
-static std::wstring XmlEscape(const std::wstring& s)
+std::wstring XmlEscape(const std::wstring& s)
 {
     std::wstring out;
     for (wchar_t c : s)
@@ -67,52 +56,95 @@ static std::wstring XmlEscape(const std::wstring& s)
         case L'<': out += L"&lt;"; break;
         case L'>': out += L"&gt;"; break;
         case L'"': out += L"&quot;"; break;
-        default: out += c;
+        default: out += c; break;
         }
     }
     return out;
 }
 
+} // namespace
+
+AutostartState GetAutostart()
+{
+    ComScope com;
+    auto root = OpenRootFolder();
+    if (!root) return AutostartState::Missing;
+    winrt::com_ptr<IRegisteredTask> task;
+    if (FAILED(root->GetTask(_bstr_t(kTaskName), task.put()))) return AutostartState::Missing;
+    VARIANT_BOOL enabled = VARIANT_FALSE;
+    if (FAILED(task->get_Enabled(&enabled)) || !enabled) return AutostartState::Disabled;
+
+    winrt::com_ptr<ITaskDefinition> def;
+    if (SUCCEEDED(task->get_Definition(def.put())) && def)
+    {
+        winrt::com_ptr<ITriggerCollection> triggers;
+        if (SUCCEEDED(def->get_Triggers(triggers.put())) && triggers)
+        {
+            winrt::com_ptr<ITrigger> trig;
+            if (SUCCEEDED(triggers->get_Item(1, trig.put())) && trig)
+            {
+                VARIANT_BOOL trigEnabled = VARIANT_TRUE;
+                if (SUCCEEDED(trig->get_Enabled(&trigEnabled)) && !trigEnabled) return AutostartState::Disabled;
+            }
+        }
+    }
+    return AutostartState::Enabled;
+}
+
 bool SetAutostart(bool enabled)
 {
-    wchar_t exe[MAX_PATH];
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    wchar_t user[256];
-    ULONG userLen = 256;
-    if (!GetUserNameExW(NameSamCompatible, user, &userLen))
-    {
-        Log(L"autostart: GetUserNameEx failed %lu", GetLastError());
-        return false;
-    }
+    ComScope com;
+    auto root = OpenRootFolder();
+    if (!root) return false;
 
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring user = CurrentUserAccount();
+    if (user.empty()) return false;
+
+    // Keep <Settings><Enabled>true</Enabled> so StartAutostartTask() can always launch the elevated
+    // compositor on demand without a UAC prompt; the checkbox toggles <LogonTrigger><Enabled>.
     std::wstring xml =
         L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>"
         L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
         L"<RegistrationInfo><Description>Splits the configured display into native monitors (SplitDisplay).</Description></RegistrationInfo>"
-        L"<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + XmlEscape(user) + L"</UserId><Delay>PT3S</Delay></LogonTrigger></Triggers>"
+        L"<Triggers><LogonTrigger><Enabled>" + std::wstring(enabled ? L"true" : L"false") + L"</Enabled>"
+        L"<UserId>" + XmlEscape(user) + L"</UserId><Delay>PT3S</Delay></LogonTrigger></Triggers>"
         L"<Principals><Principal id=\"Author\"><UserId>" + XmlEscape(user) + L"</UserId>"
         L"<LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>"
         L"<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
-        L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
-        L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>"
-        L"<Enabled>" + std::wstring(enabled ? L"true" : L"false") + L"</Enabled></Settings>"
-        L"<Actions Context=\"Author\"><Exec><Command>\"" + XmlEscape(exe) + L"\"</Command><Arguments>run</Arguments></Exec></Actions>"
-        L"</Task>";
+        L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+        L"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+        L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"
+        L"<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>"
+        L"<Enabled>true</Enabled></Settings>"
+        L"<Actions Context=\"Author\"><Exec>"
+        L"<Command>&quot;" + XmlEscape(exe) + L"&quot;</Command><Arguments>run</Arguments>"
+        L"</Exec></Actions></Task>";
 
-    ComInit com;
-    ITaskService* service = nullptr;
-    ITaskFolder* folder = RootFolder(&service);
-    if (!folder)
+    // Grant Interactive Users (IU) Generic Read + Generic Execute on the task object so the
+    // unprivileged settings window can query task state (GetAutostart) and start the task on
+    // demand (StartAutostartTask) without a UAC prompt, while only SY/BA can modify the task.
+    winrt::com_ptr<IRegisteredTask> task;
+    HRESULT hr = root->RegisterTask(_bstr_t(kTaskName), _bstr_t(xml.c_str()), TASK_CREATE_OR_UPDATE,
+        _variant_t(), _variant_t(), TASK_LOGON_INTERACTIVE_TOKEN,
+        _variant_t(L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;IU)"), task.put());
+    if (FAILED(hr))
     {
-        Log(L"autostart: Task Scheduler unavailable");
+        Log(L"RegisterTask failed: 0x%08X", (UINT)hr);
         return false;
     }
-    IRegisteredTask* task = nullptr;
-    HRESULT hr = folder->RegisterTask(_bstr_t(kTaskName), _bstr_t(xml.c_str()), TASK_CREATE_OR_UPDATE, _variant_t(), _variant_t(),
-        TASK_LOGON_INTERACTIVE_TOKEN, _variant_t(L""), &task);
-    if (task) task->Release();
-    folder->Release();
-    service->Release();
-    Log(L"autostart %s for %s: 0x%08X", enabled ? L"enabled" : L"disabled", user, (UINT)hr);
-    return SUCCEEDED(hr);
+    Log(L"autostart %s for %s: 0x%08X", enabled ? L"enabled" : L"disabled", user.c_str(), (UINT)hr);
+    return true;
+}
+
+bool StartAutostartTask()
+{
+    ComScope com;
+    auto root = OpenRootFolder();
+    if (!root) return false;
+    winrt::com_ptr<IRegisteredTask> task;
+    if (FAILED(root->GetTask(_bstr_t(kTaskName), task.put()))) return false;
+    winrt::com_ptr<IRunningTask> running;
+    return SUCCEEDED(task->Run(_variant_t(), running.put()));
 }

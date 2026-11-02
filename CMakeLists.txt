@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 # Single source of truth for the version: the generated manifest, the VERSIONINFO resource,
 # the settings window and scripts/make-release.ps1 all read it from here.
-project(SplitDisplay VERSION 0.4.0 LANGUAGES CXX)
+project(SplitDisplay VERSION 0.4.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,7 +21,6 @@ add_link_options(/guard:cf /CETCOMPAT)
 add_library(sdcommon STATIC src/common/panel.cpp src/common/log.cpp src/common/shm.cpp src/common/layout.cpp)
 target_include_directories(sdcommon PUBLIC src/common)
 target_link_libraries(sdcommon PUBLIC windowsapp d3d11 dxgi ntdll ole32)
-
 
 # ---- IDD driver (UMDF 2 / IddCx), built against the WDK NuGet package in third_party/wdk ----
 set(WDK_ROOT ${CMAKE_SOURCE_DIR}/third_party/wdk/c)
@@ -48,13 +47,26 @@ configure_file(src/splitdisplay/splitdisplay.manifest.in ${CMAKE_BINARY_DIR}/gen
 
 add_executable(splitdisplay
     src/splitdisplay/main.cpp src/splitdisplay/topology.cpp src/splitdisplay/gui.cpp src/splitdisplay/autostart.cpp
-    src/splitdisplay/guard.cpp src/splitdisplay/frames.cpp
+    src/splitdisplay/guard.cpp src/splitdisplay/frames.cpp src/splitdisplay/updater.cpp
     src/splitdisplay/splitdisplay.rc ${CMAKE_BINARY_DIR}/generated/splitdisplay.manifest)
-target_link_libraries(splitdisplay PRIVATE sdcommon comctl32 shcore taskschd secur32 comsuppw oleaut32 shell32 dwmapi slc wtsapi32 dbghelp mscms uxtheme d3dcompiler avrt)
+target_link_libraries(splitdisplay PRIVATE sdcommon comctl32 shcore taskschd secur32 comsuppw oleaut32 shell32 dwmapi slc wtsapi32 dbghelp mscms uxtheme d3dcompiler avrt winhttp version)
 target_compile_definitions(splitdisplay PRIVATE SPLITDISPLAY_VERSION="${PROJECT_VERSION}"
     SD_VER_MAJOR=${PROJECT_VERSION_MAJOR} SD_VER_MINOR=${PROJECT_VERSION_MINOR} SD_VER_PATCH=${PROJECT_VERSION_PATCH})
 # No console window when started at logon; everything goes to splitdisplay.log.
 target_link_options(splitdisplay PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup /MANIFESTUAC:NO)
+
+# ---- Standalone single-file graphical installer (SplitDisplaySetup.exe) ----
+if(NOT EXISTS "${CMAKE_BINARY_DIR}/generated/package.zip")
+    file(WRITE "${CMAKE_BINARY_DIR}/generated/package.zip" "PK")
+endif()
+configure_file(src/setup/setup.manifest.in ${CMAKE_BINARY_DIR}/generated/setup.manifest @ONLY)
+configure_file(src/setup/setup.rc.in ${CMAKE_BINARY_DIR}/generated/setup.rc @ONLY)
+add_executable(SplitDisplaySetup WIN32
+    src/setup/main.cpp ${CMAKE_BINARY_DIR}/generated/setup.rc ${CMAKE_BINARY_DIR}/generated/setup.manifest)
+target_link_libraries(SplitDisplaySetup PRIVATE comctl32 shcore dwmapi uxtheme)
+target_compile_definitions(SplitDisplaySetup PRIVATE SPLITDISPLAY_VERSION="${PROJECT_VERSION}"
+    SD_VER_MAJOR=${PROJECT_VERSION_MAJOR} SD_VER_MINOR=${PROJECT_VERSION_MINOR} SD_VER_PATCH=${PROJECT_VERSION_PATCH})
+target_link_options(SplitDisplaySetup PRIVATE /MANIFESTUAC:NO)
 
 add_executable(layout_test tests/layout_test.cpp)
 target_link_libraries(layout_test PRIVATE sdcommon)

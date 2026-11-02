@@ -21,6 +21,7 @@
 #include <DbgHelp.h>
 #include <Icm.h>
 #include <Shellapi.h>
+#include <sddl.h>
 #include <avrt.h>
 #include <d3d11_4.h>
 #include <dwmapi.h>
@@ -58,6 +59,7 @@
 #include "names.h"
 #include "panel.h"
 #include "shm.h"
+#include "updater.h"
 #include "topology.h"
 
 namespace wdc = winrt::Windows::Devices::Display::Core;
@@ -1700,7 +1702,12 @@ static int CmdRun(DWORD testSeconds)
         Log(L"already running");
         return 1;
     }
-    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, kStopEventName);
+    // Allow Interactive Users to signal the stop event so the unprivileged settings window (and
+    // "splitdisplay stop") can stop the elevated compositor without a UAC prompt.
+    SECURITY_ATTRIBUTES stopSa{ sizeof(stopSa) };
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)", SDDL_REVISION_1, &stopSa.lpSecurityDescriptor, nullptr);
+    g_stopEvent = CreateEventW(&stopSa, TRUE, FALSE, kStopEventName);
+    if (stopSa.lpSecurityDescriptor) LocalFree(stopSa.lpSecurityDescriptor);
 
     HANDLE hbMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(LONG64), HeartbeatName(GetCurrentProcessId()).c_str());
     g_heartbeat = (volatile LONG64*)MapViewOfFile(hbMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LONG64));
@@ -2040,9 +2047,40 @@ int wmain(int argc, wchar_t** argv)
         if (argc > 3 && std::wstring(argv[2]) == L"--test") test = (DWORD)_wtoi(argv[3]);
         return CmdRun(test);
     }
+    if (cmd == L"install")
+    {
+        std::wstring err;
+        if (!RunLocalInstall([](const std::wstring& s) { Log(L"install: %s", s.c_str()); }, err))
+        {
+            Log(L"install failed: %s", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
+    if (cmd == L"update")
+    {
+        auto rel = CheckForGitHubUpdate();
+        if (!rel.ok)
+        {
+            Log(L"update check failed: %s", rel.error.c_str());
+            return 1;
+        }
+        if (!rel.hasUpdate)
+        {
+            Log(L"already up to date (%s)", rel.tag.c_str());
+            return 0;
+        }
+        std::wstring err;
+        if (!RunGitHubUpgrade(rel, [](const std::wstring& s) { Log(L"update: %s", s.c_str()); }, err))
+        {
+            Log(L"update failed: %s", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
     if (cmd == L"stop") return CmdStop();
     if (cmd == L"revert") return CmdRevert();
     if (cmd == L"watchdog" && argc >= 4) return CmdWatchdog(argc, argv);
-    Log(L"usage: splitdisplay [--panel NAME] run [--test SECONDS] | stop | revert | configure | autodetect | autostart on|off");
+    Log(L"usage: splitdisplay [--panel NAME] run [--test SECONDS] | stop | revert | install | update | configure | autodetect | autostart on|off");
     return 1;
 }

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -26,6 +27,7 @@
 #include "panel.h"
 #include "shm.h"
 #include "topology.h"
+#include "updater.h"
 
 #ifndef SPLITDISPLAY_VERSION
 #define SPLITDISPLAY_VERSION "dev"
@@ -50,8 +52,12 @@ enum : int
     IDC_START,
     IDC_STOP,
     IDC_AUTOSTART,
+    IDC_AUTOSTART_L,
     IDC_LOGS,
+    IDC_INSTALL,
+    IDC_UPDATE,
     IDC_UNINSTALL,
+    IDC_UPDATE_INFO,
     IDC_HINT,
     IDC_LINK,
     // layout editor
@@ -77,10 +83,14 @@ enum : int
 
 constexpr UINT WM_APP_BUSY_DONE = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
+constexpr UINT WM_APP_UPDATE_DONE = WM_APP + 3;
+constexpr UINT WM_APP_PROGRESS_TEXT = WM_APP + 4;
+constexpr UINT WM_APP_INSTALLER_LAUNCHED = WM_APP + 5;
 constexpr int IDM_TRAY_OPEN = 4001;
 constexpr int IDM_TRAY_START = 4002;
 constexpr int IDM_TRAY_STOP = 4003;
-constexpr int IDM_TRAY_EXIT = 4004;
+constexpr int IDM_TRAY_UPGRADE = 4004;
+constexpr int IDM_TRAY_EXIT = 4005;
 constexpr UINT_PTR kTimer = 1;
 constexpr wchar_t kCanvasClass[] = L"SplitDisplayLayoutCanvas";
 constexpr wchar_t kMapClass[] = L"SplitDisplayMonitorMap";
@@ -97,7 +107,7 @@ struct MapItem
 struct Ui
 {
     HWND wnd = nullptr;
-    HFONT font = nullptr, bold = nullptr, title = nullptr, smallFont = nullptr;
+    HFONT font = nullptr, bold = nullptr, title = nullptr, smallFont = nullptr, linkFont = nullptr;
     UINT dpi = 96;
     bool busy = false;
     bool splitActive = false;
@@ -105,10 +115,19 @@ struct Ui
     bool problem = false;
     bool dark = false;
     HBRUSH bgBrush = nullptr;
+    HBRUSH inputBrush = nullptr;
     bool exiting = false;     // tray Exit really quits; the close box only hides to the tray
     bool trayTipShown = false;
     bool trayAdded = false;
     bool autostartFailed = false;
+    bool checkingUpdate = false;
+    bool manualUpdateCheck = false;
+    bool promptOnUpdateFound = false;
+    std::wstring notifiedUpdateTag;
+    UpdateInfo updateInfo;
+    std::mutex progressMutex;
+    std::wstring progressText;
+    std::wstring installError;
     int tick = 0;              // status timer ticks; the (expensive) map is rebuilt every 5th
     std::wstring trayTip;
     std::vector<PanelConfig> panels;  // config snapshot for painting; refreshed by UpdateStatus
@@ -156,10 +175,13 @@ const Item kItems[] = {
     { IDC_START, WC_BUTTON, L"Start split", BS_PUSHBUTTON | WS_TABSTOP, 16, 366, 203, 34, 0 },
     { IDC_STOP, WC_BUTTON, L"Stop split", BS_PUSHBUTTON | WS_TABSTOP, 227, 366, 203, 34, 0 },
     { IDC_AUTOSTART, WC_BUTTON, L"Start splitting automatically when I sign in", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 412, 414, 22, 0 },
-    { IDC_LOGS, WC_BUTTON, L"Open logs", BS_PUSHBUTTON | WS_TABSTOP, 16, 444, 120, 28, 0 },
-    { IDC_UNINSTALL, WC_BUTTON, L"Uninstall...", BS_PUSHBUTTON | WS_TABSTOP, 144, 444, 120, 28, 0 },
+    { IDC_LOGS, WC_BUTTON, L"Open logs", BS_PUSHBUTTON | WS_TABSTOP, 16, 444, 92, 28, 0 },
+    { IDC_INSTALL, WC_BUTTON, L"Install now", BS_PUSHBUTTON | WS_TABSTOP, 114, 444, 104, 28, 0 },
+    { IDC_UPDATE, WC_BUTTON, L"Check update", BS_PUSHBUTTON | WS_TABSTOP, 224, 444, 116, 28, 0 },
+    { IDC_UNINSTALL, WC_BUTTON, L"Uninstall...", BS_PUSHBUTTON | WS_TABSTOP, 346, 444, 84, 28, 0 },
+    { IDC_UPDATE_INFO, WC_STATIC, L"", SS_LEFT | SS_ENDELLIPSIS, 16, 480, 414, 28, 3 },
     { IDC_HINT, WC_STATIC, L"Emergency exit while split: Ctrl+Alt+Shift+F12", SS_LEFT, 16, 514, 414, 20, 3 },
-    { IDC_LINK, WC_LINK, L"<a href=\"https://github.com/Haku0002/SplitDisplay\">github.com/Haku0002/SplitDisplay</a>", WS_TABSTOP, 16, 536, 414, 20, 3 },
+    { IDC_LINK, WC_STATIC, L"github.com/Haku0002/SplitDisplay", SS_LEFT | SS_NOTIFY, 16, 536, 260, 20, 4 },
 
     { IDC_LAYOUT_L, WC_STATIC, L"Layout", SS_LEFT, 452, 56, 100, 20, 1 },
     { IDC_PRESET, WC_COMBOBOX, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 452, 80, 250, 300, 0 },
@@ -179,15 +201,18 @@ const Item kItems[] = {
     { IDC_LAYOUT_STATE, WC_STATIC, L"", SS_LEFT, 716, 396, 168, 38, 3 },
     { IDC_LAYOUT_APPLY, WC_BUTTON, L"Apply layout", BS_PUSHBUTTON | WS_TABSTOP, 716, 438, 168, 30, 0 },
     { IDC_LAYOUT_DISCARD, WC_BUTTON, L"Discard changes", BS_PUSHBUTTON | WS_TABSTOP, 716, 472, 168, 26, 0 },
-    { IDC_REFRESH_L, WC_STATIC, L"Refresh rate (whole display)", SS_LEFT, 716, 506, 168, 18, 1 },
+    { IDC_REFRESH_L, WC_STATIC, L"Refresh rate", SS_LEFT, 716, 504, 168, 20, 1 },
     { IDC_REFRESH, WC_COMBOBOX, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 716, 526, 168, 200, 0 },
 };
 constexpr int kClientW = 900, kClientH = 568;
 
-// Region fill colors (light) and the selection accent.
+// Region fill colors (light / dark) and the selection accent.
 const COLORREF kRegionColors[] = { RGB(0xDC, 0xE9, 0xF8), RGB(0xE3, 0xF1, 0xDF), RGB(0xFB, 0xEB, 0xD7), RGB(0xEE, 0xE3, 0xF6),
     RGB(0xF9, 0xE0, 0xE3), RGB(0xDD, 0xF1, 0xF0), RGB(0xF3, 0xF0, 0xD6), RGB(0xE6, 0xE6, 0xE6) };
+const COLORREF kRegionColorsDark[] = { RGB(0x24, 0x3A, 0x52), RGB(0x26, 0x42, 0x30), RGB(0x4A, 0x38, 0x24), RGB(0x3B, 0x2D, 0x4A),
+    RGB(0x4A, 0x2B, 0x32), RGB(0x22, 0x40, 0x42), RGB(0x42, 0x3E, 0x24), RGB(0x36, 0x36, 0x36) };
 const COLORREF kAccent = RGB(0x00, 0x67, 0xC0);
+const COLORREF kAccentDark = RGB(0x4C, 0xA8, 0xFF);
 
 int S(int v)
 {
@@ -209,7 +234,7 @@ std::wstring ExeDir()
 
 void MakeFonts()
 {
-    for (HFONT* f : { &g.font, &g.bold, &g.title, &g.smallFont })
+    for (HFONT* f : { &g.font, &g.bold, &g.title, &g.smallFont, &g.linkFont })
         if (*f) DeleteObject(*f);
     NONCLIENTMETRICSW ncm{ sizeof(ncm) };
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, g.dpi);
@@ -218,6 +243,9 @@ void MakeFonts()
     LOGFONTW sm = lf;
     sm.lfHeight = sm.lfHeight * 9 / 10;
     g.smallFont = CreateFontIndirectW(&sm);
+    LOGFONTW lnk = sm;
+    lnk.lfUnderline = TRUE;
+    g.linkFont = CreateFontIndirectW(&lnk);
     lf.lfWeight = FW_SEMIBOLD;
     g.bold = CreateFontIndirectW(&lf);
     lf.lfHeight = lf.lfHeight * 3 / 2;
@@ -231,7 +259,7 @@ void Layout()
     {
         HWND h = Ctl(it.id);
         SetWindowPos(h, nullptr, S(it.x), S(it.y), S(it.w), S(it.h), SWP_NOZORDER | SWP_NOACTIVATE);
-        HFONT f = it.font == 2 ? g.title : it.font == 1 ? g.bold : it.font == 3 ? g.smallFont : g.font;
+        HFONT f = it.font == 4 ? g.linkFont : it.font == 2 ? g.title : it.font == 1 ? g.bold : it.font == 3 ? g.smallFont : g.font;
         SendMessageW(h, WM_SETFONT, (WPARAM)f, TRUE);
     }
 }
@@ -245,25 +273,63 @@ bool IsDarkMode()
 }
 
 COLORREF BgColor() { return g.dark ? RGB(0x20, 0x20, 0x20) : GetSysColor(COLOR_WINDOW); }
+COLORREF InputBgColor() { return g.dark ? RGB(0x2B, 0x2B, 0x2B) : GetSysColor(COLOR_WINDOW); }
 COLORREF TextColor() { return g.dark ? RGB(0xF0, 0xF0, 0xF0) : GetSysColor(COLOR_WINDOWTEXT); }
+COLORREF MutedTextColor() { return g.dark ? RGB(0xA6, 0xA6, 0xA6) : GetSysColor(COLOR_GRAYTEXT); }
+COLORREF AccentColor() { return g.dark ? kAccentDark : kAccent; }
 
-// Classic controls do not theme themselves dark; the undocumented DarkMode_Explorer
-// window theme plus hand-picked colours for the custom-painted surfaces gets a settings
-// window that does not glow white inside a dark Windows 11 desktop.
+// Classic controls do not theme themselves dark; enabling uxtheme's dark-mode ordinals plus
+// DarkMode_CFD for ComboBox/Edit and DarkMode_Explorer for buttons/scrollbars gives native
+// dark controls across the whole window.
 void ApplyTheme()
 {
     g.dark = IsDarkMode();
     if (!g.wnd) return;
+
+    using SetPreferredAppModeFn = int(WINAPI*)(int);
+    using AllowDarkModeForWindowFn = bool(WINAPI*)(HWND, bool);
+    using FlushMenuThemesFn = void(WINAPI*)();
+    HMODULE ux = GetModuleHandleW(L"uxtheme.dll");
+    if (!ux) ux = LoadLibraryW(L"uxtheme.dll");
+    auto setAppMode = ux ? (SetPreferredAppModeFn)GetProcAddress(ux, MAKEINTRESOURCEA(135)) : nullptr;
+    auto allowWindow = ux ? (AllowDarkModeForWindowFn)GetProcAddress(ux, MAKEINTRESOURCEA(133)) : nullptr;
+    auto flushMenus = ux ? (FlushMenuThemesFn)GetProcAddress(ux, MAKEINTRESOURCEA(136)) : nullptr;
+    if (setAppMode) setAppMode(g.dark ? 2 /*ForceDark*/ : 0 /*Default*/);
+    if (allowWindow) allowWindow(g.wnd, g.dark);
+    if (flushMenus) flushMenus();
+
     BOOL dark = g.dark ? TRUE : FALSE;
     DwmSetWindowAttribute(g.wnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     HBRUSH brush = CreateSolidBrush(BgColor());
+    HBRUSH inBrush = CreateSolidBrush(InputBgColor());
     SetClassLongPtrW(g.wnd, GCLP_HBRBACKGROUND, (LONG_PTR)brush);
     if (g.bgBrush) DeleteObject(g.bgBrush);
+    if (g.inputBrush) DeleteObject(g.inputBrush);
     g.bgBrush = brush;
+    g.inputBrush = inBrush;
     for (auto& it : kItems)
     {
         HWND h = Ctl(it.id);
-        if (h) SetWindowTheme(h, g.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        if (!h) continue;
+        if (allowWindow) allowWindow(h, g.dark);
+        if (wcscmp(it.cls, WC_COMBOBOX) == 0)
+        {
+            SetWindowTheme(h, g.dark ? L"DarkMode_CFD" : L"CFD", nullptr);
+            COMBOBOXINFO cbi{ sizeof(cbi) };
+            if (GetComboBoxInfo(h, &cbi) && cbi.hwndList)
+            {
+                if (allowWindow) allowWindow(cbi.hwndList, g.dark);
+                SetWindowTheme(cbi.hwndList, g.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            }
+        }
+        else if (wcscmp(it.cls, WC_EDIT) == 0)
+        {
+            SetWindowTheme(h, g.dark ? L"DarkMode_CFD" : L"Explorer", nullptr);
+        }
+        else
+        {
+            SetWindowTheme(h, g.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        }
     }
     InvalidateRect(g.wnd, nullptr, TRUE);
 }
@@ -417,7 +483,7 @@ void PaintMap(HWND canvas, HDC dc)
     if (g.map.empty())
     {
         SelectObject(mem, g.font);
-        SetTextColor(mem, GetSysColor(COLOR_GRAYTEXT));
+        SetTextColor(mem, MutedTextColor());
         DrawTextW(mem, L"No displays found", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     auto tf = MapTransformFor(canvas);
@@ -431,7 +497,7 @@ void PaintMap(HWND canvas, HDC dc)
         HBRUSH fill = CreateSolidBrush(picked ? (g.dark ? RGB(0x2D, 0x4A, 0x66) : RGB(0xCC, 0xE4, 0xF7)) : (g.dark ? RGB(0x3A, 0x3A, 0x3A) : RGB(0xFF, 0xFF, 0xFF)));
         FillRect(mem, &r, fill);
         DeleteObject(fill);
-        HBRUSH edge = CreateSolidBrush(picked ? kAccent : RGB(0x80, 0x80, 0x80));
+        HBRUSH edge = CreateSolidBrush(picked ? AccentColor() : RGB(0x80, 0x80, 0x80));
         RECT e = r;
         for (int k = 0; k < (picked ? S(3) : 1); k++)
         {
@@ -698,13 +764,14 @@ void PaintCanvas(HWND canvas, HDC dc)
     {
         const RECT& r = regs[i].rc;
         RECT c{ map.ToX(r.left), map.ToY(r.top), map.ToX(r.right), map.ToY(r.bottom) };
-        HBRUSH b = CreateSolidBrush(kRegionColors[i % std::size(kRegionColors)]);
+        const COLORREF* pal = g.dark ? kRegionColorsDark : kRegionColors;
+        HBRUSH b = CreateSolidBrush(pal[i % std::size(kRegionColors)]);
         FillRect(mem, &c, b);
         DeleteObject(b);
 
         if (g.selRegion && regs[i].path == *g.selRegion)
         {
-            HBRUSH a = CreateSolidBrush(kAccent);
+            HBRUSH a = CreateSolidBrush(AccentColor());
             RECT in = c;
             InflateRect(&in, -S(1), -S(1));
             for (int k = 0; k < S(3); k++)
@@ -717,7 +784,7 @@ void PaintCanvas(HWND canvas, HDC dc)
 
         wchar_t label[64];
         swprintf_s(label, L"%zu\n%d x %d", i + 1, r.right - r.left, r.bottom - r.top);
-        SetTextColor(mem, RGB(0x20, 0x20, 0x20));
+        SetTextColor(mem, g.dark ? RGB(0xF0, 0xF0, 0xF0) : RGB(0x20, 0x20, 0x20));
         RECT measure = c;
         DrawTextW(mem, label, -1, &measure, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
         RECT t = c;
@@ -726,7 +793,7 @@ void PaintCanvas(HWND canvas, HDC dc)
     }
     SelectObject(mem, oldFont);
 
-    // Split lines: thin dark, hovered/selected thick accent.
+    // Split lines: thin dark/light, hovered/selected thick accent.
     auto list = ResolveSplitters(g.draft, g.panelW, g.panelH);
     for (int i = 0; i < (int)list.size(); i++)
     {
@@ -734,7 +801,7 @@ void PaintCanvas(HWND canvas, HDC dc)
         bool sel = g.selSplitter && g.selSplitter->parent == s.parent && g.selSplitter->index == s.index;
         bool hot = sel || i == g.hoverSplitter;
         int w = hot ? S(4) : S(2);
-        HBRUSH b = CreateSolidBrush(hot ? kAccent : RGB(0x40, 0x40, 0x40));
+        HBRUSH b = CreateSolidBrush(hot ? AccentColor() : (g.dark ? RGB(0x90, 0x90, 0x90) : RGB(0x40, 0x40, 0x40)));
         RECT l;
         if (s.vertical)
         {
@@ -994,8 +1061,13 @@ void UpdateStatus(bool rebuildMap)
 {
     wchar_t buf[256];
     SharedView shm;
-    bool driver = shm.Open();
-    SetWindowTextW(Ctl(IDC_DRIVER), driver ? L"Installed and loaded" : L"Not loaded (reinstall SplitDisplay)");
+    bool driver = shm.OpenReadOnly() || shm.Open();
+    bool olderDriver = !driver && SharedView::IsOlderVersionLoaded();
+    bool installedCurrent = driver && IsInstalledAndCurrent();
+    SetWindowTextW(Ctl(IDC_DRIVER),
+        driver      ? L"Installed and loaded"
+      : olderDriver ? L"Outdated driver loaded — click Install now below"
+                    : L"Not loaded — click Install now below");
 
     g.panels = LoadPanels();
     const auto& panels = g.panels;
@@ -1010,8 +1082,10 @@ void UpdateStatus(bool rebuildMap)
     }
     else if (g.splitActive)
     {
+        SdConfig cfg{};
+        if (driver) SdReadConfig(shm.get(), cfg);
         swprintf_s(buf, L"%d of %zu selected display%s split into %u monitors", splitPanels, panels.size(), panels.size() == 1 ? L"" : L"s",
-            driver ? shm->config.count : 0);
+            driver ? cfg.count : 0);
     }
     else if (panels.size() == 1)
     {
@@ -1030,9 +1104,17 @@ void UpdateStatus(bool rebuildMap)
                                         : L"Off";
     SetWindowTextW(Ctl(IDC_SPLIT), split);
 
+    SetWindowTextW(Ctl(IDC_INSTALL), (!driver || !installedCurrent) ? L"Install now" : L"Reinstall");
+    SetWindowTextW(Ctl(IDC_UPDATE), g.updateInfo.hasUpdate ? (L"Upgrade " + g.updateInfo.tag).c_str() : L"Check update");
     EnableWindow(Ctl(IDC_START), !g.busy && driver && !g.running);
     EnableWindow(Ctl(IDC_STOP), !g.busy && g.running);
-    EnableWindow(Ctl(IDC_UNINSTALL), !g.busy && GetFileAttributesW((ExeDir() + L"\\Uninstall.cmd").c_str()) != INVALID_FILE_ATTRIBUTES);
+    EnableWindow(Ctl(IDC_INSTALL), !g.busy);
+    EnableWindow(Ctl(IDC_UPDATE), !g.busy && !g.checkingUpdate);
+    wchar_t pfUninst[MAX_PATH] = {};
+    ExpandEnvironmentStringsW(L"%ProgramFiles%\\SplitDisplay\\Uninstall.cmd", pfUninst, MAX_PATH);
+    bool hasUninst = GetFileAttributesW((ExeDir() + L"\\Uninstall.cmd").c_str()) != INVALID_FILE_ATTRIBUTES ||
+                     GetFileAttributesW(pfUninst) != INVALID_FILE_ATTRIBUTES;
+    EnableWindow(Ctl(IDC_UNINSTALL), !g.busy && hasUninst);
     // The map costs a full display enumeration (CCD + a DisplayManager creation); the 1 s
     // timer only needs state text, so the map follows display-change events and a slow
     // background tick instead of every status refresh.
@@ -1045,6 +1127,13 @@ void UpdateStatus() { UpdateStatus(true); }
 
 void StartCompositor()
 {
+    // When installed, the "SplitDisplay" scheduled task is registered to run elevated:
+    // starting it through Task Scheduler needs no UAC prompt.
+    if (IsInstalledAndCurrent() && StartAutostartTask())
+    {
+        for (int i = 0; i < 40 && !IsRunning(); i++) Sleep(50);
+        if (IsRunning()) return;
+    }
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring cmd = L"\"" + std::wstring(exe) + L"\" run";
@@ -1149,6 +1238,8 @@ void TrayMenu()
     AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, L"Open settings");
     AppendMenuW(menu, MF_STRING | (g.running || g.busy ? MF_GRAYED : 0), IDM_TRAY_START, L"Start split");
     AppendMenuW(menu, MF_STRING | (!g.running || g.busy ? MF_GRAYED : 0), IDM_TRAY_STOP, L"Stop split");
+    if (g.updateInfo.hasUpdate)
+        AppendMenuW(menu, MF_STRING | (g.busy ? MF_GRAYED : 0), IDM_TRAY_UPGRADE, (L"Upgrade to " + g.updateInfo.tag).c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"Exit");
     POINT pt;
@@ -1170,6 +1261,68 @@ void Busy(F&& work)
         work();
         PostMessageW(g.wnd, WM_APP_BUSY_DONE, 0, 0);
     }).detach();
+}
+
+void SetProgressText(const std::wstring& msg)
+{
+    {
+        std::lock_guard lk(g.progressMutex);
+        g.progressText = msg;
+    }
+    if (g.wnd) PostMessageW(g.wnd, WM_APP_PROGRESS_TEXT, 0, 0);
+}
+
+void StartUpdateCheck(bool manual, bool promptUpgrade)
+{
+    if (g.checkingUpdate) return;
+    g.checkingUpdate = true;
+    g.manualUpdateCheck = manual;
+    g.promptOnUpdateFound = promptUpgrade;
+    if (manual) SetWindowTextW(Ctl(IDC_UPDATE_INFO), L"Checking GitHub Releases for updates...");
+    EnableWindow(Ctl(IDC_UPDATE), FALSE);
+    std::thread([] {
+        UpdateInfo info = CheckForGitHubUpdate();
+        {
+            std::lock_guard lk(g.progressMutex);
+            g.updateInfo = std::move(info);
+        }
+        if (g.wnd) PostMessageW(g.wnd, WM_APP_UPDATE_DONE, 0, 0);
+    }).detach();
+}
+
+void OnInstallLocal()
+{
+    if (g.busy) return;
+    Busy([] {
+        std::wstring err;
+        bool ok = RunLocalInstall([](const std::wstring& s) { SetProgressText(s); }, err);
+        std::lock_guard lk(g.progressMutex);
+        g.installError = ok ? L"" : err;
+        if (ok && g.wnd) PostMessageW(g.wnd, WM_APP_INSTALLER_LAUNCHED, 0, 0);
+    });
+}
+
+void PerformGitHubUpgrade(const UpdateInfo& rel)
+{
+    if (g.busy) return;
+    Busy([rel] {
+        std::wstring err;
+        bool ok = RunGitHubUpgrade(rel, [](const std::wstring& s) { SetProgressText(s); }, err);
+        std::lock_guard lk(g.progressMutex);
+        g.installError = ok ? L"" : err;
+        if (ok && g.wnd) PostMessageW(g.wnd, WM_APP_INSTALLER_LAUNCHED, 0, 0);
+    });
+}
+
+void OnCheckOrUpgrade()
+{
+    if (g.busy || g.checkingUpdate) return;
+    if (g.updateInfo.hasUpdate)
+    {
+        PerformGitHubUpgrade(g.updateInfo);
+        return;
+    }
+    StartUpdateCheck(true, true);
 }
 
 void RestartIfRunning()
@@ -1238,7 +1391,17 @@ void OnUninstall()
     if (MessageBoxW(g.wnd, L"Remove SplitDisplay, its driver and its certificate, and restore the display?", L"Uninstall SplitDisplay",
             MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
         return;
-    ShellExecuteW(nullptr, L"open", (ExeDir() + L"\\Uninstall.cmd").c_str(), nullptr, ExeDir().c_str(), SW_SHOWNORMAL);
+    std::wstring cmd = ExeDir() + L"\\Uninstall.cmd";
+    std::wstring dir = ExeDir();
+    if (GetFileAttributesW(cmd.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        wchar_t pf[MAX_PATH] = {};
+        ExpandEnvironmentStringsW(L"%ProgramFiles%\\SplitDisplay", pf, MAX_PATH);
+        dir = pf;
+        cmd = dir + L"\\Uninstall.cmd";
+    }
+    g.exiting = true;
+    ShellExecuteW(nullptr, L"open", cmd.c_str(), nullptr, dir.c_str(), SW_SHOWNORMAL);
     DestroyWindow(g.wnd);
 }
 
@@ -1277,6 +1440,7 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         UpdateAutostart();
         AddTray();
         UpdateStatus();
+        StartUpdateCheck(false, false);
         SetTimer(wnd, kTimer, 1000, nullptr);
         return 0;
     }
@@ -1290,7 +1454,12 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_TIMER:
-        if (!g.busy && !g.dragging) UpdateStatus(++g.tick % 5 == 0);
+        if (!g.busy && !g.dragging)
+        {
+            int t = ++g.tick;
+            UpdateStatus(t % 5 == 0);
+            if (t % 21600 == 0) StartUpdateCheck(false, false); // check GitHub every 6 hours
+        }
         return 0;
     case WM_DISPLAYCHANGE:
     case WM_DEVICECHANGE:
@@ -1299,11 +1468,19 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SETTINGCHANGE:
         if (lp && wcscmp((const wchar_t*)lp, L"ImmersiveColorSet") == 0) ApplyTheme();
         return 0;
+    case WM_SETCURSOR:
+        if ((HWND)wp == Ctl(IDC_LINK) || (HWND)wp == Ctl(IDC_AUTOSTART_L))
+        {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
     case WM_APP_TRAY:
         switch (LOWORD(lp))
         {
         case WM_LBUTTONUP:
-        case WM_LBUTTONDBLCLK: ShowSettingsWindow(); break;
+        case WM_LBUTTONDBLCLK:
+        case NIN_BALLOONUSERCLICK: ShowSettingsWindow(); break;
         case WM_RBUTTONUP:
         case WM_CONTEXTMENU: TrayMenu(); break;
         }
@@ -1327,8 +1504,84 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         return DefWindowProcW(wnd, msg, wp, lp);
+    case WM_APP_PROGRESS_TEXT:
+    {
+        std::wstring text;
+        {
+            std::lock_guard lk(g.progressMutex);
+            text = g.progressText;
+        }
+        SetWindowTextW(Ctl(IDC_UPDATE_INFO), text.c_str());
+        return 0;
+    }
+    case WM_APP_INSTALLER_LAUNCHED:
+        // Exit so the elevated installer can replace splitdisplay.exe cleanly and reopen it.
+        g.exiting = true;
+        DestroyWindow(wnd);
+        return 0;
+    case WM_APP_UPDATE_DONE:
+    {
+        g.checkingUpdate = false;
+        UpdateInfo info;
+        {
+            std::lock_guard lk(g.progressMutex);
+            info = g.updateInfo;
+        }
+        UpdateStatus(false);
+        if (info.ok && info.hasUpdate)
+        {
+            std::wstring banner = (info.isMajorOrMinor ? L"Major update " : L"New release ") + info.tag +
+                                  L" is available on GitHub — click 'Upgrade " + info.tag + L"' to install directly.";
+            SetWindowTextW(Ctl(IDC_UPDATE_INFO), banner.c_str());
+            if (g.promptOnUpdateFound)
+            {
+                g.promptOnUpdateFound = false;
+                std::wstring q = L"SplitDisplay " + info.tag + L" is available on GitHub.\n\nDownload and upgrade now?";
+                if (MessageBoxW(wnd, q.c_str(), L"SplitDisplay Update", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+                    PerformGitHubUpgrade(info);
+            }
+            else if (info.isMajorOrMinor && g.notifiedUpdateTag != info.tag && g.trayAdded && !IsWindowVisible(wnd))
+            {
+                g.notifiedUpdateTag = info.tag;
+                NOTIFYICONDATAW nid{ sizeof(nid) };
+                nid.hWnd = g.wnd;
+                nid.uID = 1;
+                nid.uFlags = NIF_INFO;
+                nid.dwInfoFlags = NIIF_INFO;
+                wcscpy_s(nid.szInfoTitle, L"SplitDisplay update available");
+                swprintf_s(nid.szInfo, L"Version %s is available. Open Settings to upgrade in one click.", info.tag.c_str());
+                Shell_NotifyIconW(NIM_MODIFY, &nid);
+            }
+        }
+        else if (g.manualUpdateCheck)
+        {
+            g.manualUpdateCheck = false;
+            g.promptOnUpdateFound = false;
+            if (!info.ok)
+                SetWindowTextW(Ctl(IDC_UPDATE_INFO), (L"Update check failed: " + info.error).c_str());
+            else
+                SetWindowTextW(Ctl(IDC_UPDATE_INFO), L"You are on the latest release (v" _CRT_WIDE(SPLITDISPLAY_VERSION) L").");
+        }
+        else if (g.problem)
+        {
+            SetWindowTextW(Ctl(IDC_UPDATE_INFO), L"Click 'Install now' above to sign and install the virtual display driver.");
+        }
+        return 0;
+    }
     case WM_APP_BUSY_DONE:
+    {
         g.busy = false;
+        std::wstring err;
+        {
+            std::lock_guard lk(g.progressMutex);
+            err = std::move(g.installError);
+            g.installError.clear();
+        }
+        if (!err.empty())
+        {
+            SetWindowTextW(Ctl(IDC_UPDATE_INFO), err.c_str());
+            MessageBoxW(wnd, err.c_str(), L"SplitDisplay", MB_ICONWARNING);
+        }
         if (g.autostartFailed)
         {
             g.autostartFailed = false;
@@ -1337,16 +1590,47 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         UpdateAutostart();
         UpdateStatus();
         return 0;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    {
+        HDC dc = (HDC)wp;
+        SetBkColor(dc, InputBgColor());
+        SetTextColor(dc, TextColor());
+        return (LRESULT)(g.inputBrush ? g.inputBrush : GetSysColorBrush(COLOR_WINDOW));
+    }
+    case WM_CTLCOLORBTN:
+    {
+        HDC dc = (HDC)wp;
+        SetBkColor(dc, BgColor());
+        SetTextColor(dc, TextColor());
+        return (LRESULT)(g.bgBrush ? g.bgBrush : GetSysColorBrush(COLOR_WINDOW));
+    }
     case WM_CTLCOLORSTATIC:
     {
         HDC dc = (HDC)wp;
-        SetBkColor(dc, GetSysColor(COLOR_WINDOW));
         int id = GetDlgCtrlID((HWND)lp);
+        if (id == IDC_MANUAL_POS)
+        {
+            SetBkColor(dc, InputBgColor());
+            SetTextColor(dc, MutedTextColor());
+            return (LRESULT)(g.inputBrush ? g.inputBrush : GetSysColorBrush(COLOR_WINDOW));
+        }
+        SetBkColor(dc, BgColor());
         SetTextColor(dc, TextColor());
-        if (id == IDC_SPLIT) SetTextColor(dc, g.splitActive ? (g.dark ? RGB(0x6C, 0xC8, 0x6C) : RGB(0x10, 0x7C, 0x10)) : TextColor());
-        if (id == IDC_DRIVER) SetTextColor(dc, g.problem ? RGB(0xC4, 0x2B, 0x1C) : GetSysColor(COLOR_WINDOWTEXT));
-        if (id == IDC_VERSION || id == IDC_HINT || id == IDC_LAYOUT_STATE || id == IDC_MANUAL_INFO) SetTextColor(dc, GetSysColor(COLOR_GRAYTEXT));
-        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+        if (id == IDC_SPLIT)
+            SetTextColor(dc, g.splitActive ? (g.dark ? RGB(0x6C, 0xC8, 0x6C) : RGB(0x10, 0x7C, 0x10)) : TextColor());
+        else if (id == IDC_DRIVER)
+            SetTextColor(dc, g.problem ? (g.dark ? RGB(0xFF, 0x6B, 0x6B) : RGB(0xC4, 0x2B, 0x1C)) : TextColor());
+        else if (id == IDC_LINK)
+            SetTextColor(dc, AccentColor());
+        else if (id == IDC_UPDATE_INFO && g.updateInfo.hasUpdate)
+            SetTextColor(dc, AccentColor());
+        else if (id == IDC_VERSION || id == IDC_HINT || id == IDC_LAYOUT_STATE || id == IDC_MANUAL_INFO || id == IDC_UPDATE_INFO)
+            SetTextColor(dc, MutedTextColor());
+        else if (id == IDC_AUTOSTART_L && !IsWindowEnabled(Ctl(IDC_AUTOSTART)))
+            SetTextColor(dc, MutedTextColor());
+        return (LRESULT)(g.bgBrush ? g.bgBrush : GetSysColorBrush(COLOR_WINDOW));
     }
     case WM_COMMAND:
         switch (LOWORD(wp))
@@ -1355,11 +1639,13 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_START:
             Busy([] {
                 StartCompositor();
-                // The child relaunches itself elevated first: the user may need a while at the UAC prompt.
-    for (int i = 0; i < 600 && !IsRunning(); i++) Sleep(50);
+                for (int i = 0; i < 600 && !IsRunning(); i++) Sleep(50);
             });
             break;
         case IDC_STOP: Busy([] { StopCompositor(); }); break;
+        case IDC_AUTOSTART_L:
+            if (IsWindowEnabled(Ctl(IDC_AUTOSTART))) SendMessageW(Ctl(IDC_AUTOSTART), BM_CLICK, 0, 0);
+            break;
         case IDC_AUTOSTART:
         {
             // Creating the task needs elevation; the child process relaunches itself
@@ -1368,12 +1654,21 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
             Busy([on] { g.autostartFailed = RunSelfAndWait(on ? L"autostart on" : L"autostart off") != 0; });
             break;
         }
+        case IDC_INSTALL: OnInstallLocal(); break;
+        case IDC_UPDATE: OnCheckOrUpgrade(); break;
+        case IDC_LINK:
+            ShellExecuteW(nullptr, L"open", L"https://github.com/Haku0002/SplitDisplay", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
         case IDC_REFRESH:
             if (HIWORD(wp) == CBN_SELCHANGE) OnRefreshRate();
             break;
         case IDM_TRAY_OPEN: ShowSettingsWindow(); break;
         case IDM_TRAY_START: SendMessageW(Ctl(IDC_START), BM_CLICK, 0, 0); break;
         case IDM_TRAY_STOP: SendMessageW(Ctl(IDC_STOP), BM_CLICK, 0, 0); break;
+        case IDM_TRAY_UPGRADE:
+            ShowSettingsWindow();
+            OnCheckOrUpgrade();
+            break;
         case IDM_TRAY_EXIT:
             g.exiting = true;
             DestroyWindow(wnd);
@@ -1396,13 +1691,6 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_LAYOUT_DISCARD: LoadDraftFromConfig(); break;
         }
         return 0;
-    case WM_NOTIFY:
-    {
-        auto* n = (NMHDR*)lp;
-        if (n->idFrom == IDC_LINK && (n->code == NM_CLICK || n->code == NM_RETURN))
-            ShellExecuteW(nullptr, L"open", ((NMLINK*)lp)->item.szUrl, nullptr, nullptr, SW_SHOWNORMAL);
-        return 0;
-    }
     case WM_DESTROY:
         RemoveTray();
         KillTimer(wnd, kTimer);

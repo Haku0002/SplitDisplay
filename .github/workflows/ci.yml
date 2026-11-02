@@ -35,6 +35,19 @@ jobs:
         shell: pwsh
         run: ctest --test-dir build -C Release --output-on-failure
 
+      - name: Sign binaries (when SD_SIGN_PFX_BASE64 is configured in Secrets)
+        shell: pwsh
+        env:
+          SD_SIGN_PFX_BASE64: ${{ secrets.SD_SIGN_PFX_BASE64 }}
+          SD_SIGN_PASSWORD: ${{ secrets.SD_SIGN_PASSWORD }}
+        run: |
+          scripts/sign-binaries.ps1 -Files (
+            'build/Release/splitdisplay.exe',
+            'build/Release/sdctl.exe',
+            'build/Release/SplitDisplayIdd.dll',
+            'build/Release/SplitDisplaySetup.exe'
+          )
+
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
@@ -43,3 +56,4 @@ jobs:
             build/Release/splitdisplay.exe
             build/Release/sdctl.exe
             build/Release/SplitDisplayIdd.dll
+            build/Release/SplitDisplaySetup.exe

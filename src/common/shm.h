@@ -6,11 +6,16 @@ class SharedView
 {
 public:
     ~SharedView();
-    bool Open();       // false if the driver is not loaded
+    bool Open();               // read-write view + command event (elevated compositor / controller)
+    bool OpenReadOnly();       // read-only view (unprivileged GUI / status query)
     void Close();
     SdShared* operator->() const { return m_Shm; }
     SdShared* get() const { return m_Shm; }
-    void Kick() const; // wake the driver's command thread
+    void Kick() const;         // wake the driver's command thread
+
+    // True if a shared-memory section from an earlier protocol version (v1..v4) is present in
+    // the kernel namespace, meaning an older driver is loaded and needs an upgrade.
+    static bool IsOlderVersionLoaded();
 
 private:
     HANDLE m_Section = nullptr;

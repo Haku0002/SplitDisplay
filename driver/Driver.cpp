@@ -820,10 +820,10 @@ void IndirectDeviceContext::FinishInit()
         ReleaseOwnership();
     };
 
-    // SYSTEM, Administrators, LocalService. LocalService is the UMDF host account: after a
-    // host restart it must be able to re-open the section a still-running compositor kept alive.
+    // SYSTEM, Administrators, LocalService (full access), plus Interactive Users (read-only so
+    // the unprivileged settings window and sdctl status can inspect driver state without UAC).
     SECURITY_ATTRIBUTES sa = { sizeof(sa) };
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GR;;;IU)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
     {
         DLog(L"SDDL failed %lu", GetLastError());
         fail();

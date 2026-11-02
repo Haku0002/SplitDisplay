@@ -173,7 +173,7 @@ static int Unplug()
 static int Status()
 {
     SharedView v;
-    if (!OpenShm(v)) return 1;
+    if (!v.OpenReadOnly() && !OpenShm(v)) return 1;
     auto* s = v.get();
     SdConfig cfg;
     SdReadConfig(s, cfg);

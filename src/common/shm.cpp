@@ -24,6 +24,36 @@ bool SharedView::Open()
     return true;
 }
 
+bool SharedView::OpenReadOnly()
+{
+    Close();
+    m_Section = OpenFileMappingW(FILE_MAP_READ, FALSE, SD_SHM_NAME);
+    if (!m_Section) return false;
+    m_Shm = (SdShared*)MapViewOfFile(m_Section, FILE_MAP_READ, 0, 0, sizeof(SdShared));
+    if (!m_Shm || m_Shm->magic != SD_MAGIC || m_Shm->version != SD_VERSION)
+    {
+        Close();
+        return false;
+    }
+    return true;
+}
+
+bool SharedView::IsOlderVersionLoaded()
+{
+    const wchar_t* const names[] = { L"Global\\SplitDisplay.Shm.v4", L"Global\\SplitDisplay.Shm.v3", L"Global\\SplitDisplay.Shm.v2", L"Global\\SplitDisplay.Shm.v1" };
+    for (const wchar_t* name : names)
+    {
+        HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
+        if (h)
+        {
+            CloseHandle(h);
+            return true;
+        }
+        if (GetLastError() == ERROR_ACCESS_DENIED) return true;
+    }
+    return false;
+}
+
 void SharedView::Close()
 {
     if (m_Shm) UnmapViewOfFile(m_Shm);

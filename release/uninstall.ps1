@@ -30,9 +30,13 @@ if (-not (Test-Path $sdctl)) { $sdctl = Join-Path $PSScriptRoot 'sdctl.exe' }
 Write-Host '== Restoring the display'
 if (Test-Path $exe) {
     & $exe stop | Out-Null
-    Get-Process splitdisplay -ErrorAction SilentlyContinue | Wait-Process -Timeout 20 -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not (Get-Process splitdisplay -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 150
+    }
     & $exe revert | Out-Null
 }
+Get-Process splitdisplay, sdctl -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName 'SplitDisplay' -Confirm:$false -ErrorAction SilentlyContinue
 
 Write-Host '== Removing the driver'
@@ -50,5 +54,6 @@ foreach ($store in 'Root', 'TrustedPublisher', 'My') {
 
 Write-Host '== Removing program files'
 Set-Location $env:TEMP
+Remove-Item -Force (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\SplitDisplay.lnk') -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
 Write-Host 'SplitDisplay removed. Logs remain in' "$env:ProgramData\SplitDisplay" -ForegroundColor Green

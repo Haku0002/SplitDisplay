@@ -111,7 +111,7 @@ inline void SdWriteConfig(SdShared* s, const SdConfig& cfg)
     InterlockedIncrement(&s->configGeneration); // even: stable
 }
 
-inline bool SdReadConfig(SdShared* s, SdConfig& out)
+inline bool SdReadConfig(const SdShared* s, SdConfig& out)
 {
     for (int attempt = 0; attempt < 1000; attempt++)
     {

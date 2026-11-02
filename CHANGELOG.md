@@ -1,5 +1,28 @@
 # SplitDisplay changelog
 
+## 0.4.1
+
+Installer, in-app updater, signing, and dark mode
+- Fixed dark mode in the settings window: static labels, edit boxes, dropdowns (`DarkMode_CFD`),
+  links, and the layout preview canvas now use dark backgrounds and appropriate text contrast
+  instead of painting white `COLOR_WINDOW` boxes under light text.
+- Built-in installer and GitHub Releases updater (`updater.cpp`, `Install now` / `Check update` /
+  `Upgrade vX.Y.Z` buttons in the settings window and tray menu, plus `splitdisplay install` and
+  `splitdisplay update` CLI commands): automatically checks GitHub Releases on startup and every
+  6 hours, downloads new releases via WinHTTP with progress feedback, and upgrades in place without
+  leaving the app.
+- Standalone single-file graphical installer (`SplitDisplay-Setup-v<ver>-x64.exe`) built alongside
+  the portable zip archive.
+- Authenticode signing: `install.ps1` now strips Mark-of-the-Web (`Zone.Identifier`) and signs
+  `splitdisplay.exe` and `sdctl.exe` alongside `SplitDisplayIdd.dll` and `SplitDisplayIdd.cat`
+  with the machine-trusted certificate before deleting its private key, eliminating UAC "Unknown
+  publisher" warnings on installed binaries. Added `scripts/sign-binaries.ps1` and CI secret hooks
+  (`SD_SIGN_PFX_BASE64`) for pre-signing release packages.
+- Unprivileged GUI permissions: granted Interactive Users read-only access to the driver's shared
+  memory section, signal access to the compositor stop event, and read/execute access on the
+  scheduled task so starting/stopping/inspecting the split from the unprivileged settings window
+  works without UAC prompts.
+
 ## 0.4.0
 
 Frame path
