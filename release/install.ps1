@@ -8,9 +8,12 @@
 # 3. Copies SplitDisplay to Program Files, picks the display to split and registers a logon task.
 #    Optional: -Panel "<monitor name>" to choose the display without asking.
 #    Optional: -NoOpenGui to skip opening the settings window at the end.
+#    Optional: -PauseOnError to keep the window open on failure (in-app install / upgrade).
+# Everything is also written to %ProgramData%\SplitDisplay\install.log.
 param(
     [string]$Panel,
-    [switch]$NoOpenGui
+    [switch]$NoOpenGui,
+    [switch]$PauseOnError
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,6 +30,7 @@ Get-ChildItem $here -Recurse -File -ErrorAction SilentlyContinue | Unblock-File 
 # made by an elevated process and are read-only for the user. Grant the installing user Modify
 # and also grant Interactive Users Modify so any interactive session can save settings.
 New-Item -ItemType Directory -Force $data | Out-Null
+try { Start-Transcript -Path (Join-Path $data 'install.log') -Force | Out-Null } catch { }
 $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 icacls $data /grant "${me}:(OI)(CI)M" /grant "*S-1-5-4:(OI)(CI)M" /T /C 2>&1 | Out-Null
 
@@ -72,6 +76,7 @@ Start-Sleep -Milliseconds 300
 # From here on, any failure restarts the previous SplitDisplay (if one was installed) and cleans up.
 $pkg = $null
 $cert = $null
+$driverInstalled = $false
 try {
 
 Step 'Signing driver and executables with a one-time local certificate'
@@ -96,12 +101,16 @@ try {
     $sig = Set-AuthenticodeSignature (Join-Path $pkg 'SplitDisplayIdd.cat') -Certificate $cert -HashAlgorithm SHA256
     if ($sig.Status -ne 'Valid') { throw "signing the driver catalog failed: $($sig.Status) $($sig.StatusMessage)" }
 
-    # Sign splitdisplay.exe and sdctl.exe too (unless already signed by a trusted CA) so UAC and
-    # Windows security checks see a verified publisher instead of "Unknown publisher".
+    # Sign splitdisplay.exe and sdctl.exe too so UAC and Windows security checks see a verified
+    # publisher instead of "Unknown publisher". A valid signature is kept only if it comes from
+    # another publisher (a real CA-issued release signature). One from an earlier local install
+    # must be replaced: that certificate is removed from the trusted stores below, which would
+    # leave the binary signed by an untrusted root.
     foreach ($exeName in 'splitdisplay.exe', 'sdctl.exe') {
         $exePath = Join-Path $binStage $exeName
         $existing = Get-AuthenticodeSignature $exePath -ErrorAction SilentlyContinue
-        if (-not $existing -or $existing.Status -ne 'Valid') {
+        $foreign = $existing -and $existing.Status -eq 'Valid' -and $existing.SignerCertificate.Subject -notlike "$subject*"
+        if (-not $foreign) {
             $sig = Set-AuthenticodeSignature $exePath -Certificate $cert -HashAlgorithm SHA256
             if ($sig.Status -ne 'Valid') { throw "signing $exeName failed: $($sig.Status) $($sig.StatusMessage)" }
         }
@@ -118,6 +127,8 @@ Write-Host "Certificate $($cert.Thumbprint) trusted; driver + executables signed
 Step 'Installing the virtual monitor driver'
 & (Join-Path $binStage 'sdctl.exe') driver-install (Join-Path $pkg 'SplitDisplayIdd.inf')
 if ($LASTEXITCODE) { throw "driver install failed (see $env:ProgramData\SplitDisplay\sdctl.log)" }
+# From here on the installed driver depends on this certificate: a later failure must keep it.
+$driverInstalled = $true
 
 # Driver packages from earlier installs are no longer needed (the one in use cannot be deleted).
 foreach ($oem in Get-SplitDisplayDriverPackages) { pnputil /delete-driver $oem 2>&1 | Out-Null }
@@ -181,13 +192,16 @@ if ($r.ExitCode) { throw 'creating the logon task failed' }
 }
 catch {
     Write-Host "`nInstall failed: $_" -ForegroundColor Red
-    if ($cert) {
+    if ($cert -and -not $driverInstalled) {
         foreach ($store in 'Root', 'TrustedPublisher') { Remove-Item "Cert:\LocalMachine\$store\$($cert.Thumbprint)" -ErrorAction SilentlyContinue }
     }
     if (Get-ScheduledTask -TaskName 'SplitDisplay' -ErrorAction SilentlyContinue) {
         Write-Host 'Restarting the previously installed SplitDisplay.'
         Start-ScheduledTask -TaskName 'SplitDisplay'
     }
+    Write-Host "Details: $data\install.log"
+    try { Stop-Transcript | Out-Null } catch { }
+    if ($PauseOnError) { Read-Host 'Press Enter to close' | Out-Null }
     exit 1
 }
 finally {
@@ -208,3 +222,4 @@ Done. SplitDisplay is installed and starts automatically after you sign in.
   Uninstall:            "$dest\Uninstall.cmd"
   Logs:                 $env:ProgramData\SplitDisplay\
 "@ -ForegroundColor Green
+try { Stop-Transcript | Out-Null } catch { }

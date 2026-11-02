@@ -461,6 +461,46 @@ static int CmdStop()
     return 0;
 }
 
+// Dumps go next to the logs. They are tens of MB each, so only the newest few are kept.
+static void PruneDumps(size_t keep)
+{
+    wchar_t dir[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay", dir, MAX_PATH);
+    std::vector<std::pair<ULONGLONG, std::wstring>> found;
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW((std::wstring(dir) + L"\\*.dmp").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do found.push_back({ ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime, std::wstring(dir) + L"\\" + fd.cFileName });
+    while (FindNextFileW(find, &fd));
+    FindClose(find);
+    std::sort(found.rbegin(), found.rend());
+    for (size_t i = keep; i < found.size(); i++) DeleteFileW(found[i].second.c_str());
+}
+
+// Writes a minidump of `proc` to %ProgramData%\SplitDisplay\<kind>-<pid>-<tick>.dmp. Used for
+// crashes (in process, with the exception record) and for hangs (the watchdog dumps the stuck
+// compositor before ending it): without one, a failure in the field leaves nothing to look at.
+// No heap use, so it is safe from a crash handler.
+static bool WriteDump(HANDLE proc, DWORD pid, const wchar_t* kind, EXCEPTION_POINTERS* ep, wchar_t (&path)[MAX_PATH])
+{
+    wchar_t dir[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay", dir, MAX_PATH);
+    CreateDirectoryW(dir, nullptr);
+    swprintf_s(path, L"%s\\%s-%lu-%llu.dmp", dir, kind, pid, GetTickCount64());
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    MINIDUMP_EXCEPTION_INFORMATION mei{};
+    mei.ThreadId = GetCurrentThreadId();
+    mei.ExceptionPointers = ep;
+    mei.ClientPointers = FALSE;
+    auto type = (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
+                                MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory);
+    BOOL ok = MiniDumpWriteDump(proc, pid, f, type, ep ? &mei : nullptr, nullptr, nullptr);
+    CloseHandle(f);
+    if (!ok) DeleteFileW(path);
+    return ok != FALSE;
+}
+
 // watchdog <parentPid> <maxSeconds> <luidLow>:<luidHigh>:<targetId> ...
 static int CmdWatchdog(int argc, wchar_t** argv)
 {
@@ -495,6 +535,15 @@ static int CmdWatchdog(int argc, wchar_t** argv)
             if (last && now - (ULONGLONG)last > 6000)
             {
                 reason = L"heartbeat lost";
+                // Capture where it is stuck before ending it: a hang leaves no other trace.
+                if (HANDLE dumpable = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, FALSE, parentPid))
+                {
+                    PruneDumps(4);
+                    wchar_t dump[MAX_PATH];
+                    if (WriteDump(dumpable, parentPid, L"hang", nullptr, dump)) Log(L"watchdog: compositor stopped responding; hang dump written to %s", dump);
+                    else Log(L"watchdog: compositor stopped responding; hang dump failed (%lu)", GetLastError());
+                    CloseHandle(dumpable);
+                }
                 TerminateProcess(parent, 0xDEAD);
                 break;
             }
@@ -1302,37 +1351,91 @@ static Outcome PanelWorker(SharedView& shm, const PanelSession& p, ULONGLONG dea
     return Outcome::Lost;
 }
 
-// Gives the split monitors the panel's ICC profile. Without this, a calibrated panel's
-// colours shift the moment it is split, because the virtual monitors get the system
-// default (sRGB) association. Best effort: association keys off GDI device names, which
-// Windows renumbers between sessions, so this runs at every session start. Per-user scope
-// matches how calibration tools install display profiles.
-static void InheritColorProfiles(const std::vector<PanelSession>& ps)
+// Gives the split monitors the panel's colour profile, so a calibrated panel keeps its colours
+// when it is split. Runs on its own thread and only reads/writes through the display colour
+// APIs (Windows 10 1903+), which address a display by adapter LUID + CCD source id.
+//
+// Why so careful: 0.4.0 and 0.4.1 did this on the session thread with the legacy Wcs* calls and a
+// GDI device name. mscms does not recognise \\.\DISPLAYn there and resolves it as a *printer*
+// through the print spooler; on a machine whose spooler is slow to answer, the call blocked until
+// the watchdog ended the session -- the split flashed on and straight back off. Nothing here may
+// ever hold up the session again, so it is fire-and-forget.
+static void StartColorProfileInheritance(const std::vector<PanelSession>& ps)
 {
+    struct Job
+    {
+        LUID adapter;
+        UINT32 targetId;
+        std::wstring panelName;
+        std::vector<std::wstring> splits;
+    };
+    std::vector<Job> jobs;
     for (auto& p : ps)
     {
-        if (p.target.gdiName.empty()) continue;
-        DWORD bytes = 0;
-        if (!WcsGetDefaultColorProfileSize(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, p.target.gdiName.c_str(), CPT_ICC, CPST_NONE, 0, &bytes) || !bytes)
-            continue;
-        std::wstring profile(bytes / sizeof(wchar_t) + 1, L'\0');
-        if (!WcsGetDefaultColorProfile(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, p.target.gdiName.c_str(), CPT_ICC, CPST_NONE, 0, bytes,
-                profile.data()))
-            continue;
-        profile.resize(wcslen(profile.c_str()));
-        if (profile.empty()) continue;
-        for (UINT i = 0; i < p.regions.size(); i++)
-        {
-            auto gdi = GdiNameOfMonitor(VirtualName(p.first + i));
-            if (gdi.empty()) continue;
-            if (WcsAssociateColorProfileWithDevice(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, profile.c_str(), gdi.c_str()))
-            {
-                WcsSetDefaultColorProfile(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, gdi.c_str(), CPT_ICC, CPST_NONE, 0, profile.c_str());
-                Log(L"color profile '%s' inherited by Split %u", profile.c_str(), p.first + i + 1);
-            }
-        }
+        Job j{ p.target.adapter, p.target.targetId, p.cfg.name, {} };
+        for (UINT i = 0; i < p.regions.size(); i++) j.splits.push_back(VirtualName(p.first + i));
+        jobs.push_back(std::move(j));
     }
+    std::thread([jobs = std::move(jobs)] {
+        using GetDefaultFn = HRESULT(WINAPI*)(WCS_PROFILE_MANAGEMENT_SCOPE, LUID, UINT32, COLORPROFILETYPE, COLORPROFILESUBTYPE, LPWSTR*);
+        using AddAssociationFn = HRESULT(WINAPI*)(WCS_PROFILE_MANAGEMENT_SCOPE, PCWSTR, LUID, UINT32, BOOL, BOOL);
+        HMODULE mscms = LoadLibraryExW(L"mscms.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        auto getDefault = mscms ? (GetDefaultFn)GetProcAddress(mscms, "ColorProfileGetDisplayDefault") : nullptr;
+        auto addAssociation = mscms ? (AddAssociationFn)GetProcAddress(mscms, "ColorProfileAddDisplayAssociation") : nullptr;
+        if (!getDefault || !addAssociation) return; // older Windows: keep the default profile
+
+        // The panels are still on the desktop when the session starts: read their profiles now.
+        std::vector<std::wstring> profiles(jobs.size());
+        auto snap = SnapshotMonitors();
+        for (size_t k = 0; k < jobs.size(); k++)
+        {
+            for (auto& e : snap)
+            {
+                if (e.adapter.LowPart != jobs[k].adapter.LowPart || e.adapter.HighPart != jobs[k].adapter.HighPart || e.targetId != jobs[k].targetId)
+                    continue;
+                LPWSTR name = nullptr;
+                if (SUCCEEDED(getDefault(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, e.adapter, e.sourceId, CPT_ICC, CPST_NONE, &name)) && name)
+                {
+                    profiles[k] = name;
+                    LocalFree(name);
+                }
+            }
+            // The stock profile is what new monitors get anyway: nothing to inherit.
+            if (_wcsicmp(profiles[k].c_str(), L"sRGB Color Space Profile.icm") == 0) profiles[k].clear();
+        }
+        bool any = false;
+        for (auto& pr : profiles) any |= !pr.empty();
+        if (!any) return;
+
+        // Then wait (up to 20 s) for the split monitors to join the desktop and give them the same one.
+        std::vector<std::vector<bool>> done(jobs.size());
+        for (size_t k = 0; k < jobs.size(); k++) done[k].assign(jobs[k].splits.size(), profiles[k].empty());
+        for (int attempt = 0; attempt < 40; attempt++)
+        {
+            bool pending = false;
+            snap = SnapshotMonitors();
+            for (size_t k = 0; k < jobs.size(); k++)
+            {
+                for (size_t i = 0; i < jobs[k].splits.size(); i++)
+                {
+                    if (done[k][i]) continue;
+                    const MonitorSnapshot* e = FindInSnapshot(snap, jobs[k].splits[i]);
+                    if (!e)
+                    {
+                        pending = true;
+                        continue;
+                    }
+                    HRESULT hr = addAssociation(WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER, profiles[k].c_str(), e->adapter, e->sourceId, TRUE, FALSE);
+                    Log(L"colour profile '%s' of '%s' -> %s: 0x%08X", profiles[k].c_str(), jobs[k].panelName.c_str(), jobs[k].splits[i].c_str(), (UINT)hr);
+                    done[k][i] = true;
+                }
+            }
+            if (!pending) return;
+            Sleep(500);
+        }
+    }).detach();
 }
+
 
 // One full split session: plug every panel's monitors, take the panels over, composite until
 // stop / loss. Returns true if the session ended because a stop was requested.
@@ -1398,16 +1501,30 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
             p.first + 1, cfg.count, desc.c_str());
     }
 
-    // Counters survive from earlier sessions, so require fresh frames after this plug.
+    // Panels are still on the desktop here, so their colour profiles can be read (off-thread).
+    StartColorProfileInheritance(ps);
+
+    // Counters survive from earlier sessions, so require fresh frames after this plug. "Fresh"
+    // means the sequence or the ring changed, not that it grew: a 0.4.1 driver restarts the
+    // count whenever it recreates a ring, which made a strict "greater than" wait forever.
     LONG64 base[SD_MAX_MONITORS];
-    for (int i = 0; i < SD_MAX_MONITORS; i++) base[i] = (LONG64)SdReadI64(&shm->mon[i].frameSeq);
+    long long baseKey[SD_MAX_MONITORS];
+    for (int i = 0; i < SD_MAX_MONITORS; i++)
+    {
+        base[i] = (LONG64)SdReadI64(&shm->mon[i].frameSeq);
+        baseKey[i] = FrameRingKey(shm.get(), i);
+    }
     SdWriteConfig(shm.get(), cfg);
     InterlockedIncrement(&shm->modesGeneration);
     InterlockedExchange(&shm->desiredPlugged, 1);
     shm.Kick();
     auto live = [&] {
         for (UINT i = 0; i < cfg.count; i++)
-            if (!shm->mon[i].plugged || SdReadI64(&shm->mon[i].frameSeq) <= base[i] || !IsTargetActive(VirtualName(i).c_str())) return false;
+        {
+            LONG64 seq = (LONG64)SdReadI64(&shm->mon[i].frameSeq);
+            bool fresh = seq > 0 && (seq != base[i] || FrameRingKey(shm.get(), i) != baseKey[i]);
+            if (!shm->mon[i].plugged || !fresh || !IsTargetActive(VirtualName(i).c_str())) return false;
+        }
         return true;
     };
     std::vector<std::wstring> allNames;
@@ -1489,8 +1606,8 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     // Moving a panel can make Windows fall back to 60 Hz; it must run at the rate of its split monitors.
     if (g_windowMode)
         for (auto& p : ps) ForceRefreshTarget(p.target.adapter, p.target.targetId, p.refreshMilliHz);
+    Log(L"session: monitors arranged");
     WriteRuntime(ps);
-    InheritColorProfiles(ps);
 
     WindowGuard guard;
     if (g_windowMode)
@@ -1503,6 +1620,7 @@ static bool RunSession(std::vector<PanelSession>& ps, ULONGLONG deadline)
     RestoreWindowLayout();
 
     // One thread per panel, each paced by its own panel's vblank.
+    Log(L"session: compositing %zu panel(s)", ps.size());
     g_abort = false;
     std::vector<std::unique_ptr<std::atomic<ULONGLONG>>> beats;
     std::vector<Outcome> results(ps.size(), Outcome::Stop);
@@ -1898,23 +2016,8 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep)
 {
     static volatile LONG inside = 0;
     if (InterlockedExchange(&inside, 1)) return EXCEPTION_EXECUTE_HANDLER;
-    wchar_t dir[MAX_PATH];
-    ExpandEnvironmentStringsW(L"%ProgramData%\\SplitDisplay", dir, MAX_PATH);
-    CreateDirectoryW(dir, nullptr);
     wchar_t path[MAX_PATH];
-    swprintf_s(path, L"%s\\crash-%lu-%llu.dmp", dir, GetCurrentProcessId(), GetTickCount64());
-    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f != INVALID_HANDLE_VALUE)
-    {
-        MINIDUMP_EXCEPTION_INFORMATION mei{};
-        mei.ThreadId = GetCurrentThreadId();
-        mei.ExceptionPointers = ep;
-        mei.ClientPointers = FALSE;
-        MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
-            (MINIDUMP_TYPE)(MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory | MiniDumpScanMemory), &mei, nullptr, nullptr);
-        CloseHandle(f);
-        Log(L"crashed; minidump written to %s", path);
-    }
+    if (WriteDump(GetCurrentProcess(), GetCurrentProcessId(), L"crash", ep, path)) Log(L"crashed; minidump written to %s", path);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 

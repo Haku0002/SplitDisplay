@@ -57,7 +57,7 @@ namespace SplitDisplay
         HANDLE m_TexHandle[SD_BUFFERS] = {};
         HANDLE m_FenceHandle = nullptr;
         UINT64 m_FenceValue = 0;
-        UINT64 m_Seq = 0; // frames published by this ring (== shared frameSeq)
+        UINT64 m_Seq = 0; // last frameSeq this ring published; continues the shared count (0 = not yet)
         UINT m_Width = 0, m_Height = 0;
         DXGI_FORMAT m_Format = DXGI_FORMAT_UNKNOWN;
         bool m_Ready = false;

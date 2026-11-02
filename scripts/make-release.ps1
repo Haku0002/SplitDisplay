@@ -57,6 +57,12 @@ if ($LASTEXITCODE) { throw 'SplitDisplaySetup build failed' }
 Copy-Item (Join-Path $root 'build\Release\SplitDisplaySetup.exe') $setupExe -Force
 & (Join-Path $root 'scripts\sign-binaries.ps1') -Files @($setupExe)
 
+# Symbols are published separately (never inside the installer) so dumps can be read later.
+$symZip = Join-Path $root "out\SplitDisplay-v$Version-x64-symbols.zip"
+Remove-Item $symZip -ErrorAction SilentlyContinue
+Compress-Archive -Path (Join-Path $root 'build\Release\splitdisplay.pdb'), (Join-Path $root 'build\Release\sdctl.pdb'), (Join-Path $root 'build\Release\SplitDisplayIdd.pdb') -DestinationPath $symZip
+"$symZip"
+
 $hashZip = (Get-FileHash $zip -Algorithm SHA256).Hash
 $hashExe = (Get-FileHash $setupExe -Algorithm SHA256).Hash
 "$zip  (SHA256 $hashZip)"

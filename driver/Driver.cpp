@@ -590,6 +590,11 @@ void FrameRing::Publish(ID3D11Texture2D* Source, IDDCX_SWAPCHAIN SwapChain, cons
 
     // Journal first (what changed in this frame only), published state afterwards: a consumer
     // that sees the new latest must also find the matching journal entry.
+    // frameSeq is monotonic for the life of the shared section, not per ring: a ring is
+    // recreated on every swap-chain reassignment (mode change, ACCESS_LOST), and consumers
+    // compare sequence numbers across that boundary ("has a new frame arrived since X?").
+    // Restarting at 1 made those checks wait until the new ring caught up with the old count.
+    if (!m_Seq) m_Seq = (UINT64)SdReadI64(&m.frameSeq);
     UINT64 seq = ++m_Seq;
     SdDirtyFrame& j = m.journal[seq % SD_DIRTY_JOURNAL];
     j.seqEnd = 0;
@@ -892,7 +897,14 @@ void IndirectDeviceContext::CommandLoop()
             SdConfig cfg;
             if (SdReadConfig(g_Shm, cfg))
             {
-                if (!m_Plugged) ReconcileMonitors(cfg);
+                if (!m_Plugged)
+                {
+                    // A fresh plug already uses the current config: the generation bump that
+                    // came with the request must not trigger a second, redundant mode update
+                    // right after arrival (that reset every swap chain once more).
+                    m_LastModesGeneration = g_Shm->modesGeneration;
+                    ReconcileMonitors(cfg);
+                }
                 else if (g_Shm->modesGeneration != m_LastModesGeneration)
                 {
                     // Same monitors, new mode lists (e.g. the panel switched refresh rate).
@@ -1015,7 +1027,7 @@ bool IndirectDeviceContext::CreateSlot(UINT i, const SdConfig& cfg)
         cfg.mon[i].refreshMilliHz % 1000, Status);
     if (!NT_SUCCESS(Status))
     {
-        WdfObjectDelete(MonitorCreateOut.MonitorObject);
+        // Left to IddCx as well (it is parented to the adapter), like the Microsoft sample does.
         return false;
     }
     m_Monitors[i] = MonitorCreateOut.MonitorObject;
@@ -1032,9 +1044,10 @@ void IndirectDeviceContext::DepartSlot(UINT i)
     NTSTATUS Status = IddCxMonitorDeparture(mon);
     DLog(L"MonitorDeparture(%u) status=0x%08X", i, Status);
     InterlockedExchange(&g_Shm->mon[i].plugged, 0);
-    // Destroying the object runs the context cleanup (stops the frame thread, frees the
-    // ring). The old code only departed, leaking one monitor object and context per replug.
-    WdfObjectDelete((WDFOBJECT)mon);
+    // No WdfObjectDelete here: after IddCxMonitorDeparture the monitor object belongs to IddCx,
+    // which releases it (and runs the context cleanup) itself. 0.4.0/0.4.1 deleted it again,
+    // and the double release crashed the driver host on every unplug -- often enough that
+    // Windows then disabled the device (Code 43).
 }
 
 void IndirectDeviceContext::UnplugMonitors()

@@ -419,6 +419,7 @@ std::vector<MonitorSnapshot> SnapshotMonitors()
         s.devicePath = TargetDevicePath(p);
         s.adapter = p.targetInfo.adapterId;
         s.targetId = p.targetInfo.id;
+        s.sourceId = p.sourceInfo.id;
         s.refreshMilliHz = MilliHz(p.targetInfo.refreshRate);
         s.rotation = p.targetInfo.rotation;
         s.scalePercent = ScalePercentForSource(p.sourceInfo.adapterId, p.sourceInfo.id, nullptr);

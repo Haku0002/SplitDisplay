@@ -48,6 +48,7 @@ struct MonitorSnapshot
     std::wstring gdiName;
     LUID adapter{};
     UINT32 targetId = 0;
+    UINT32 sourceId = 0; // CCD source id (with adapter: what the display colour APIs take)
     POINT position{};
     UINT32 width = 0, height = 0;
     int refreshMilliHz = 0;

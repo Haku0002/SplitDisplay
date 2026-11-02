@@ -1,5 +1,24 @@
 # SplitDisplay changelog
 
+## 0.4.2
+
+Fixes "Start split flashes once and does nothing" in 0.4.0 and 0.4.1.
+- The session thread inherited the panel's colour profile through the legacy `Wcs*` calls with a
+  GDI device name; mscms resolved that through the print spooler and could block until the
+  watchdog gave up after 6 s. Colour profiles now go through the display colour APIs
+  (adapter LUID + source id) on a background thread that can never hold up a session.
+- The driver deleted monitor objects it had already handed back to IddCx, crashing its host on
+  every unplug until Windows disabled the device (Code 43).
+- Each new frame ring restarted the frame counter, so "wait for a fresh frame" could time out
+  ("virtual monitors did not come up"); the counter is now continuous, and the compositor
+  also tolerates drivers that restart it.
+- A fresh plug no longer triggers a redundant mode update right after arrival.
+- Scheduled task XML now validates (0x80041316), so starting from the settings window works
+  without a UAC prompt; installed executables are re-signed when upgrading over a local signature.
+- The watchdog writes a hang dump before ending a stuck compositor; release builds ship PDBs in a
+  separate symbols archive; install scripts are compiled into the app from `release/` instead of
+  a hand-maintained copy; installs log to `install.log`.
+
 ## 0.4.1
 
 Installer, in-app updater, signing, and dark mode

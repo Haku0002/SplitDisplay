@@ -239,7 +239,9 @@ void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HAN
         // Copy path (also the fallback if the blitter is unavailable: crops as before).
         UINT copyW = std::min(f.width, (UINT)(rc.right - rc.left));
         UINT copyH = std::min(f.height, (UINT)(rc.bottom - rc.top));
-        bool copyFull = drawn <= 0 || seq - drawn > SD_DIRTY_JOURNAL || stretch;
+        // seq < drawn: the driver restarted its count (0.4.1 drivers do on every new ring), so
+        // the journal no longer relates the two frames.
+        bool copyFull = drawn <= 0 || seq < drawn || seq - drawn > SD_DIRTY_JOURNAL || stretch;
         SdRect rects[SD_DIRTY_JOURNAL * 4];
         int rectCount = 0;
         UINT64 dirtyArea = 0;
