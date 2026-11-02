@@ -58,7 +58,9 @@ Copy-Item (Join-Path $root 'build\Release\SplitDisplaySetup.exe') $setupExe -For
 & (Join-Path $root 'scripts\sign-binaries.ps1') -Files @($setupExe)
 
 # Symbols are published separately (never inside the installer) so dumps can be read later.
-$symZip = Join-Path $root "out\SplitDisplay-v$Version-x64-symbols.zip"
+# Named so it sorts after the package: the GitHub API lists assets by name, and 0.5.0 updaters take
+# the first .zip ("-x64_symbols" > "-x64.zip", whereas "-x64-symbols" sorted first).
+$symZip = Join-Path $root "out\SplitDisplay-v$Version-x64_symbols.zip"
 Remove-Item $symZip -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $root 'build\Release\splitdisplay.pdb'), (Join-Path $root 'build\Release\sdctl.pdb'), (Join-Path $root 'build\Release\SplitDisplayIdd.pdb') -DestinationPath $symZip
 "$symZip"
