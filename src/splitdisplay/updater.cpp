@@ -431,7 +431,11 @@ UpdateInfo CheckForGitHubUpdate()
         if (url.empty() || next <= pos) break;
         pos = next;
         std::wstring wurl = Utf8ToWide(url);
-        if (wurl.size() > 4 && _wcsicmp(wurl.c_str() + wurl.size() - 4, L".zip") == 0 && info.zipUrl.empty())
+        // A release also carries a symbols zip (PDBs for reading crash dumps): never install that one.
+        std::wstring lower = wurl;
+        for (auto& ch : lower) ch = (wchar_t)towlower(ch);
+        bool symbols = lower.find(L"symbols") != std::wstring::npos;
+        if (wurl.size() > 4 && _wcsicmp(wurl.c_str() + wurl.size() - 4, L".zip") == 0 && !symbols && info.zipUrl.empty())
             info.zipUrl = wurl;
         else if (wurl.size() > 4 && _wcsicmp(wurl.c_str() + wurl.size() - 4, L".exe") == 0 && info.setupUrl.empty())
             info.setupUrl = wurl;

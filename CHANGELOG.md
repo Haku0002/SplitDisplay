@@ -1,5 +1,12 @@
 # SplitDisplay changelog
 
+Releases 0.4.1 - 0.5.0 were short-lived fix-up builds and have been withdrawn; their entries are kept below.
+
+## 0.5.1
+
+- Same features as 0.5.0. The updater now ignores the symbols archive when it picks the release package to
+  install (it took the first .zip of a release).
+
 ## 0.5.0
 
 Lower latency and lower GPU cost in window mode, measured on hardware (100 Hz panel, both split monitors busy,
