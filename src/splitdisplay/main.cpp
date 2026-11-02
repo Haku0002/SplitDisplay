@@ -1081,10 +1081,8 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     // Three buffers: one on screen, one waiting for the next vblank, one to draw the next frame into.
     sd.BufferCount = 3;
-    // FLIP_SEQUENTIAL, not FLIP_DISCARD: contents of each buffer survive its present, so a
-    // later pass can leave regions (and rects) that have not changed untouched instead of
-    // recopying the whole panel every frame -- with DISCARD they would be undefined.
-    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    // Every present overwrites the whole back buffer from the canvas below, so DISCARD is right.
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     // With a waitable swap chain, Present never blocks on frame latency: a present right after the
     // previous one must not wait for that one to reach the screen.
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -1095,8 +1093,24 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     // With a D3D11 flip-model swap chain, buffer 0 is always the current back buffer.
     winrt::com_ptr<ID3D11Texture2D> back;
     back.capture(swap, &IDXGISwapChain1::GetBuffer, 0);
-    winrt::com_ptr<ID3D11RenderTargetView> backRtv;
-    winrt::check_hresult(dev->CreateRenderTargetView(back.get(), nullptr, backRtv.put()));
+    // Frames are composed into one persistent canvas and the canvas is copied to the back buffer
+    // at every present. Incremental (dirty-rect) updates need a target whose contents are known,
+    // and a D3D11 swap chain's back buffer is not one: buffer 0 rotates through the physical
+    // buffers and IDXGISwapChain3::GetCurrentBackBufferIndex always reports 0 there, so 0.4.0/0.4.1,
+    // which tracked contents per back buffer, left every buffer partly stale -- cursor trails that
+    // never cleared and three different images alternating (severe stutter).
+    D3D11_TEXTURE2D_DESC cd{};
+    cd.Width = width;
+    cd.Height = height;
+    cd.MipLevels = 1;
+    cd.ArraySize = 1;
+    cd.Format = sd.Format;
+    cd.SampleDesc.Count = 1;
+    cd.BindFlags = D3D11_BIND_RENDER_TARGET;
+    winrt::com_ptr<ID3D11Texture2D> canvas;
+    winrt::check_hresult(dev->CreateTexture2D(&cd, nullptr, canvas.put()));
+    winrt::com_ptr<ID3D11RenderTargetView> canvasRtv;
+    winrt::check_hresult(dev->CreateRenderTargetView(canvas.get(), nullptr, canvasRtv.put()));
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     Log(L"panel %u: window mode, compositor window at (%ld,%ld) %ux%u", panel.targetId, rc.left, rc.top, width, height);
 
@@ -1110,7 +1124,6 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
     std::vector<FrameSource> src(p.regions.size());
     FrameEventWaiter waiter(src.size());
     ULONGLONG nextDriverCheck = 0;
-    auto swap3 = swap.try_as<IDXGISwapChain3>();
     for (int i = 0; i < (int)src.size(); i++)
     {
         src[i].index = (int)p.first + i;
@@ -1208,14 +1221,14 @@ static Outcome CompositeWindow(SharedView& shm, const PanelSession& p, ULONGLONG
                 int at = scan.Percent();
                 if (at >= 0) arrivalAt[at / 10]++;
             }
-            // No blanket clear: the regions tile the panel, buffers keep their contents
-            // (FLIP_SEQUENTIAL), and DrawRegions tracks per buffer what is already there --
-            // it blacks out exactly the regions that have no frame yet.
+            // Bring the canvas up to date (only what changed), then hand the whole of it to the
+            // back buffer. DrawRegions tracks what the canvas shows and blacks out regions that
+            // have no frame yet.
             int rotations[SD_MAX_MONITORS] = {};
             for (size_t k2 = 0; k2 < src.size() && p.first + k2 < SD_MAX_MONITORS; k2++) rotations[k2] = g_rotations[p.first + k2].load();
-            int targetIndex = swap3 ? (int)swap3->GetCurrentBackBufferIndex() : 0;
-            DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc.get(), src, p.regions, back.get(), backRtv.get(), width, height,
-                targetIndex, blitterOk ? &blitter : nullptr, rotations);
+            DrawRegions(dev.get(), ctx.get(), shm.get(), driverProc.get(), src, p.regions, canvas.get(), canvasRtv.get(), width, height,
+                0, blitterOk ? &blitter : nullptr, rotations);
+            ctx->CopyResource(back.get(), canvas.get());
             ctx->Signal(fence.get(), ++fenceValue);
             pendingFence = fenceValue;
             LARGE_INTEGER presentAt;

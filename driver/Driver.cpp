@@ -469,11 +469,6 @@ HRESULT FrameRing::Recreate(const D3D11_TEXTURE2D_DESC& Src)
     }
 
     m_FenceValue = 0;
-    for (int i = 0; i < SD_BUFFERS; i++)
-    {
-        m_Accum[i].clear();
-        m_AccumFull[i] = true; // a fresh texture holds nothing yet
-    }
     m_Width = d.Width;
     m_Height = d.Height;
     m_Format = d.Format;
@@ -496,7 +491,7 @@ HRESULT FrameRing::Recreate(const D3D11_TEXTURE2D_DESC& Src)
     return S_OK;
 }
 
-void FrameRing::Publish(ID3D11Texture2D* Source, IDDCX_SWAPCHAIN SwapChain, const IDDCX_METADATA& Meta)
+void FrameRing::Publish(ID3D11Texture2D* Source, const IDDCX_METADATA& Meta)
 {
     if (!g_Shm) return;
     D3D11_TEXTURE2D_DESC sd;
@@ -506,126 +501,33 @@ void FrameRing::Publish(ID3D11Texture2D* Source, IDDCX_SWAPCHAIN SwapChain, cons
         if (FAILED(Recreate(sd))) return;
     }
 
-    // What changed in this frame? A single all-zero dirty rect means "nothing": the OS
-    // re-presents static desktops so encoders can re-encode; copying those would republish
-    // the identical frame and burn both copy hops for no reason. Move regions are gone in
-    // IddCx 1.7+ (always zero here); a nonzero count on an older OS falls back to a full copy.
-    std::vector<RECT> frameDirty;
-    bool full = Meta.HwProtectedSurface || Meta.MoveRegionCount != 0 || Meta.DirtyRectCount == 0;
-    if (!full && Meta.DirtyRectCount <= 4096)
-    {
-        // The usual desktop frame has a handful of rects; only pathological ones go to the heap.
-        RECT stackRects[64];
-        std::vector<RECT> heapRects;
-        RECT* rects = stackRects;
-        if (Meta.DirtyRectCount > ARRAYSIZE(stackRects))
-        {
-            heapRects.resize(Meta.DirtyRectCount);
-            rects = heapRects.data();
-        }
-        IDARG_IN_GETDIRTYRECTS in = { Meta.DirtyRectCount, rects };
-        IDARG_OUT_GETDIRTYRECTS out = {};
-        if (SUCCEEDED(IddCxSwapChainGetDirtyRects(SwapChain, &in, &out)))
-        {
-            UINT n = std::min(out.DirtyRectOutCount, Meta.DirtyRectCount);
-            if (n == 1 && rects[0].left == 0 && rects[0].top == 0 && rects[0].right == 0 && rects[0].bottom == 0) return; // no image update
-            for (UINT i = 0; i < n; i++)
-            {
-                RECT r = { std::clamp<LONG>(rects[i].left, 0, (LONG)sd.Width), std::clamp<LONG>(rects[i].top, 0, (LONG)sd.Height),
-                    std::clamp<LONG>(rects[i].right, 0, (LONG)sd.Width), std::clamp<LONG>(rects[i].bottom, 0, (LONG)sd.Height) };
-                if (r.right > r.left && r.bottom > r.top) frameDirty.push_back(r);
-            }
-            if (frameDirty.empty()) full = true; // OS said something changed but listed nothing usable
-        }
-        else
-        {
-            full = true;
-        }
-    }
-    else if (Meta.DirtyRectCount > 4096)
-    {
-        full = true;
-    }
-
-    // Every slot still missing this frame's changes accumulates them: slot w is only correct
-    // once it has received all changes since the frame it currently holds.
-    for (int i = 0; i < SD_BUFFERS; i++)
-    {
-        if (full) m_AccumFull[i] = true;
-        else if (!m_AccumFull[i])
-        {
-            m_Accum[i].insert(m_Accum[i].end(), frameDirty.begin(), frameDirty.end());
-            if (m_Accum[i].size() > 256) m_AccumFull[i] = true; // a full copy beats hundreds of small ones
-        }
-    }
-
+    // Every frame is copied whole and published. 0.4.0/0.4.1 copied only the IddCx dirty rects
+    // and skipped frames reported as "no image update", but the software cursor that the OS
+    // draws into these frames is not covered by the dirty rects: cursor moves were dropped,
+    // the cursor only appeared where other content happened to change, and every image of it
+    // left behind stayed forever ("infinite ghosting"). Verified on hardware. Partial copies
+    // need a cursor the driver draws itself (IddCxMonitorSetupHardwareCursor) first.
     auto& m = g_Shm->mon[m_Index];
     int w = SdPickWriteSlot(m.latest, m.readerIndex);
     if (w < 0) return; // shared state out of range (torn down or corrupted): drop the frame
 
     auto* ctx = m_Device->DeviceContext.Get();
-    bool copyFull = m_AccumFull[w];
-    if (!copyFull)
-    {
-        UINT64 area = 0;
-        for (auto& r : m_Accum[w]) area += (UINT64)(r.right - r.left) * (r.bottom - r.top);
-        copyFull = area >= (UINT64)sd.Width * sd.Height * 3 / 4;
-    }
-    if (copyFull)
-    {
-        ctx->CopyResource(m_Tex[w].Get(), Source);
-    }
-    else
-    {
-        for (auto& r : m_Accum[w])
-        {
-            D3D11_BOX box{ (UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1 };
-            ctx->CopySubresourceRegion(m_Tex[w].Get(), 0, (UINT)r.left, (UINT)r.top, 0, Source, 0, &box);
-        }
-    }
-    m_Accum[w].clear();
-    m_AccumFull[w] = false;
+    ctx->CopyResource(m_Tex[w].Get(), Source);
     ctx->Signal(m_Fence.Get(), ++m_FenceValue);
     ctx->Flush();
 
-    // Journal first (what changed in this frame only), published state afterwards: a consumer
-    // that sees the new latest must also find the matching journal entry.
+    // Journal first, published state afterwards: a consumer that sees the new latest must also
+    // find the matching journal entry. Every entry says "whole frame changed" for now.
     // frameSeq is monotonic for the life of the shared section, not per ring: a ring is
     // recreated on every swap-chain reassignment (mode change, ACCESS_LOST), and consumers
     // compare sequence numbers across that boundary ("has a new frame arrived since X?").
-    // Restarting at 1 made those checks wait until the new ring caught up with the old count.
     if (!m_Seq) m_Seq = (UINT64)SdReadI64(&m.frameSeq);
     UINT64 seq = ++m_Seq;
     SdDirtyFrame& j = m.journal[seq % SD_DIRTY_JOURNAL];
     j.seqEnd = 0;
     MemoryBarrier();
-    if (full)
-    {
-        j.full = 1;
-        j.count = 0;
-    }
-    else if ((int)frameDirty.size() > SD_MAX_DIRTY)
-    {
-        // Too many rects to store: their bounding box is a correct superset.
-        SdRect bb = { (INT32)sd.Width, (INT32)sd.Height, 0, 0 };
-        for (auto& r : frameDirty)
-        {
-            bb.left = std::min(bb.left, (INT32)r.left);
-            bb.top = std::min(bb.top, (INT32)r.top);
-            bb.right = std::max(bb.right, (INT32)r.right);
-            bb.bottom = std::max(bb.bottom, (INT32)r.bottom);
-        }
-        j.full = 0;
-        j.count = 1;
-        j.rects[0] = bb;
-    }
-    else
-    {
-        j.full = 0;
-        j.count = (UINT32)frameDirty.size();
-        for (UINT32 i = 0; i < j.count; i++)
-            j.rects[i] = { frameDirty[i].left, frameDirty[i].top, frameDirty[i].right, frameDirty[i].bottom };
-    }
+    j.full = 1;
+    j.count = 0;
     j.seq = seq;
     MemoryBarrier();
     j.seqEnd = seq;
@@ -711,7 +613,7 @@ void SwapChainProcessor::RunCore()
             ComPtr<ID3D11Texture2D> tex;
             if (SUCCEEDED(AcquiredBuffer.As(&tex)))
             {
-                ring.Publish(tex.Get(), m_hSwapChain, Buffer.MetaData);
+                ring.Publish(tex.Get(), Buffer.MetaData);
                 if (++frames == 1) DLog(L"mon%u: first frame", m_Index);
             }
             AcquiredBuffer.Reset();

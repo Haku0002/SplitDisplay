@@ -12,7 +12,9 @@
 
 #include "protocol.h"
 
-// Back buffers a compositor rotates through (exclusive: 2 primaries, window: 3 swap buffers).
+// Composition targets whose contents a compositor tracks (exclusive: its 2 primaries, window: 1
+// canvas). Each must be a distinct texture that keeps its contents -- never a D3D11 swap-chain
+// back buffer, whose identity rotates behind buffer 0.
 constexpr int kMaxTargetBuffers = 3;
 
 struct FrameSource

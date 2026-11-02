@@ -1,5 +1,21 @@
 # SplitDisplay changelog
 
+## 0.4.3
+
+Fixes the mouse cursor leaving trails that never cleared, and heavy stutter, in window mode (0.4.0 - 0.4.2).
+- Window mode tracked what each swap-chain back buffer already showed, by
+  `IDXGISwapChain3::GetCurrentBackBufferIndex`. In D3D11 that call always returns 0 while the
+  buffers keep rotating, so every buffer missed some updates and three different, partly stale
+  images alternated on screen. The compositor now composes into one persistent canvas and copies
+  it to the back buffer at each present (`FLIP_DISCARD` again).
+- The driver copied only the dirty rectangles Windows reported, but those do not include the
+  software cursor drawn into the frames: cursor moves were lost and old cursor images stayed.
+  Every changed frame is copied whole again, as in 0.3.0. Unchanged regions are still skipped.
+- The compositor takes the sequence number of the ring slot it actually read, not the one it
+  saw a moment earlier.
+- Verified on hardware with Desktop Duplication captures of the panel: no cursor trails, and the
+  panel keeps up with the split monitors.
+
 ## 0.4.2
 
 Fixes "Start split flashes once and does nothing" in 0.4.0 and 0.4.1.

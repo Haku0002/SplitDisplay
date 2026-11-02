@@ -27,9 +27,9 @@ of any split monitor (in Windows Settings, or in the settings window) switches t
 place, without re-plugging anything; only rates the display supports are offered, at their exact fractional value
 (59.94 Hz stays 59.94 Hz), so a split monitor is paced exactly with the panel.
 
-Only what actually changed is copied between the driver and the compositor: the driver reports each frame's dirty
-rectangles, and both copy hops move just those (skipping static regions and unchanged rects entirely). That keeps
-the GPU and memory-bandwidth cost of a mostly-idle split desktop near zero, which matters most on integrated GPUs.
+Nothing is copied while a split monitor shows nothing new, and a region whose monitor did not change is left as it
+is. A frame that did change is copied whole: the dirty rectangles Windows reports do not cover the mouse cursor it
+draws into these frames, so copying only them left cursor trails (0.4.0 and 0.4.1).
 
 ## How it works
 
@@ -221,8 +221,8 @@ Taking over your only display is risky, so there are several layers of protectio
   Windows re-places windows. A refresh-rate change alone no longer does this.
 - A split monitor can also run at 3/4 or 1/2 of its region size (for fullscreen games); the compositor stretches
   those frames to the region. Latency-critical use should stay at the native size.
-- GPU cost now tracks what actually changes on screen rather than the panels' pixel count, but a full-screen video
-  or game still copies every pixel twice, as before.
+- GPU cost follows how often the split monitors change: an idle desktop costs nothing, and every changed frame is
+  copied twice (driver, then compositor), as in 0.3.0.
 - All split displays must be connected to the same GPU (Windows renders an indirect display's monitors on one
   adapter). Displays on another GPU are skipped, with a note in the log.
 

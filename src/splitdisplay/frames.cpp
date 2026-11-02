@@ -225,6 +225,9 @@ void DrawRegions(ID3D11Device5* dev, ID3D11DeviceContext4* ctx, SdShared* s, HAN
             continue; // else keep the previous frame for this pass
         }
         ctx->Wait(f.fence.get(), fv);
+        // The driver may have published again between reading frameSeq and reserving the slot:
+        // what this copy brings the target up to is the reserved slot's own frame.
+        if (long long slotSeq = (long long)m.slotSeq[idx]; slotSeq >= seq) seq = slotSeq;
 
         UINT regionW = (UINT)(full.right - full.left), regionH = (UINT)(full.bottom - full.top);
         int rotation = rotations ? rotations[k] : 1;

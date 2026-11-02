@@ -36,15 +36,14 @@ namespace SplitDisplay
         Microsoft::WRL::ComPtr<ID3D11DeviceContext4> DeviceContext;
     };
 
-    // Ring of shared textures that the compositor reads from (see protocol.h). Only the parts
-    // of the desktop that changed are copied: each slot accumulates the dirty rects of every
-    // frame since it was last written, because its contents are that old.
+    // Ring of shared textures that the compositor reads from (see protocol.h). Each frame is
+    // copied whole (see Publish for why dirty rects are not used).
     class FrameRing
     {
     public:
         FrameRing(UINT MonitorIndex, std::shared_ptr<Direct3DDevice> Device);
         ~FrameRing();
-        void Publish(ID3D11Texture2D* Source, IDDCX_SWAPCHAIN SwapChain, const IDDCX_METADATA& Meta);
+        void Publish(ID3D11Texture2D* Source, const IDDCX_METADATA& Meta);
 
     private:
         HRESULT Recreate(const D3D11_TEXTURE2D_DESC& Desc);
@@ -61,8 +60,6 @@ namespace SplitDisplay
         UINT m_Width = 0, m_Height = 0;
         DXGI_FORMAT m_Format = DXGI_FORMAT_UNKNOWN;
         bool m_Ready = false;
-        std::vector<RECT> m_Accum[SD_BUFFERS]; // dirty rects each slot is still missing
-        bool m_AccumFull[SD_BUFFERS] = { true, true, true };
     };
 
     class SwapChainProcessor

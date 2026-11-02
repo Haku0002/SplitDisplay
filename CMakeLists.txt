@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 # Single source of truth for the version: the generated manifest, the VERSIONINFO resource,
 # the settings window and scripts/make-release.ps1 all read it from here.
-project(SplitDisplay VERSION 0.4.2 LANGUAGES CXX)
+project(SplitDisplay VERSION 0.4.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
