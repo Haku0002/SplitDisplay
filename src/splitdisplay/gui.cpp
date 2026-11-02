@@ -1158,6 +1158,7 @@ void StopCompositor()
     if (!e) return;
     SetEvent(e);
     CloseHandle(e);
+    Log(L"gui: stop requested"); // every stop path leaves a trace in the log
     for (int i = 0; i < 300 && IsRunning(); i++) Sleep(100);
 }
 
